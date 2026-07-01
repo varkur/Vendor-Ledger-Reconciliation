@@ -1,0 +1,162 @@
+/**
+ * User create form component.
+ * Includes single role assignment via Dropdown.
+ */
+
+import { useForm, Controller } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { InputText } from 'primereact/inputtext';
+import { Password } from 'primereact/password';
+import { Dropdown } from 'primereact/dropdown';
+import { InputSwitch } from 'primereact/inputswitch';
+import { Button } from 'primereact/button';
+import { Dialog } from 'primereact/dialog';
+import { useRoles } from '../hooks/useRoles';
+import type { CreateUserRequest } from '../models/User';
+
+const createUserSchema = z.object({
+  username: z.string().min(3, 'Username must be at least 3 characters').max(255),
+  password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  is_validate_ad: z.boolean(),
+  role_id: z.string().min(1, 'Role is required'),
+});
+
+type CreateUserFormData = z.infer<typeof createUserSchema>;
+
+interface UserFormProps {
+  visible: boolean;
+  onHide: () => void;
+  onSubmit: (data: CreateUserRequest) => void;
+  loading?: boolean;
+}
+
+export const UserForm = ({ visible, onHide, onSubmit, loading }: UserFormProps) => {
+  const { roleOptions, loading: rolesLoading } = useRoles();
+
+  const {
+    register,
+    handleSubmit,
+    control,
+    reset,
+    formState: { errors },
+  } = useForm<CreateUserFormData>({
+    resolver: zodResolver(createUserSchema),
+    defaultValues: { is_validate_ad: true, role_id: '' },
+  });
+
+  const handleFormSubmit = (data: CreateUserFormData) => {
+    onSubmit(data);
+    reset();
+  };
+
+  const footer = (
+    <div className="flex justify-content-end gap-2">
+      <Button
+        label="Cancel"
+        icon="pi pi-times"
+        severity="secondary"
+        outlined
+        onClick={() => { reset(); onHide(); }}
+      />
+      <Button
+        label="Create"
+        icon="pi pi-check"
+        loading={loading}
+        onClick={handleSubmit(handleFormSubmit)}
+      />
+    </div>
+  );
+
+  return (
+    <Dialog
+      header="Create New User"
+      visible={visible}
+      onHide={() => { reset(); onHide(); }}
+      style={{ width: '450px' }}
+      footer={footer}
+      modal
+      aria-label="Create user dialog"
+    >
+      <form className="flex flex-column gap-4 pt-3">
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-username" className="font-medium">Username</label>
+          <InputText
+            id="new-username"
+            {...register('username')}
+            placeholder="Enter username"
+            className={errors.username ? 'p-invalid' : ''}
+            aria-describedby="new-username-error"
+          />
+          {errors.username && (
+            <small id="new-username-error" className="p-error">{errors.username.message}</small>
+          )}
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-password" className="font-medium">Password</label>
+          <Controller
+            name="password"
+            control={control}
+            render={({ field }) => (
+              <Password
+                id="new-password"
+                {...field}
+                placeholder="Enter password"
+                toggleMask
+                className={errors.password ? 'p-invalid' : ''}
+                inputClassName="w-full"
+                aria-describedby="new-password-error"
+              />
+            )}
+          />
+          {errors.password && (
+            <small id="new-password-error" className="p-error">{errors.password.message}</small>
+          )}
+        </div>
+
+        {/* Role Assignment */}
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-role" className="font-medium">Role</label>
+          <Controller
+            name="role_id"
+            control={control}
+            render={({ field }) => (
+              <Dropdown
+                id="new-role"
+                value={field.value}
+                options={roleOptions}
+                onChange={(e) => field.onChange(e.value)}
+                placeholder={rolesLoading ? 'Loading roles...' : 'Select a role'}
+                disabled={rolesLoading}
+                className={`w-full ${errors.role_id ? 'p-invalid' : ''}`}
+                aria-label="Assign role"
+              />
+            )}
+          />
+          {errors.role_id && (
+            <small className="p-error">{errors.role_id.message}</small>
+          )}
+        </div>
+
+        <div className="flex align-items-center gap-3">
+          <Controller
+            name="is_validate_ad"
+            control={control}
+            render={({ field }) => (
+              <InputSwitch
+                id="new-validate-ad"
+                checked={field.value}
+                onChange={(e) => field.onChange(e.value)}
+                aria-label="Validate with AD"
+              />
+            )}
+          />
+          <label htmlFor="new-validate-ad" className="font-medium cursor-pointer">
+            Validate with AD
+          </label>
+        </div>
+      </form>
+    </Dialog>
+  );
+};

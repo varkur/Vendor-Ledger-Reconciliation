@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 120" fill="none">
+  <!-- "Emcure" in red -->
+  <text x="8" y="58" font-family="Arial, Helvetica, sans-serif" font-size="58" font-weight="900" fill="#E31E25">Emcure</text>
+  <!-- Horizontal rule line -->
+  <line x1="70" y1="70" x2="272" y2="70" stroke="#222" stroke-width="2.5"/>
+  <!-- "cure" small -->
+  <text x="8" y="105" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="700" fill="#222">cure</text>
+  <!-- "and" tiny -->
+  <text x="8" y="118" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="400" fill="#555">and</text>
+  <!-- "beyond" large -->
+  <text x="70" y="112" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="900" fill="#222">beyond</text>
+</svg>

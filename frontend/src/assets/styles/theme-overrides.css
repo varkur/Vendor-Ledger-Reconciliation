@@ -1,0 +1,360 @@
+/**
+ * Emcure Enterprise Theme Overrides
+ * Based on Emcure Theme v2.0 Design Tokens
+ * Compact density matching Sakai template (primereact.org/sakai)
+ */
+
+:root {
+  /* Primary */
+  --color-primary: #ED1C24;
+  --color-primary-hover: #C8141B;
+  --color-primary-50: #FFF0F0;
+  --color-primary-100: #FFD6D8;
+
+  /* Semantic */
+  --color-success: #17C765;
+  --color-success-hover: #0DA050;
+  --color-warning: #FFA21E;
+  --color-error: #EF4444;
+  --color-info: #3B82F6;
+
+  /* Text */
+  --color-text-primary: #212529;
+  --color-text-secondary: #6C757D;
+  --color-text-muted: #ADB5BD;
+
+  /* Surface */
+  --color-surface: #FFFFFF;
+  --color-surface-ground: #F8F9FA;
+  --color-surface-border: #E9ECEF;
+  --color-surface-hover: #F1F3F5;
+
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+
+  /* Compact density */
+  font-size: 13px;
+}
+
+/* ─── Global Compact Density ─── */
+
+body {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+h2 {
+  font-size: 1.25rem;
+}
+
+/* ─── PrimeReact Compact Overrides ─── */
+
+/* Buttons — smaller padding */
+.p-button {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  border-radius: var(--radius-md);
+  padding: 0.5rem 0.85rem;
+  font-size: 0.813rem;
+}
+
+.p-button.p-button-sm {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.75rem;
+}
+
+.p-button:not(:disabled):hover {
+  background: var(--color-primary-hover);
+  border-color: var(--color-primary-hover);
+}
+
+.p-button.p-button-outlined {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: transparent;
+}
+
+.p-button.p-button-outlined:not(:disabled):hover {
+  background: var(--color-primary-50);
+  color: var(--color-primary-hover);
+}
+
+.p-button.p-button-success {
+  background: linear-gradient(135deg, #34d874, #0da050);
+  border-color: var(--color-success);
+}
+
+.p-button.p-button-danger {
+  background: linear-gradient(135deg, #ff6b6b, #b91c1c);
+  border-color: var(--color-error);
+}
+
+.p-button.p-button-secondary {
+  background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+  border-color: var(--color-surface-border);
+  color: var(--color-text-primary);
+}
+
+.p-button.p-button-text {
+  color: var(--color-primary);
+}
+
+/* Input fields — compact */
+.p-inputtext {
+  padding: 0.5rem 0.65rem;
+  font-size: 0.813rem;
+}
+
+.p-inputtext:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px var(--color-primary-50);
+}
+
+/* Password component — force full width */
+.p-password {
+  width: 100% !important;
+  display: block !important;
+}
+
+.p-password .p-inputtext,
+.p-password input {
+  width: 100% !important;
+}
+
+.p-password-panel {
+  display: none;
+}
+
+.p-dropdown,
+.p-multiselect {
+  font-size: 0.813rem;
+}
+
+.p-dropdown .p-dropdown-label,
+.p-multiselect .p-multiselect-label {
+  padding: 0.5rem 0.65rem;
+  font-size: 0.813rem;
+}
+
+/* DataTable — compact rows */
+.p-datatable .p-datatable-thead > tr > th {
+  background: var(--color-surface-ground);
+  color: var(--color-text-primary);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0.6rem 0.75rem;
+  border-color: var(--color-surface-border);
+}
+
+.p-datatable .p-datatable-tbody > tr > td {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.813rem;
+}
+
+.p-datatable .p-datatable-tbody > tr:hover {
+  background: var(--color-surface-hover);
+}
+
+.p-datatable .p-paginator {
+  padding: 0.4rem 0;
+  font-size: 0.813rem;
+}
+
+/* Tags / Badges — compact */
+.p-tag {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+}
+
+.p-tag.p-tag-success {
+  background: #ECFDF5;
+  color: #065F46;
+}
+
+.p-tag.p-tag-danger {
+  background: #FEF2F2;
+  color: #991B1B;
+}
+
+.p-tag.p-tag-warning {
+  background: #FFFBEB;
+  color: #92400E;
+}
+
+.p-tag.p-tag-info {
+  background: #EFF6FF;
+  color: #1E40AF;
+}
+
+/* Tree — compact */
+.p-tree .p-tree-container .p-treenode .p-treenode-content {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.813rem;
+}
+
+.p-tree .p-tree-container .p-treenode .p-treenode-content .p-tree-toggler {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+/* Dialog — compact */
+.p-dialog .p-dialog-header {
+  padding: 1rem 1.25rem;
+  font-size: 1rem;
+}
+
+.p-dialog .p-dialog-content {
+  padding: 0.75rem 1.25rem;
+}
+
+.p-dialog .p-dialog-footer {
+  padding: 0.75rem 1.25rem;
+}
+
+/* Toolbar — compact */
+.p-toolbar {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-md);
+}
+
+/* Rounded icon buttons — compact */
+.p-button.p-button-rounded.p-button-outlined {
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+}
+
+.p-button.p-button-rounded.p-button-outlined .p-button-icon {
+  font-size: 0.75rem;
+}
+
+/* Sidebar active item */
+.sidebar-active {
+  background-color: var(--color-primary-50) !important;
+  border-left: 3px solid var(--color-primary);
+  color: var(--color-primary) !important;
+  font-weight: 600;
+}
+
+/* Sidebar styling */
+.em-sidebar {
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-surface-border);
+  box-shadow: 0 0 10px rgba(0, 0, 0, 0.03);
+}
+
+.em-sidebar .p-panelmenu .p-panelmenu-header > a {
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  transition: all 0.2s;
+}
+
+.em-sidebar .p-panelmenu .p-panelmenu-header > a:hover {
+  background: var(--color-surface-hover);
+}
+
+.em-sidebar .p-menuitem-link {
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  transition: all 0.2s;
+}
+
+.em-sidebar .p-menuitem-link:hover {
+  background: var(--color-surface-hover);
+}
+
+/* Top bar */
+.em-topbar {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-surface-border);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Cards */
+.em-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-surface-border);
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.2s;
+}
+
+.em-card:hover {
+  box-shadow: var(--shadow-md);
+}
+
+/* Login page */
+.em-login-card {
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--color-surface-border);
+}
+
+/* Toast overrides */
+.p-toast .p-toast-message.p-toast-message-success {
+  border-left: 4px solid var(--color-success);
+}
+
+.p-toast .p-toast-message.p-toast-message-error {
+  border-left: 4px solid var(--color-error);
+}
+
+.p-toast .p-toast-message.p-toast-message-warn {
+  border-left: 4px solid var(--color-warning);
+}
+
+.p-toast .p-toast-message.p-toast-message-info {
+  border-left: 4px solid var(--color-info);
+}
+
+/* ─── Responsive — ensure content fits standard resolutions ─── */
+
+/* Sidebar collapses below 768px (handled by md:flex) */
+@media (max-width: 768px) {
+  .em-sidebar {
+    display: none;
+  }
+}
+
+/* Scale down for 1366x768 (common laptop) */
+@media (max-width: 1440px) {
+  :root {
+    font-size: 12.5px;
+  }
+}
+
+/* Scale down for smaller screens */
+@media (max-width: 1280px) {
+  :root {
+    font-size: 12px;
+  }
+}
+
+
+/* Avatar */
+.bg-primary {
+  background-color: var(--color-primary) !important;
+}

@@ -1,0 +1,7 @@
+{
+  "apiBaseUrl": "",
+  "authProviderUrl": "",
+  "featureFlags": {},
+  "logLevel": "warn",
+  "telemetryEndpoint": ""
+}

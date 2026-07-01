@@ -1,0 +1,1 @@
+﻿# Stripe payment gateway adapter
