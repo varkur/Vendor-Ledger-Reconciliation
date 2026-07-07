@@ -37,7 +37,6 @@ async def seed_admin_user() -> None:
             is_active=True,
             is_blocked=False,
             is_validate_ad=False,
-            role="ADMIN",
             created_by="seed_script",
             modified_by="seed_script",
         )

@@ -8,10 +8,12 @@ from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from src.api.middleware.audit_context_middleware import AuditContextMiddleware
 from src.api.middleware.correlation_id import CorrelationIdMiddleware
 from src.api.middleware.exception_handler import ExceptionHandlerMiddleware
+from src.api.middleware.rate_limiter import RateLimitMiddleware
 from src.api.middleware.request_logging import RequestLoggingMiddleware
 from src.api.v1.router import api_v1_router
 from src.config.logging_config import configure_file_logging
@@ -71,8 +73,10 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 # ─── Middleware (order matters: outermost first) ───
+app.add_middleware(GZipMiddleware, minimum_size=1024)  # Compress responses > 1KB
 app.add_middleware(ExceptionHandlerMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(AuditContextMiddleware)
 app.add_middleware(CorrelationIdMiddleware)
 app.add_middleware(

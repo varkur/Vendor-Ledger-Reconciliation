@@ -79,6 +79,12 @@ class Settings(BaseSettings):
         description="Base URL for the Darwin AD integrator service",
     )
 
+    # Encryption (for SAP credentials and other sensitive settings)
+    ENCRYPTION_KEY: str = Field(
+        default="",
+        description="Fernet symmetric encryption key for sensitive data (base64-encoded 32 bytes)",
+    )
+
     # CORS
     CORS_ORIGINS: list[str] = Field(
         default=["http://localhost:3000"], description="Allowed CORS origins"

@@ -59,6 +59,63 @@ DEFAULT_PERMISSIONS = [
     # Employee AD service permission
     {"code": "services.employee_ad", "name": "Access Employee AD Service", "scope": "API", "resource": "services", "action": "EXECUTE"},
 
+    # ─── VLR Permissions ───
+    # vlr.vendors.*
+    {"code": "vlr.vendors.read", "name": "View Vendors", "scope": "API", "resource": "vlr.vendors", "action": "READ"},
+    {"code": "vlr.vendors.write", "name": "Create/Update Vendors", "scope": "API", "resource": "vlr.vendors", "action": "CREATE"},
+    {"code": "vlr.vendors.create", "name": "Create Vendor", "scope": "API", "resource": "vlr.vendors", "action": "CREATE"},
+    {"code": "vlr.vendors.update", "name": "Update Vendor", "scope": "API", "resource": "vlr.vendors", "action": "UPDATE"},
+    {"code": "vlr.vendors.delete", "name": "Delete Vendor", "scope": "API", "resource": "vlr.vendors", "action": "DELETE"},
+    {"code": "vlr.vendors.import", "name": "Import Vendors", "scope": "API", "resource": "vlr.vendors", "action": "IMPORT"},
+
+    # vlr.requests.*
+    {"code": "vlr.requests.read", "name": "View Reconciliation Requests", "scope": "API", "resource": "vlr.requests", "action": "READ"},
+    {"code": "vlr.requests.write", "name": "Create/Update Requests", "scope": "API", "resource": "vlr.requests", "action": "CREATE"},
+    {"code": "vlr.requests.create", "name": "Create Reconciliation Request", "scope": "API", "resource": "vlr.requests", "action": "CREATE"},
+    {"code": "vlr.requests.update", "name": "Update Reconciliation Request", "scope": "API", "resource": "vlr.requests", "action": "UPDATE"},
+    {"code": "vlr.requests.delete", "name": "Delete Reconciliation Request", "scope": "API", "resource": "vlr.requests", "action": "DELETE"},
+
+    # vlr.cases.*
+    {"code": "vlr.cases.read", "name": "View Reconciliation Cases", "scope": "API", "resource": "vlr.cases", "action": "READ"},
+    {"code": "vlr.cases.write", "name": "Create/Update Cases", "scope": "API", "resource": "vlr.cases", "action": "CREATE"},
+    {"code": "vlr.cases.create", "name": "Create Reconciliation Case", "scope": "API", "resource": "vlr.cases", "action": "CREATE"},
+    {"code": "vlr.cases.update", "name": "Update Reconciliation Case", "scope": "API", "resource": "vlr.cases", "action": "UPDATE"},
+    {"code": "vlr.cases.submit", "name": "Submit Case for Approval", "scope": "API", "resource": "vlr.cases", "action": "EXECUTE"},
+
+    # vlr.exceptions.*
+    {"code": "vlr.exceptions.read", "name": "View Exceptions", "scope": "API", "resource": "vlr.exceptions", "action": "READ"},
+    {"code": "vlr.exceptions.write", "name": "Resolve/Modify Exceptions", "scope": "API", "resource": "vlr.exceptions", "action": "EXECUTE"},
+    {"code": "vlr.exceptions.resolve", "name": "Resolve Exceptions", "scope": "API", "resource": "vlr.exceptions", "action": "EXECUTE"},
+    {"code": "vlr.exceptions.write_off", "name": "Write Off Exceptions", "scope": "API", "resource": "vlr.exceptions", "action": "UPDATE"},
+
+    # vlr.approvals.*
+    {"code": "vlr.approvals.read", "name": "View Approvals", "scope": "API", "resource": "vlr.approvals", "action": "READ"},
+    {"code": "vlr.approvals.approve", "name": "Approve/Reject Cases", "scope": "API", "resource": "vlr.approvals", "action": "EXECUTE"},
+    {"code": "vlr.approvals.delegate", "name": "Delegate Approval Authority", "scope": "API", "resource": "vlr.approvals", "action": "UPDATE"},
+
+    # vlr.notifications.*
+    {"code": "vlr.notifications.read", "name": "View Notifications", "scope": "API", "resource": "vlr.notifications", "action": "READ"},
+    {"code": "vlr.notifications.write", "name": "Send Notifications", "scope": "API", "resource": "vlr.notifications", "action": "CREATE"},
+
+    # vlr.reports.*
+    {"code": "vlr.reports.read", "name": "View Reports", "scope": "API", "resource": "vlr.reports", "action": "READ"},
+    {"code": "vlr.reports.export", "name": "Export Reports", "scope": "API", "resource": "vlr.reports", "action": "EXPORT"},
+
+    # vlr.settings.*
+    {"code": "vlr.settings.read", "name": "View VLR Settings", "scope": "API", "resource": "vlr.settings", "action": "READ"},
+    {"code": "vlr.settings.write", "name": "Modify VLR Settings", "scope": "API", "resource": "vlr.settings", "action": "UPDATE"},
+
+    # vlr.portal.*
+    {"code": "vlr.portal.read", "name": "View Vendor Portal", "scope": "API", "resource": "vlr.portal", "action": "READ"},
+    {"code": "vlr.portal.upload", "name": "Upload Vendor Data", "scope": "API", "resource": "vlr.portal", "action": "CREATE"},
+    {"code": "vlr.portal.sign_off", "name": "Vendor Sign-Off", "scope": "API", "resource": "vlr.portal", "action": "EXECUTE"},
+
+    # VLR Menu permissions
+    {"code": "menu.vlr_dashboard", "name": "VLR Dashboard Menu", "scope": "MENU", "resource": "vlr_dashboard", "action": "READ"},
+    {"code": "menu.vlr_reconciliation", "name": "VLR Reconciliation Menu", "scope": "MENU", "resource": "vlr_reconciliation", "action": "READ"},
+    {"code": "menu.vlr_reports", "name": "VLR Reports Menu", "scope": "MENU", "resource": "vlr_reports", "action": "READ"},
+    {"code": "menu.vlr_settings", "name": "VLR Settings Menu", "scope": "MENU", "resource": "vlr_settings", "action": "READ"},
+
     # Field-level permissions — control visibility of sensitive fields
     {"code": "users.salary.read", "name": "View Salary", "scope": "FIELD", "resource": "users.salary", "action": "READ"},
     {"code": "users.salary.update", "name": "Edit Salary", "scope": "FIELD", "resource": "users.salary", "action": "UPDATE"},
@@ -80,6 +137,18 @@ ROLE_PERMISSIONS = {
         "rbac.read", "rbac.create", "rbac.update", "services.employee_ad",
         "users.salary.read", "users.salary.update",
         "users.email.read", "users.email.update", "users.phone.read",
+        # Admin also gets all VLR permissions
+        "vlr.vendors.read", "vlr.vendors.write", "vlr.vendors.create", "vlr.vendors.update",
+        "vlr.vendors.delete", "vlr.vendors.import",
+        "vlr.requests.read", "vlr.requests.write", "vlr.requests.create", "vlr.requests.update", "vlr.requests.delete",
+        "vlr.cases.read", "vlr.cases.write", "vlr.cases.create", "vlr.cases.update", "vlr.cases.submit",
+        "vlr.exceptions.read", "vlr.exceptions.write", "vlr.exceptions.resolve", "vlr.exceptions.write_off",
+        "vlr.approvals.read", "vlr.approvals.approve", "vlr.approvals.delegate",
+        "vlr.notifications.read", "vlr.notifications.write",
+        "vlr.reports.read", "vlr.reports.export",
+        "vlr.settings.read", "vlr.settings.write",
+        "vlr.portal.read", "vlr.portal.upload", "vlr.portal.sign_off",
+        "menu.vlr_dashboard", "menu.vlr_reconciliation", "menu.vlr_reports", "menu.vlr_settings",
     ],
     "MANAGER": [
         "menu.dashboard", "menu.users", "menu.reports", "menu.services",
@@ -90,11 +159,59 @@ ROLE_PERMISSIONS = {
     "USER": [
         "menu.dashboard", "menu.services",
     ],
+    # ─── VLR-Specific Roles ───
+    "Reconciliation_User": [
+        "menu.vlr_dashboard", "menu.vlr_reconciliation", "menu.vlr_reports",
+        "vlr.vendors.read",
+        "vlr.requests.read", "vlr.requests.create", "vlr.requests.update",
+        "vlr.cases.read", "vlr.cases.create", "vlr.cases.update", "vlr.cases.submit",
+        "vlr.exceptions.read", "vlr.exceptions.resolve",
+        "vlr.approvals.read",
+        "vlr.reports.read", "vlr.reports.export",
+        "vlr.portal.read",
+        "vlr.settings.read",
+    ],
+    "Reconciliation_Manager": [
+        "menu.vlr_dashboard", "menu.vlr_reconciliation", "menu.vlr_reports", "menu.vlr_settings",
+        "vlr.vendors.read", "vlr.vendors.create", "vlr.vendors.update", "vlr.vendors.import",
+        "vlr.requests.read", "vlr.requests.create", "vlr.requests.update", "vlr.requests.delete",
+        "vlr.cases.read", "vlr.cases.create", "vlr.cases.update", "vlr.cases.submit",
+        "vlr.exceptions.read", "vlr.exceptions.resolve", "vlr.exceptions.write_off",
+        "vlr.approvals.read", "vlr.approvals.approve", "vlr.approvals.delegate",
+        "vlr.reports.read", "vlr.reports.export",
+        "vlr.portal.read", "vlr.portal.upload", "vlr.portal.sign_off",
+        "vlr.settings.read",
+    ],
+    "IT_Admin": [
+        "menu.vlr_dashboard", "menu.vlr_reconciliation", "menu.vlr_reports", "menu.vlr_settings",
+        "vlr.vendors.read", "vlr.vendors.write", "vlr.vendors.create", "vlr.vendors.update",
+        "vlr.vendors.delete", "vlr.vendors.import",
+        "vlr.requests.read", "vlr.requests.write", "vlr.requests.create", "vlr.requests.update", "vlr.requests.delete",
+        "vlr.cases.read", "vlr.cases.write", "vlr.cases.create", "vlr.cases.update", "vlr.cases.submit",
+        "vlr.exceptions.read", "vlr.exceptions.write", "vlr.exceptions.resolve", "vlr.exceptions.write_off",
+        "vlr.approvals.read", "vlr.approvals.approve", "vlr.approvals.delegate",
+        "vlr.notifications.read", "vlr.notifications.write",
+        "vlr.reports.read", "vlr.reports.export",
+        "vlr.settings.read", "vlr.settings.write",
+        "vlr.portal.read", "vlr.portal.upload", "vlr.portal.sign_off",
+    ],
+    "Read_Only_Audit": [
+        "menu.vlr_dashboard", "menu.vlr_reports",
+        "vlr.vendors.read",
+        "vlr.requests.read",
+        "vlr.cases.read",
+        "vlr.exceptions.read",
+        "vlr.approvals.read",
+        "vlr.reports.read",
+        "vlr.settings.read",
+        "vlr.portal.read",
+        "audit.read",
+    ],
 }
 
 
 async def seed() -> None:
-    """Seed default permissions and role-permission mappings."""
+    """Seed default permissions, VLR roles, and role-permission mappings."""
     async with async_session_factory() as session:
         # 1. Create permissions (skip existing)
         perm_map: dict[str, str] = {}  # code → id
@@ -127,7 +244,53 @@ async def seed() -> None:
 
         await session.flush()
 
-        # 2. Assign permissions to roles
+        # 2. Ensure VLR-specific roles exist
+        VLR_ROLES = [
+            {
+                "code": "Reconciliation_User",
+                "name": "Reconciliation User",
+                "description": "VLR user who creates requests, manages cases, and resolves exceptions",
+            },
+            {
+                "code": "Reconciliation_Manager",
+                "name": "Reconciliation Manager",
+                "description": "VLR manager who approves cases, delegates authority, and manages vendors",
+            },
+            {
+                "code": "IT_Admin",
+                "name": "IT Admin",
+                "description": "VLR IT administrator with full system settings access",
+            },
+            {
+                "code": "Read_Only_Audit",
+                "name": "Read Only Audit",
+                "description": "VLR read-only role for auditors and compliance reviewers",
+            },
+        ]
+
+        for role_def in VLR_ROLES:
+            existing_role = await session.execute(
+                select(RoleModel).where(RoleModel.code == role_def["code"])
+            )
+            role = existing_role.scalar_one_or_none()
+            if role:
+                print(f"  [skip] Role '{role_def['code']}' already exists")
+            else:
+                new_role = RoleModel(
+                    id=uuid4(),
+                    code=role_def["code"],
+                    name=role_def["name"],
+                    description=role_def["description"],
+                    is_active=True,
+                    created_by="seed_script",
+                    modified_by="seed_script",
+                )
+                session.add(new_role)
+                print(f"  [new]  Role '{role_def['code']}' created")
+
+        await session.flush()
+
+        # 3. Assign permissions to roles
         for role_code, perm_codes in ROLE_PERMISSIONS.items():
             role_result = await session.execute(
                 select(RoleModel).where(RoleModel.code == role_code)

@@ -1,4 +1,4 @@
-﻿"""
+"""
 API v1 Router - aggregates all v1 endpoint routers.
 """
 
@@ -12,6 +12,17 @@ from src.api.v1.endpoints.rbac_controller import router as rbac_router
 from src.api.v1.endpoints.user_controller import router as user_router
 from src.api.v1.endpoints.workflow.workflow_controller import router as workflow_router
 from src.api.v1.endpoints.commission_claim.controller import router as claims_router
+from src.api.v1.endpoints.vlr.vendor_controller import router as vlr_vendor_router
+from src.api.v1.endpoints.vlr.sap_settings_controller import router as vlr_sap_settings_router
+from src.api.v1.endpoints.vlr.settings_controller import router as vlr_settings_router
+from src.api.v1.endpoints.vlr.sap_pull_controller import router as vlr_sap_pull_router
+from src.api.v1.endpoints.vlr.request_controller import router as vlr_request_router
+from src.api.v1.endpoints.vlr.case_controller import router as vlr_case_router
+from src.api.v1.endpoints.vlr.exception_controller import router as vlr_exception_router
+from src.api.v1.endpoints.vlr.approval_controller import router as vlr_approval_router
+from src.api.v1.endpoints.vlr.notification_controller import router as vlr_notification_router
+from src.api.v1.endpoints.vlr.portal_controller import router as vlr_portal_router
+from src.api.v1.endpoints.vlr.report_controller import router as vlr_report_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -23,3 +34,14 @@ api_v1_router.include_router(health_router)
 api_v1_router.include_router(employee_ad_router)
 api_v1_router.include_router(workflow_router)
 api_v1_router.include_router(claims_router)
+api_v1_router.include_router(vlr_vendor_router)
+api_v1_router.include_router(vlr_sap_settings_router)
+api_v1_router.include_router(vlr_settings_router)
+api_v1_router.include_router(vlr_sap_pull_router)
+api_v1_router.include_router(vlr_request_router)
+api_v1_router.include_router(vlr_case_router)
+api_v1_router.include_router(vlr_exception_router)
+api_v1_router.include_router(vlr_approval_router)
+api_v1_router.include_router(vlr_notification_router)
+api_v1_router.include_router(vlr_portal_router)
+api_v1_router.include_router(vlr_report_router)

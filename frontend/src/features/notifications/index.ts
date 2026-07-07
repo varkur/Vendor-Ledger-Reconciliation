@@ -1,1 +1,1 @@
-// Notifications feature module barrel export
+export { NotificationHistoryPage } from './pages/NotificationHistoryPage';

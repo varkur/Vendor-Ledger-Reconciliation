@@ -45,7 +45,7 @@ export const LoginPage = () => {
     dispatch(clearError());
     const result = await dispatch(loginThunk(data));
     if (loginThunk.fulfilled.match(result)) {
-      const redirect = sessionStorage.getItem('redirectAfterLogin') || '/dashboard';
+      const redirect = sessionStorage.getItem('redirectAfterLogin') || '/manage-party';
       sessionStorage.removeItem('redirectAfterLogin');
       navigate(redirect);
     }

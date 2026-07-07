@@ -1,1 +1,1 @@
-// Reports feature module barrel export
+export { ReportsPage } from './pages/ReportsPage';
