@@ -1,53 +1,137 @@
 /**
- * Track Reconciliation page — List of reconciliation requests with status tracking.
+ * Track Reconciliation page — List of reconciliation cases with status tracking.
+ * Wired to backend GET /api/v1/vlr/cases with server-side pagination, filtering, and search.
+ *
+ * Requirements: 23.2, 25.3, 25.4
  */
 
-import { useState } from 'react';
-import { DataTable } from 'primereact/datatable';
+import { useState, useCallback } from 'react';
+import { DataTable, DataTablePageEvent, DataTableSortEvent } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
 import { InputText } from 'primereact/inputtext';
+import { Dropdown } from 'primereact/dropdown';
+import { ProgressSpinner } from 'primereact/progressspinner';
+import { Message } from 'primereact/message';
 import { useNavigate } from 'react-router-dom';
 
-interface RecoRequest {
-  id: string;
-  requestId: string;
-  recoType: string;
-  requestTitle: string;
-  numberOfParties: number;
-  recoPeriod: string;
-  sendDate: string;
-  status: string;
-}
+import { useCaseList } from '../hooks/useTrackReconciliation';
+import type { ReconciliationCase } from '../api/trackReconciliationApi';
 
-const sampleData: RecoRequest[] = [
-  { id: '1', requestId: 'EPL-00094', recoType: 'Ledger', requestTitle: '1222', numberOfParties: 0, recoPeriod: '13-Jul-26 to 15-Jul-26', sendDate: '01-Jul-26', status: 'Not Sent' },
-  { id: '2', requestId: 'EPL-00093', recoType: 'Ledger', requestTitle: 'Emcure', numberOfParties: 0, recoPeriod: '01-Apr-25 to 31-Mar-26', sendDate: '29-Jun-26', status: 'Not Sent' },
-  { id: '3', requestId: 'EPL-00092', recoType: 'Ledger', requestTitle: 'Vaishal Enterprise Internal Reconciliation', numberOfParties: 1, recoPeriod: '01-Apr-23 to 31-Mar-26', sendDate: '22-Jun-26', status: 'open' },
-  { id: '4', requestId: 'EPL-00091', recoType: 'Ledger', requestTitle: 'Rajeev gupsta data', numberOfParties: 0, recoPeriod: '01-Apr-25 to 31-Mar-26', sendDate: '10-Jun-26', status: 'Not Sent' },
-  { id: '5', requestId: 'EPL-00090', recoType: 'Ledger', requestTitle: 'Test 2', numberOfParties: 1, recoPeriod: '01-Apr-25 to 31-Mar-26', sendDate: '02-Jun-26', status: 'open' },
-  { id: '6', requestId: 'EPL-00089', recoType: 'Ledger', requestTitle: 'Test', numberOfParties: 1, recoPeriod: '01-Apr-25 to 31-Mar-26', sendDate: '01-Jun-26', status: 'open' },
-  { id: '7', requestId: 'EPL-00087', recoType: 'Ledger', requestTitle: 'MAY-2026-ROLEOUT DATA', numberOfParties: 366, recoPeriod: '01-Apr-25 to 31-Mar-26', sendDate: '26-May-26', status: 'open' },
-  { id: '8', requestId: 'EPL-00086', recoType: 'Ledger', requestTitle: 'V-XPRESS(A DIVISION OF V-TRANS INDI', numberOfParties: 1, recoPeriod: '01-Apr-24 to 31-Mar-26', sendDate: '10-Apr-28', status: 'open' },
-  { id: '9', requestId: 'EPL-00085', recoType: 'Ledger', requestTitle: 'GATI KINTETSU EXPRESS PVT LTD', numberOfParties: 1, recoPeriod: '01-Apr-24 to 31-Mar-26', sendDate: '07-Apr-26', status: 'open' },
+/** Available status options for the filter dropdown. */
+const STATUS_OPTIONS = [
+  { label: 'All Statuses', value: '' },
+  { label: 'Open', value: 'open' },
+  { label: 'Draft', value: 'draft' },
+  { label: 'Active', value: 'active' },
+  { label: 'Data Received', value: 'data_received' },
+  { label: 'Matching', value: 'matching' },
+  { label: 'Matched', value: 'matched' },
+  { label: 'Review', value: 'review' },
+  { label: 'Pending Approval', value: 'pending_approval' },
+  { label: 'Approved', value: 'approved' },
+  { label: 'Closed', value: 'closed' },
 ];
 
+/** Page size options for the paginator. */
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+
+/** Default company code — in a real app this would come from user context/session. */
+const DEFAULT_COMPANY_CODE = 'EPL';
+
 export const TrackReconciliationPage = () => {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [requests] = useState<RecoRequest[]>(sampleData);
   const navigate = useNavigate();
 
-  const statusTemplate = (rowData: RecoRequest) => (
-    <span className={`status-badge ${rowData.status === 'open' ? 'open' : 'not-sent'}`}>
-      {rowData.status}
+  // Pagination state
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+
+  // Filter state
+  const [statusFilter, setStatusFilter] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [appliedSearch, setAppliedSearch] = useState('');
+
+  // Sort state
+  const [sortBy, setSortBy] = useState<string | undefined>(undefined);
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+
+  // Query hook — lazy server-side pagination
+  const { data, isLoading, isError, error, refetch } = useCaseList({
+    company_code: DEFAULT_COMPANY_CODE,
+    page,
+    page_size: pageSize,
+    status: statusFilter || undefined,
+    search: appliedSearch || undefined,
+    sort_by: sortBy,
+    sort_order: sortOrder,
+  });
+
+  // Handlers
+  const handlePageChange = useCallback((event: DataTablePageEvent) => {
+    setPage((event.page ?? 0) + 1); // PrimeReact is 0-indexed, our API is 1-indexed
+    setPageSize(event.rows);
+  }, []);
+
+  const handleSort = useCallback((event: DataTableSortEvent) => {
+    if (event.sortField) {
+      setSortBy(event.sortField as string);
+      setSortOrder(event.sortOrder === 1 ? 'asc' : 'desc');
+    }
+  }, []);
+
+  const handleSearch = useCallback(() => {
+    setAppliedSearch(searchQuery);
+    setPage(1); // Reset to first page on new search
+  }, [searchQuery]);
+
+  const handleSearchKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        handleSearch();
+      }
+    },
+    [handleSearch]
+  );
+
+  const handleStatusFilterChange = useCallback((value: string) => {
+    setStatusFilter(value);
+    setPage(1); // Reset to first page on filter change
+  }, []);
+
+  // Column templates
+  const statusTemplate = (rowData: ReconciliationCase) => {
+    const statusClass = rowData.status === 'closed' ? 'closed' : rowData.status === 'open' || rowData.status === 'active' ? 'open' : 'in-progress';
+    return (
+      <span className={`status-badge ${statusClass}`}>
+        {rowData.status.replace(/_/g, ' ')}
+      </span>
+    );
+  };
+
+  const caseTypeTemplate = (rowData: ReconciliationCase) => (
+    <span style={{ textTransform: 'capitalize' }}>
+      {rowData.case_type || 'batch'}
     </span>
   );
 
-  const actionTemplate = (rowData: RecoRequest) => (
+  const dateTemplate = (rowData: ReconciliationCase) => {
+    if (!rowData.created_date) return '—';
+    try {
+      return new Date(rowData.created_date).toLocaleDateString('en-IN', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+      });
+    } catch {
+      return rowData.created_date;
+    }
+  };
+
+  const actionTemplate = (rowData: ReconciliationCase) => (
     <div className="flex align-items-center gap-2">
       <span
         className="link-view"
-        onClick={() => navigate(`/track-reconciliation/${rowData.requestId}`)}
+        onClick={() => navigate(`/track-reconciliation/${rowData.id}`)}
         style={{ cursor: 'pointer' }}
       >
         View
@@ -56,11 +140,40 @@ export const TrackReconciliationPage = () => {
     </div>
   );
 
-  const filteredRequests = requests.filter(
-    (r) =>
-      r.requestTitle.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      r.requestId.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  // Loading state
+  if (isLoading && !data) {
+    return (
+      <div>
+        <div className="em-page-header">
+          <h2>Track Reconciliation</h2>
+        </div>
+        <div className="flex justify-content-center align-items-center" style={{ minHeight: 300 }}>
+          <ProgressSpinner style={{ width: '50px', height: '50px' }} />
+        </div>
+      </div>
+    );
+  }
+
+  // Error state
+  if (isError) {
+    return (
+      <div>
+        <div className="em-page-header">
+          <h2>Track Reconciliation</h2>
+        </div>
+        <div className="flex flex-column align-items-center gap-3" style={{ minHeight: 300, paddingTop: 80 }}>
+          <Message
+            severity="error"
+            text={error?.message || 'Failed to load reconciliation cases. Please try again.'}
+          />
+          <Button label="Retry" icon="pi pi-refresh" onClick={() => refetch()} className="p-button-outlined" />
+        </div>
+      </div>
+    );
+  }
+
+  const cases = data?.items ?? [];
+  const totalRecords = data?.total ?? 0;
 
   return (
     <div>
@@ -68,38 +181,67 @@ export const TrackReconciliationPage = () => {
       <div className="em-page-header">
         <h2>Track Reconciliation</h2>
         <div className="em-page-header-actions">
+          <Dropdown
+            value={statusFilter}
+            options={STATUS_OPTIONS}
+            onChange={(e) => handleStatusFilterChange(e.value)}
+            placeholder="All Statuses"
+            style={{ width: 160 }}
+          />
           <div className="em-search-bar">
             <InputText
               placeholder="Type and press enter to Search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={handleSearchKeyDown}
               style={{ border: 'none', boxShadow: 'none', width: 200 }}
             />
-            <i className="pi pi-search" />
+            <i className="pi pi-search" style={{ cursor: 'pointer' }} onClick={handleSearch} />
           </div>
           <Button label="Add New Request" icon="pi pi-plus" />
         </div>
       </div>
 
-      {/* Data Table */}
+      {/* Data Table with lazy pagination */}
       <div className="em-card" style={{ padding: 0 }}>
-        <DataTable
-          value={filteredRequests}
-          paginator
-          rows={10}
-          rowsPerPageOptions={[10, 25, 50]}
-          sortMode="multiple"
-          emptyMessage="No requests found."
-        >
-          <Column field="requestId" header="Request ID" sortable style={{ width: '10%' }} />
-          <Column field="recoType" header="Reco Type" sortable style={{ width: '8%' }} />
-          <Column field="requestTitle" header="Request Title" sortable style={{ width: '25%' }} />
-          <Column field="numberOfParties" header="Number of Parties" sortable style={{ width: '10%', textAlign: 'center' }} />
-          <Column field="recoPeriod" header="Reco Period" sortable style={{ width: '18%' }} />
-          <Column field="sendDate" header="Send Date" sortable style={{ width: '10%' }} />
-          <Column header="Status" body={statusTemplate} sortable style={{ width: '10%' }} />
-          <Column header="Action" body={actionTemplate} style={{ width: '9%' }} />
-        </DataTable>
+        {cases.length === 0 && !isLoading ? (
+          <div className="flex flex-column align-items-center gap-3 p-5">
+            <i className="pi pi-inbox" style={{ fontSize: '2rem', color: 'var(--color-text-muted)' }} />
+            <p style={{ color: 'var(--color-text-muted)' }}>
+              No reconciliation cases found.
+              {appliedSearch && ' Try adjusting your search or filters.'}
+            </p>
+          </div>
+        ) : (
+          <DataTable
+            value={cases}
+            lazy
+            paginator
+            first={(page - 1) * pageSize}
+            rows={pageSize}
+            totalRecords={totalRecords}
+            rowsPerPageOptions={PAGE_SIZE_OPTIONS}
+            onPage={handlePageChange}
+            onSort={handleSort}
+            sortField={sortBy}
+            sortOrder={sortOrder === 'asc' ? 1 : -1}
+            loading={isLoading}
+            emptyMessage="No cases found."
+            dataKey="id"
+          >
+            <Column field="id" header="Case ID" sortable style={{ width: '18%' }}
+              body={(row: ReconciliationCase) => row.id.substring(0, 8) + '...'}
+            />
+            <Column field="case_type" header="Type" sortable style={{ width: '10%' }} body={caseTypeTemplate} />
+            <Column field="vendor_id" header="Vendor ID" sortable style={{ width: '18%' }}
+              body={(row: ReconciliationCase) => row.vendor_id.substring(0, 8) + '...'}
+            />
+            <Column field="upload_count" header="Uploads" sortable style={{ width: '8%', textAlign: 'center' }} />
+            <Column field="created_date" header="Created" sortable style={{ width: '14%' }} body={dateTemplate} />
+            <Column field="status" header="Status" sortable style={{ width: '14%' }} body={statusTemplate} />
+            <Column header="Action" body={actionTemplate} style={{ width: '10%' }} />
+          </DataTable>
+        )}
       </div>
     </div>
   );

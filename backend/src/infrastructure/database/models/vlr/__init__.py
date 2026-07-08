@@ -28,6 +28,13 @@ from src.infrastructure.database.models.vlr.setting_model import SettingModel
 from src.infrastructure.database.models.vlr.automation_rule_model import AutomationRuleModel
 from src.infrastructure.database.models.vlr.automation_execution_model import AutomationExecutionModel
 from src.infrastructure.database.models.vlr.portal_sign_off_model import PortalSignOffModel
+from src.infrastructure.database.models.vlr.document_type_mapping_model import DocumentTypeMappingModel
+from src.infrastructure.database.models.vlr.workflow_step_history_model import WorkflowStepHistoryModel
+from src.infrastructure.database.models.vlr.sla_configuration_model import SLAConfigurationModel
+from src.infrastructure.database.models.vlr.column_mapping_template_model import ColumnMappingTemplateModel
+from src.infrastructure.database.models.vlr.recovery_item_model import RecoveryItemModel
+from src.infrastructure.database.models.vlr.recovery_follow_up_model import RecoveryFollowUpModel
+from src.infrastructure.database.models.vlr.audit_event_model import AuditEventModel
 
 __all__ = [
     # Enums
@@ -54,4 +61,11 @@ __all__ = [
     "AutomationRuleModel",
     "AutomationExecutionModel",
     "PortalSignOffModel",
+    "DocumentTypeMappingModel",
+    "WorkflowStepHistoryModel",
+    "SLAConfigurationModel",
+    "ColumnMappingTemplateModel",
+    "RecoveryItemModel",
+    "RecoveryFollowUpModel",
+    "AuditEventModel",
 ]

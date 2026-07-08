@@ -1,14 +1,25 @@
 """
 Multi-Pass Reconciliation Engine Domain Service.
 
-Implements the 6-pass matching algorithm for reconciling company and vendor
+Implements the 7-pass matching algorithm for reconciling company and vendor
 ledger entries. Enforces no-double-match invariant, calculates match statistics,
 and supports re-reconciliation by clearing previous results.
 
-Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 5.10, 5.11, 5.12, 5.13
+Confidence scoring per BRD Section 5.6.10:
+- Pass 1 (Exact): 1.0 (Auto-Accept)
+- Pass 2 (Tolerance): 0.85 (Auto-Accept)
+- Pass 3 (Fuzzy Reference): 0.70 (Finance confirmation required)
+- Pass 4 (One-to-Many): 0.80 (Finance confirmation required)
+- Pass 5 (Many-to-One): 0.75 (Finance confirmation required)
+- Pass 6 (Date-proximity): 0.70 (Finance confirmation required)
+- Pass 7 (Unmatched): 0.0
+
+Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 5.10, 5.11, 5.12, 5.13,
+              17.1, 17.2, 17.3, 17.4, 36.1, 36.2, 36.3
 """
 
 import difflib
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import IntEnum
@@ -18,6 +29,9 @@ from src.domain.repositories.vlr.case_repository import ICaseRepository
 from src.domain.repositories.vlr.exception_repository import IExceptionRepository
 from src.domain.repositories.vlr.ledger_entry_repository import ILedgerEntryRepository
 from src.domain.repositories.vlr.match_result_repository import IMatchResultRepository
+from src.infrastructure.logging.structured_logger import get_structured_logger
+
+_structured_logger = get_structured_logger("reconciliation_engine")
 
 
 class MatchPassType(IntEnum):
@@ -28,7 +42,27 @@ class MatchPassType(IntEnum):
     FUZZY_REFERENCE = 3
     ONE_TO_MANY = 4
     MANY_TO_ONE = 5
-    UNMATCHED = 6
+    DATE_PROXIMITY = 6
+    UNMATCHED = 7
+
+
+# BRD Section 5.6.10 - Matching Priority Rules confidence scores (normalized to 0.0-1.0)
+# Pass 1 (Exact): 100 → 1.0, Auto-Accept = Yes
+# Pass 2 (Tolerance): 85 → 0.85, Auto-Accept = Yes
+# Pass 3 (Fuzzy Reference): 70 → 0.70, Auto-Accept = No
+# Pass 4 (One-to-Many): 80 → 0.80, Auto-Accept = No
+# Pass 5 (Many-to-One): 75 → 0.75, Auto-Accept = No
+# Pass 6 (Date-proximity): 70 → 0.70, Auto-Accept = No
+# Pass 7 (Unmatched): 0 → 0.0
+CONFIDENCE_SCORES: dict[int, float] = {
+    MatchPassType.EXACT: 1.0,
+    MatchPassType.TOLERANCE: 0.85,
+    MatchPassType.FUZZY_REFERENCE: 0.70,
+    MatchPassType.ONE_TO_MANY: 0.80,
+    MatchPassType.MANY_TO_ONE: 0.75,
+    MatchPassType.DATE_PROXIMITY: 0.70,
+    MatchPassType.UNMATCHED: 0.0,
+}
 
 
 @dataclass
@@ -103,16 +137,18 @@ class ReconciliationResult:
 
 class ReconciliationEngineService:
     """
-    Domain service implementing the 6-pass reconciliation matching algorithm.
+    Domain service implementing the 7-pass reconciliation matching algorithm.
 
     Pass 1: Exact Match - amount + date + reference_number identical (confidence=1.0)
-    Pass 2: Tolerance Match - amount within tolerance AND reference numbers match
-    Pass 3: Fuzzy Reference Match - amounts equal, reference similarity > 0.8
-    Pass 4: One-to-Many - one company entry = sum of multiple vendor entries
-    Pass 5: Many-to-One - multiple company entries sum to one vendor entry
-    Pass 6: Unmatched - mark remaining entries as unmatched exceptions
+    Pass 2: Tolerance Match - amount within tolerance AND reference numbers match (confidence=0.85)
+    Pass 3: Fuzzy Reference Match - amounts equal, reference similarity > 0.8 (confidence=0.70)
+    Pass 4: One-to-Many - one company entry = sum of multiple vendor entries (confidence=0.80)
+    Pass 5: Many-to-One - multiple company entries sum to one vendor entry (confidence=0.75)
+    Pass 6: Date-proximity Match - amount matches + date within configurable N days (confidence=0.70)
+    Pass 7: Unmatched - mark remaining entries as unmatched exceptions (confidence=0.0)
 
-    Invariant: No entry is matched more than once across all passes.
+    Invariant MR-001: No entry is matched more than once across all passes.
+    Invariant MR-002: Once matched in Pass N, a row cannot be re-matched in later passes.
     """
 
     def __init__(
@@ -136,15 +172,18 @@ class ReconciliationEngineService:
         case_id: UUID,
         tolerance: Decimal = Decimal("0"),
         fuzzy_threshold: float = 0.8,
+        date_tolerance_days: int = 3,
     ) -> ReconciliationResult:
         """
-        Execute the full 6-pass reconciliation engine for a case.
+        Execute the full 7-pass reconciliation engine for a case.
 
         Requirement 5.1: Execute passes in sequence.
         Requirement 5.8: Complete within 120 seconds for 5,000 entries per side.
         Requirement 5.10: No entry matched more than once.
         Requirement 5.13: Clear previous results before re-reconciliation.
+        Requirement 17.1: Pass 6 Date-proximity Match by amount + date within N days.
         """
+        start = time.perf_counter()
         # Clear previous results for re-reconciliation (Requirement 5.13)
         await self.clear_previous_results(case_id)
 
@@ -245,7 +284,22 @@ class ReconciliationEngineService:
                 matched_vendor_ids.add(vid)
             result.match_groups.append(group)
 
-        # ─── Pass 6: Mark Unmatched ───────────────────────────────────────
+        # ─── Pass 6: Date-proximity Match ─────────────────────────────────
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        date_proximity_pairs = self._date_proximity_match(
+            available_company, available_vendor, date_tolerance_days
+        )
+        for pair in date_proximity_pairs:
+            matched_company_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
+        # ─── Pass 7: Mark Unmatched ───────────────────────────────────────
         result.unmatched_company_ids = [
             e.id for e in company_entries if e.id not in matched_company_ids
         ]
@@ -253,9 +307,10 @@ class ReconciliationEngineService:
             e.id for e in vendor_entries if e.id not in matched_vendor_ids
         ]
 
-        # Determine if confirmation is needed (fuzzy/combination matches)
+        # Determine if confirmation is needed (fuzzy/combination/date-proximity matches)
         result.needs_confirmation = len(fuzzy_pairs) > 0 or (
             len(one_to_many_groups) > 0 or len(many_to_one_groups) > 0
+            or len(date_proximity_pairs) > 0
         )
 
         # Calculate statistics (Requirement 5.12)
@@ -267,6 +322,19 @@ class ReconciliationEngineService:
 
         # Persist results
         await self._persist_results(case_id, result)
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        _structured_logger.log_success(
+            operation="execute_reconciliation",
+            duration_ms=duration_ms,
+            case_id=str(case_id),
+            total_company=result.statistics.total_company_entries,
+            total_vendor=result.statistics.total_vendor_entries,
+            matched_company=result.statistics.total_matched_company,
+            matched_vendor=result.statistics.total_matched_vendor,
+            match_pairs=len(result.match_pairs),
+            match_groups=len(result.match_groups),
+        )
 
         return result
 
@@ -348,14 +416,12 @@ class ReconciliationEngineService:
                     continue
                 diff = abs(c_entry.amount - v_entry.amount)
                 if diff <= tolerance:
-                    confidence = float(
-                        Decimal("1") - (diff / tolerance) if tolerance > 0 else Decimal("1")
-                    )
+                    # BRD: Pass 2 confidence = 0.85 (normalized from MatchScore 85)
                     pairs.append(
                         MatchPair(
                             company_entry_id=c_entry.id,
                             vendor_entry_id=v_entry.id,
-                            confidence_score=round(confidence, 4),
+                            confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
                             pass_number=MatchPassType.TOLERANCE,
                             matched_amount=c_entry.amount,
                             difference_amount=c_entry.amount - v_entry.amount,
@@ -406,11 +472,12 @@ class ReconciliationEngineService:
                     best_match = v_entry
 
             if best_match is not None:
+                # BRD: Pass 3 confidence = 0.70 (normalized from MatchScore 70)
                 pairs.append(
                     MatchPair(
                         company_entry_id=c_entry.id,
                         vendor_entry_id=best_match.id,
-                        confidence_score=round(best_score, 4),
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.FUZZY_REFERENCE],
                         pass_number=MatchPassType.FUZZY_REFERENCE,
                         matched_amount=c_entry.amount,
                         difference_amount=Decimal("0"),
@@ -462,7 +529,7 @@ class ReconciliationEngineService:
                     MatchGroup(
                         company_entry_ids=[c_entry.id],
                         vendor_entry_ids=vendor_ids,
-                        confidence_score=0.85,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.ONE_TO_MANY],
                         pass_number=MatchPassType.ONE_TO_MANY,
                         matched_amount=c_entry.amount,
                         difference_amount=c_entry.amount - total_amount,
@@ -512,7 +579,7 @@ class ReconciliationEngineService:
                     MatchGroup(
                         company_entry_ids=company_ids,
                         vendor_entry_ids=[v_entry.id],
-                        confidence_score=0.85,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.MANY_TO_ONE],
                         pass_number=MatchPassType.MANY_TO_ONE,
                         matched_amount=v_entry.amount,
                         difference_amount=total_amount - v_entry.amount,
@@ -522,6 +589,137 @@ class ReconciliationEngineService:
                     used_company_ids.add(cid)
 
         return groups
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 6: Date-proximity Match
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _date_proximity_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        date_tolerance_days: int = 3,
+    ) -> list[MatchPair]:
+        """
+        Match entries where amounts are equal (by absolute value) and
+        posting dates are within a configurable number of days.
+
+        Requirement 17.1: Pass 6 matches by amount + date within N days.
+        This handles cases where the amount matches exactly but the reference
+        doesn't match — common when bank value dates differ from SAP posting dates.
+
+        Default date tolerance: ±3 days (configurable).
+        Confidence score: 0.70 for date-proximity matches.
+        """
+        if date_tolerance_days < 0:
+            return []
+
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        # Build lookup for vendor entries by absolute amount for efficient filtering
+        vendor_by_abs_amount: dict[Decimal, list[LedgerEntryData]] = {}
+        for v_entry in vendor:
+            abs_amount = abs(v_entry.amount)
+            vendor_by_abs_amount.setdefault(abs_amount, []).append(v_entry)
+
+        for c_entry in company:
+            abs_company_amount = abs(c_entry.amount)
+            candidates = vendor_by_abs_amount.get(abs_company_amount, [])
+
+            best_match: LedgerEntryData | None = None
+            best_date_diff: int | None = None
+
+            for v_entry in candidates:
+                if v_entry.id in used_vendor_ids:
+                    continue
+
+                # Calculate date difference in days
+                if c_entry.posting_date is None or v_entry.posting_date is None:
+                    continue
+
+                date_diff = abs(
+                    (c_entry.posting_date - v_entry.posting_date).days
+                )
+
+                if date_diff <= date_tolerance_days:
+                    # Pick the closest date match
+                    if best_date_diff is None or date_diff < best_date_diff:
+                        best_date_diff = date_diff
+                        best_match = v_entry
+
+            if best_match is not None:
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=best_match.id,
+                        confidence_score=0.70,
+                        pass_number=MatchPassType.DATE_PROXIMITY,
+                        matched_amount=c_entry.amount,
+                        difference_amount=Decimal("0"),
+                    )
+                )
+                used_vendor_ids.add(best_match.id)
+
+        return pairs
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 6: Date-proximity Match
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _date_proximity_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        date_tolerance_days: int = 3,
+    ) -> list[MatchPair]:
+        """
+        Match entries where amounts are equal and posting dates are within
+        N days of each other (configurable via date_tolerance_days).
+
+        Requirement 17.1: Match by amount + date within configurable N days.
+        BRD confidence = 0.70 (normalized from MatchScore 70).
+        """
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        # Build lookup for vendor entries by amount for efficient filtering
+        vendor_by_amount: dict[Decimal, list[LedgerEntryData]] = {}
+        for v_entry in vendor:
+            vendor_by_amount.setdefault(v_entry.amount, []).append(v_entry)
+
+        for c_entry in company:
+            candidates = vendor_by_amount.get(c_entry.amount, [])
+            best_match: LedgerEntryData | None = None
+            best_date_diff: int | None = None
+
+            for v_entry in candidates:
+                if v_entry.id in used_vendor_ids:
+                    continue
+                # Calculate date difference in days
+                if c_entry.posting_date is None or v_entry.posting_date is None:
+                    continue
+                date_diff = abs((c_entry.posting_date - v_entry.posting_date).days)
+                if date_diff <= date_tolerance_days:
+                    # Pick the closest date match
+                    if best_date_diff is None or date_diff < best_date_diff:
+                        best_date_diff = date_diff
+                        best_match = v_entry
+
+            if best_match is not None:
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=best_match.id,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.DATE_PROXIMITY],
+                        pass_number=MatchPassType.DATE_PROXIMITY,
+                        matched_amount=c_entry.amount,
+                        difference_amount=Decimal("0"),
+                    )
+                )
+                used_vendor_ids.add(best_match.id)
+
+        return pairs
 
     # ──────────────────────────────────────────────────────────────────────
     # Subset Sum Helper
@@ -602,10 +800,10 @@ class ReconciliationEngineService:
 
         # Aggregate per pass
         pass_data: dict[int, PassStatistics] = {}
-        for pass_num in range(1, 7):
+        for pass_num in range(1, 8):
             pass_data[pass_num] = PassStatistics(pass_number=pass_num)
 
-        # Count from pairs (passes 1, 2, 3)
+        # Count from pairs (passes 1, 2, 3, 6)
         for pair in result.match_pairs:
             ps = pass_data[pair.pass_number]
             ps.match_count += 1
@@ -617,7 +815,7 @@ class ReconciliationEngineService:
             ps.match_count += 1
             ps.matched_amount += group.matched_amount
 
-        # Pass 6: unmatched count
+        # Pass 7: unmatched count
         pass_data[MatchPassType.UNMATCHED].match_count = (
             len(result.unmatched_company_ids) + len(result.unmatched_vendor_ids)
         )
@@ -627,7 +825,7 @@ class ReconciliationEngineService:
             if total_entries > 0:
                 # Entries involved: for pairs = 2 per match, for groups = n entries
                 entries_involved = 0
-                if ps.pass_number in (1, 2, 3):
+                if ps.pass_number in (1, 2, 3, 6):
                     entries_involved = ps.match_count * 2
                 elif ps.pass_number == 4:
                     for g in result.match_groups:
@@ -641,7 +839,7 @@ class ReconciliationEngineService:
                             entries_involved += (
                                 len(g.company_entry_ids) + len(g.vendor_entry_ids)
                             )
-                elif ps.pass_number == 6:
+                elif ps.pass_number == 7:
                     entries_involved = ps.match_count
 
                 ps.percentage = round(
@@ -686,16 +884,20 @@ class ReconciliationEngineService:
         self, case_id: UUID, result: ReconciliationResult
     ) -> None:
         """Persist match results and update ledger entries with match metadata."""
-        # Persist match pairs (passes 1, 2, 3)
+        # Persist match pairs (passes 1, 2, 3, 6)
         for pair in result.match_pairs:
             match_id = uuid4()
+            # BRD: Auto-Accept for Pass 1 (Exact) and Pass 2 (Tolerance)
+            is_auto_accepted = pair.pass_number in (
+                MatchPassType.EXACT, MatchPassType.TOLERANCE
+            )
             match_data = {
                 "id": match_id,
                 "case_id": case_id,
                 "pass_number": pair.pass_number,
                 "match_type": "pair",
                 "confidence_score": pair.confidence_score,
-                "is_confirmed": pair.pass_number == MatchPassType.EXACT,
+                "is_confirmed": is_auto_accepted,
                 "company_entry_ids": [str(pair.company_entry_id)],
                 "vendor_entry_ids": [str(pair.vendor_entry_id)],
                 "matched_amount": float(pair.matched_amount),
@@ -737,7 +939,7 @@ class ReconciliationEngineService:
                 confidence_score=group.confidence_score,
             )
 
-        # Persist unmatched entries as exceptions (Pass 6)
+        # Persist unmatched entries as exceptions (Pass 7)
         all_unmatched = result.unmatched_company_ids + result.unmatched_vendor_ids
         if all_unmatched:
             exceptions_data = []

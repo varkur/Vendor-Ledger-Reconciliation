@@ -2,10 +2,11 @@
 Notification Celery tasks.
 
 Provides async task execution for email delivery, retry processing,
-and scheduled reminder sending. Prevents API request blocking for
-email operations that may have latency or require retry logic.
+scheduled reminder sending, and periodic vendor reminder checking.
+Prevents API request blocking for email operations that may have
+latency or require retry logic.
 
-Requirements: 10.1, 10.7, 10.10, 16.6
+Requirements: 10.1, 10.7, 10.10, 14.4, 15.1, 15.2, 15.3, 15.4, 16.6
 """
 
 from __future__ import annotations
@@ -13,14 +14,36 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from celery import Task
+from celery.schedules import crontab
 
 from src.infrastructure.background.celery_app import celery_app
+from src.infrastructure.logging.structured_logger import get_structured_logger
 
 logger = logging.getLogger(__name__)
+_structured_logger = get_structured_logger("celery_notification")
+
+# Default interval for periodic vendor reminder check (in hours)
+DEFAULT_REMINDER_CHECK_INTERVAL_HOURS: int = 4
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Celery Beat Schedule - Vendor Reminder Checking
+# ──────────────────────────────────────────────────────────────────────
+
+# Register vendor reminder check as a periodic task (every 4 hours)
+celery_app.conf.beat_schedule = {
+    **getattr(celery_app.conf, "beat_schedule", {}),
+    "vlr-check-vendor-reminders": {
+        "task": "vlr.check_vendor_reminders",
+        "schedule": crontab(minute=0, hour=f"*/{DEFAULT_REMINDER_CHECK_INTERVAL_HOURS}"),
+        "options": {"queue": "notifications"},
+    },
+}
 
 
 class NotificationDeliveryTask(Task):
@@ -32,19 +55,35 @@ class NotificationDeliveryTask(Task):
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Log task failure."""
+        case_id = kwargs.get("case_id") or (args[0] if args else "unknown")
+        _structured_logger.log_failure(
+            operation="notification_delivery",
+            duration_ms=0.0,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.error(
             "Notification delivery task failed: task_id=%s, case_id=%s, error=%s",
             task_id,
-            kwargs.get("case_id") or (args[0] if args else "unknown"),
+            case_id,
             str(exc),
         )
 
     def on_success(self, retval, task_id, args, kwargs):
         """Log task success."""
+        case_id = kwargs.get("case_id") or (args[0] if args else "unknown")
+        _structured_logger.log_success(
+            operation="notification_delivery",
+            duration_ms=0.0,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.info(
             "Notification delivery task completed: task_id=%s, case_id=%s",
             task_id,
-            kwargs.get("case_id") or (args[0] if args else "unknown"),
+            case_id,
         )
 
 
@@ -57,19 +96,35 @@ class ReminderTask(Task):
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Log task failure."""
+        case_id = kwargs.get("case_id") or (args[0] if args else "unknown")
+        _structured_logger.log_failure(
+            operation="send_reminder",
+            duration_ms=0.0,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.error(
             "Reminder task failed: task_id=%s, case_id=%s, error=%s",
             task_id,
-            kwargs.get("case_id") or (args[0] if args else "unknown"),
+            case_id,
             str(exc),
         )
 
     def on_success(self, retval, task_id, args, kwargs):
         """Log task success."""
+        case_id = kwargs.get("case_id") or (args[0] if args else "unknown")
+        _structured_logger.log_success(
+            operation="send_reminder",
+            duration_ms=0.0,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.info(
             "Reminder task completed: task_id=%s, case_id=%s",
             task_id,
-            kwargs.get("case_id") or (args[0] if args else "unknown"),
+            case_id,
         )
 
 
@@ -93,6 +148,32 @@ class RetryProcessingTask(Task):
         logger.info(
             "Notification retry processing task completed: task_id=%s",
             task_id,
+        )
+
+
+class VendorReminderCheckTask(Task):
+    """Custom base task class for periodic vendor reminder checking."""
+
+    name = "vlr.check_vendor_reminders"
+    max_retries = 1
+    default_retry_delay = 300  # seconds
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """Log task failure."""
+        logger.error(
+            "Vendor reminder check task failed: task_id=%s, error=%s",
+            task_id,
+            str(exc),
+        )
+
+    def on_success(self, retval, task_id, args, kwargs):
+        """Log task success."""
+        logger.info(
+            "Vendor reminder check task completed: task_id=%s, "
+            "reminders_sent=%s, escalations_sent=%s",
+            task_id,
+            retval.get("reminders_sent", 0) if retval else 0,
+            retval.get("escalations_sent", 0) if retval else 0,
         )
 
 
@@ -552,3 +633,366 @@ async def _execute_process_retries(task: RetryProcessingTask) -> dict:
                 str(exc),
             )
             raise
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Task: Check Vendor Reminders (Periodic)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@celery_app.task(
+    base=VendorReminderCheckTask,
+    bind=True,
+    name="vlr.check_vendor_reminders",
+    acks_late=True,
+    time_limit=300,  # Hard limit: 5 minutes
+    soft_time_limit=240,  # Soft limit: 4 minutes
+)
+def check_vendor_reminders_periodic(self: VendorReminderCheckTask) -> dict:
+    """
+    Periodic task that checks for overdue vendor engagements and triggers
+    appropriate reminders (D3, D7, D10) or escalation.
+
+    Runs every 4 hours via Celery Beat. For each reconciliation case in the
+    "vendor_engagement" workflow step:
+    1. Determines the invite date and number of reminders already sent
+    2. Checks if the vendor has uploaded a statement
+    3. Calls EmailNotificationService.determine_reminder_action() to decide
+    4. If action is "send_reminder" → calls send_scheduled_reminder()
+    5. If action is "escalate" → calls send_escalation()
+    6. If action is "none" → skips
+
+    Uses max_retries=1 since this task runs periodically and will
+    execute again on the next schedule.
+
+    Requirements: 15.1, 15.2, 15.3, 15.4
+
+    Returns:
+        Dict with reminder check results including counts of
+        reminders sent, escalations triggered, and cases processed.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(
+            _execute_check_vendor_reminders(task=self)
+        )
+        return result
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=self.default_retry_delay)
+    finally:
+        loop.close()
+
+
+async def _execute_check_vendor_reminders(task: VendorReminderCheckTask) -> dict:
+    """
+    Execute vendor reminder check across all cases in vendor_engagement step.
+
+    For each case:
+    - Queries the invite date (step_entered_at for vendor_engagement)
+    - Counts D3/D7/D10 type reminders already sent
+    - Checks vendor upload status (upload_count > 0 means uploaded)
+    - Uses EmailNotificationService.determine_reminder_action() to decide action
+    - Dispatches reminders or escalations as needed
+    """
+    from sqlalchemy import select, and_, func
+    from sqlalchemy.orm import selectinload
+
+    from src.infrastructure.database.session import async_session_factory
+    from src.infrastructure.database.models.vlr.reconciliation_case_model import (
+        ReconciliationCaseModel,
+    )
+    from src.infrastructure.database.models.vlr.notification_model import (
+        NotificationModel,
+    )
+    from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+    from src.infrastructure.database.models.vlr.vendor_contact_model import (
+        VendorContactModel,
+    )
+    from src.infrastructure.database.repositories.vlr.notification_repository_impl import (
+        NotificationRepositoryImpl,
+    )
+    from src.infrastructure.database.repositories.vlr.case_repository_impl import (
+        CaseRepositoryImpl,
+    )
+    from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
+        SettingRepositoryImpl,
+    )
+    from src.domain.services.vlr.notification_service import (
+        EmailNotificationService,
+        NotificationType,
+    )
+
+    check_start = datetime.now(timezone.utc)
+
+    task.update_state(
+        state="PROGRESS",
+        meta={
+            "phase": "checking_vendor_reminders",
+            "status": "Checking for overdue vendor engagements...",
+        },
+    )
+
+    async with async_session_factory() as session:
+        try:
+            # Query all cases in "vendor_engagement" workflow step
+            # that haven't been uploaded yet (upload_count == 0)
+            # and are not deleted
+            vendor_engagement_stmt = (
+                select(ReconciliationCaseModel)
+                .options(selectinload(ReconciliationCaseModel.vendor))
+                .where(
+                    and_(
+                        ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+                        ReconciliationCaseModel.current_workflow_step == "vendor_engagement",
+                        ReconciliationCaseModel.upload_count == 0,
+                        ReconciliationCaseModel.step_entered_at.isnot(None),
+                    )
+                )
+            )
+            result = await session.execute(vendor_engagement_stmt)
+            engagement_cases = result.scalars().all()
+
+            if not engagement_cases:
+                return {
+                    "status": "completed",
+                    "cases_checked": 0,
+                    "reminders_sent": 0,
+                    "escalations_sent": 0,
+                    "skipped": 0,
+                    "checked_at": check_start.isoformat(),
+                    "duration_seconds": 0.0,
+                }
+
+            # Initialize the EmailNotificationService
+            notification_repo = NotificationRepositoryImpl(session)
+            case_repo = CaseRepositoryImpl(session)
+            setting_repo = SettingRepositoryImpl(session)
+
+            email_service = EmailNotificationService(
+                notification_repository=notification_repo,
+                case_repository=case_repo,
+                setting_repository=setting_repo,
+                email_sender=None,  # Uses default (dev mode) or configure via DI
+            )
+
+            reminders_sent = 0
+            escalations_sent = 0
+            skipped = 0
+            errors = 0
+
+            for case in engagement_cases:
+                try:
+                    case_id = case.id
+                    invite_date = case.step_entered_at
+
+                    # Count BRD-specific reminders (D3/D7/D10) already sent for this case
+                    brd_reminder_types = [
+                        NotificationType.REMINDER_D3.value,
+                        NotificationType.REMINDER_D7.value,
+                        NotificationType.REMINDER_D10.value,
+                    ]
+                    reminder_count_stmt = select(
+                        func.count(NotificationModel.id)
+                    ).where(
+                        and_(
+                            NotificationModel.case_id == case_id,
+                            NotificationModel.type.in_(brd_reminder_types),
+                        )
+                    )
+                    reminder_count_result = await session.execute(reminder_count_stmt)
+                    reminders_already_sent = reminder_count_result.scalar_one()
+
+                    # Determine what action to take
+                    action = email_service.determine_reminder_action(
+                        reminders_sent=reminders_already_sent,
+                        invite_date=invite_date,
+                    )
+
+                    if action["action"] == "send_reminder":
+                        # Get vendor info for the email
+                        vendor = case.vendor
+                        if vendor is None:
+                            logger.warning(
+                                "No vendor found for case %s, skipping reminder",
+                                str(case_id),
+                            )
+                            skipped += 1
+                            continue
+
+                        # Get primary contact email
+                        contact_stmt = select(VendorContactModel).where(
+                            and_(
+                                VendorContactModel.vendor_id == vendor.id,
+                                VendorContactModel.is_primary == True,  # noqa: E712
+                            )
+                        )
+                        contact_result = await session.execute(contact_stmt)
+                        primary_contact = contact_result.scalar_one_or_none()
+
+                        if primary_contact is None:
+                            # Fallback: get any contact
+                            any_contact_stmt = select(VendorContactModel).where(
+                                VendorContactModel.vendor_id == vendor.id
+                            ).limit(1)
+                            any_contact_result = await session.execute(any_contact_stmt)
+                            primary_contact = any_contact_result.scalar_one_or_none()
+
+                        if primary_contact is None:
+                            logger.warning(
+                                "No contact found for vendor %s (case %s), skipping",
+                                str(vendor.id),
+                                str(case_id),
+                            )
+                            skipped += 1
+                            continue
+
+                        # Send the scheduled reminder
+                        portal_token = case.portal_token or str(uuid4())
+                        await email_service.send_scheduled_reminder(
+                            case_id=case_id,
+                            reminder_number=action["reminder_number"],
+                            vendor_email=primary_contact.email,
+                            vendor_name=vendor.name,
+                            portal_token=portal_token,
+                        )
+                        reminders_sent += 1
+
+                        logger.info(
+                            "Reminder D%d sent: case_id=%s, vendor=%s",
+                            action["interval_days"],
+                            str(case_id),
+                            vendor.name,
+                        )
+
+                    elif action["action"] == "escalate":
+                        # Check if escalation was already sent for this case
+                        escalation_count_stmt = select(
+                            func.count(NotificationModel.id)
+                        ).where(
+                            and_(
+                                NotificationModel.case_id == case_id,
+                                NotificationModel.type == NotificationType.ESCALATION.value,
+                            )
+                        )
+                        esc_result = await session.execute(escalation_count_stmt)
+                        escalation_already_sent = esc_result.scalar_one()
+
+                        if escalation_already_sent > 0:
+                            # Already escalated, skip
+                            skipped += 1
+                            continue
+
+                        # Resolve the manager email
+                        # Use a default or look up from SLA configuration
+                        manager_email = await _resolve_manager_email(session, case)
+
+                        days_elapsed = action.get("days_elapsed", 10)
+                        vendor = case.vendor
+                        vendor_name = vendor.name if vendor else "Unknown Vendor"
+
+                        await email_service.send_escalation(
+                            case_id=case_id,
+                            manager_email=manager_email,
+                            vendor_name=vendor_name,
+                            reminder_count=reminders_already_sent,
+                            days_since_invite=days_elapsed,
+                        )
+                        escalations_sent += 1
+
+                        logger.info(
+                            "Escalation sent: case_id=%s, vendor=%s, "
+                            "days_since_invite=%d",
+                            str(case_id),
+                            vendor_name,
+                            days_elapsed,
+                        )
+
+                    else:
+                        # action is "none" - not yet time for a reminder
+                        skipped += 1
+
+                except Exception as case_exc:
+                    errors += 1
+                    logger.error(
+                        "Error processing vendor reminder for case %s: %s",
+                        str(case.id),
+                        str(case_exc),
+                    )
+                    continue
+
+            await session.commit()
+
+            check_end = datetime.now(timezone.utc)
+            duration = (check_end - check_start).total_seconds()
+
+            logger.info(
+                "Vendor reminder check completed: cases=%d, reminders=%d, "
+                "escalations=%d, skipped=%d, errors=%d, duration=%.2fs",
+                len(engagement_cases),
+                reminders_sent,
+                escalations_sent,
+                skipped,
+                errors,
+                duration,
+            )
+
+            return {
+                "status": "completed",
+                "cases_checked": len(engagement_cases),
+                "reminders_sent": reminders_sent,
+                "escalations_sent": escalations_sent,
+                "skipped": skipped,
+                "errors": errors,
+                "checked_at": check_start.isoformat(),
+                "duration_seconds": round(duration, 2),
+            }
+
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "Vendor reminder check failed: error=%s",
+                str(exc),
+            )
+            raise
+
+
+async def _resolve_manager_email(session: object, case: object) -> str:
+    """
+    Resolve the Reconciliation Manager email for escalation.
+
+    Attempts to find the manager email from:
+    1. SLA configuration for the vendor_engagement step
+    2. The reconciliation request's assigned manager
+    3. Falls back to a default escalation email
+
+    Args:
+        session: The database session.
+        case: The ReconciliationCaseModel instance.
+
+    Returns:
+        Email address for the escalation recipient.
+    """
+    try:
+        from sqlalchemy import select, and_
+        from src.infrastructure.database.models.vlr.sla_configuration_model import (
+            SLAConfigurationModel,
+        )
+
+        # Try to get escalation email from SLA config
+        sla_stmt = select(SLAConfigurationModel).where(
+            and_(
+                SLAConfigurationModel.step_name == "vendor_engagement",
+                SLAConfigurationModel.is_active == True,  # noqa: E712
+            )
+        )
+        sla_result = await session.execute(sla_stmt)
+        sla_config = sla_result.scalar_one_or_none()
+
+        if sla_config and sla_config.escalation_email:
+            return sla_config.escalation_email
+    except Exception:
+        pass
+
+    # Fallback to a default manager email
+    return "recon.manager@example.com"

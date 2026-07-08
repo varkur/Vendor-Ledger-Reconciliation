@@ -4,12 +4,15 @@ Thin controller — provides vendor-facing portal access via token-based authent
 Does NOT use standard JWT auth; uses unique portal_token stored on ReconciliationCase.
 
 Routes:
-- GET    /api/v1/vlr/portal/auth/{token}   — Authenticate via portal token
-- POST   /api/v1/vlr/portal/upload         — Upload vendor statement file
-- GET    /api/v1/vlr/portal/statement      — Get reconciliation statement
-- POST   /api/v1/vlr/portal/sign-off       — Record digital sign-off
+- GET    /api/v1/vlr/portal/auth/{token}          — Authenticate via portal token
+- POST   /api/v1/vlr/portal/validate-token        — Validate token with 90-day expiry check
+- POST   /api/v1/vlr/portal/upload                — Upload vendor statement file
+- GET    /api/v1/vlr/portal/statement             — Get reconciliation statement (legacy)
+- GET    /api/v1/vlr/portal/statement/{case_id}   — Get vendor-facing reconciliation results
+- POST   /api/v1/vlr/portal/sign-off             — Record digital sign-off (legacy)
+- POST   /api/v1/vlr/portal/sign-off/{case_id}   — Record vendor approval with confirmation
 
-Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11
+Requirements: 4.1–4.11, 24.1, 24.2, 24.3, 24.4, 33.1, 33.2
 """
 
 from __future__ import annotations
@@ -20,15 +23,21 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, status
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.api.v1.schemas.vlr.portal_schemas import (
     PortalAuthResponse,
+    PortalCaseSignOffRequest,
+    PortalCaseSignOffResponse,
     PortalSignOffRequest,
     PortalSignOffResponse,
     PortalStatementResponse,
+    PortalStatementResultResponse,
     PortalUploadResponse,
+    PortalValidateTokenRequest,
+    PortalValidateTokenResponse,
 )
 from src.domain.exceptions.vlr import (
     FileValidationException,
@@ -42,7 +51,11 @@ from src.infrastructure.database.models.vlr.portal_sign_off_model import PortalS
 from src.infrastructure.database.models.vlr.reconciliation_case_model import (
     ReconciliationCaseModel,
 )
+from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+    ReconciliationRequestModel,
+)
 from src.infrastructure.database.models.vlr.reco_exception_model import RecoExceptionModel
+from src.infrastructure.database.models.vlr.vendor_model import VendorModel
 from src.infrastructure.database.repositories.vlr.case_repository_impl import (
     CaseRepositoryImpl,
 )
@@ -50,6 +63,14 @@ from src.infrastructure.database.repositories.vlr.ledger_entry_repository_impl i
     LedgerEntryRepositoryImpl,
 )
 from src.infrastructure.database.session import get_db_session
+from src.domain.services.vlr.audit_trail_service import (
+    AuditEvent,
+    AuditEventType,
+    AuditTrailService,
+)
+from src.infrastructure.database.repositories.vlr.audit_trail_repository_impl import (
+    AuditTrailRepositoryImpl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +312,22 @@ async def upload_vendor_statement(
         is_reupload,
     )
 
+    # Emit audit event for vendor portal upload (Requirement 38.2)
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username="vendor_portal",
+        event_type=AuditEventType.VENDOR_INTERACTION,
+        case_id=case.id,
+        event_details={
+            "action": "file_upload",
+            "upload_count": new_upload_count,
+            "entries_parsed": len(result.entries),
+            "is_reupload": is_reupload,
+            "filename": file.filename,
+        },
+        ip_address=request.client.host if request.client else None,
+    ))
+
     return PortalUploadResponse(
         case_id=case.id,
         status="data_received",
@@ -495,6 +532,19 @@ async def sign_off(
         body.statement_version,
     )
 
+    # Emit audit event for vendor sign-off (Requirement 38.2)
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username="vendor_portal",
+        event_type=AuditEventType.VENDOR_INTERACTION,
+        case_id=case.id,
+        event_details={
+            "action": "sign_off",
+            "statement_version": body.statement_version,
+        },
+        ip_address=client_ip,
+    ))
+
     return PortalSignOffResponse(
         case_id=case.id,
         signed_at=signed_at,
@@ -503,3 +553,350 @@ async def sign_off(
         status="signed_off",
         message="Digital sign-off recorded successfully.",
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# New Endpoints — Requirements 24.1, 24.2, 24.3, 24.4, 33.1, 33.2
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/validate-token",
+    response_model=PortalValidateTokenResponse,
+    summary="Validate portal access token",
+    responses={
+        410: {"description": "Token has expired (90-day validity exceeded)"},
+        404: {"description": "Token not found"},
+    },
+)
+async def validate_token(
+    body: PortalValidateTokenRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalValidateTokenResponse:
+    """
+    POST /api/v1/vlr/portal/validate-token
+
+    Validates the portal access token. Checks that the token exists in the cases
+    table and that the token_expiry has not been exceeded (90-day validity per Req 33.1).
+
+    Returns case summary (vendor name, period, status) if valid.
+    Returns 410 Gone if token has expired.
+    Returns 404 Not Found if token does not exist.
+
+    Requirement 24.1: Token validation for portal authentication.
+    Requirement 33.1: 90-day validity enforcement.
+    Requirement 33.2: Expiry message on denied access.
+    """
+    # Look up the case by portal token
+    case_repo = CaseRepositoryImpl(session)
+    case = await case_repo.get_by_token(body.token)
+
+    if case is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Portal token not found. Please check the link or contact the reconciliation team.",
+        )
+
+    # Check token expiry — return 410 Gone if expired (per design.md error handling)
+    if case.token_expiry and case.token_expiry < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "This portal link has expired. Portal links are valid for 90 days. "
+                "Please contact the reconciliation team to request a new invitation."
+            ),
+        )
+
+    # Fetch vendor name
+    vendor_stmt = select(VendorModel).where(VendorModel.id == case.vendor_id)
+    vendor_result = await session.execute(vendor_stmt)
+    vendor = vendor_result.scalar_one_or_none()
+    vendor_name = vendor.name if vendor else "Unknown Vendor"
+
+    # Fetch reconciliation period from the parent request
+    request_stmt = select(ReconciliationRequestModel).where(
+        ReconciliationRequestModel.id == case.request_id
+    )
+    request_result = await session.execute(request_stmt)
+    recon_request = request_result.scalar_one_or_none()
+
+    period_start = recon_request.period_start if recon_request else None
+    period_end = recon_request.period_end if recon_request else None
+
+    logger.info(
+        "Portal token validated successfully: case_id=%s, vendor=%s",
+        case.id,
+        vendor_name,
+    )
+
+    return PortalValidateTokenResponse(
+        case_id=case.id,
+        vendor_name=vendor_name,
+        period_start=period_start,
+        period_end=period_end,
+        status=case.status,
+        upload_count=case.upload_count,
+        max_uploads=MAX_UPLOAD_ATTEMPTS,
+        token_valid_until=case.token_expiry,
+    )
+
+
+@router.get(
+    "/statement/{case_id}",
+    response_model=PortalStatementResultResponse,
+    summary="Get vendor-facing reconciliation results",
+    responses={
+        410: {"description": "Token has expired"},
+        404: {"description": "Case not found or access denied"},
+    },
+)
+async def get_statement_by_case(
+    case_id: UUID,
+    request: Request,
+    x_portal_token: str = Header(..., alias="X-Portal-Token"),
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalStatementResultResponse:
+    """
+    GET /api/v1/vlr/portal/statement/{case_id}
+
+    Returns vendor-facing reconciliation results for a specific case.
+    Displays matched items summary, status, and balances.
+    Does NOT include internal SAP data per BRD Section 7.1.
+
+    Requirement 24.3: Statement view for vendor portal.
+    """
+    # Validate token and verify case access
+    case = await _validate_portal_token_with_expiry(x_portal_token, session)
+
+    # Verify the token belongs to this case
+    if str(case.id) != str(case_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found or access denied.",
+        )
+
+    # Fetch vendor name
+    vendor_stmt = select(VendorModel).where(VendorModel.id == case.vendor_id)
+    vendor_result = await session.execute(vendor_stmt)
+    vendor = vendor_result.scalar_one_or_none()
+    vendor_name = vendor.name if vendor else "Unknown Vendor"
+
+    # Fetch reconciliation period
+    request_stmt = select(ReconciliationRequestModel).where(
+        ReconciliationRequestModel.id == case.request_id
+    )
+    request_result = await session.execute(request_stmt)
+    recon_request = request_result.scalar_one_or_none()
+
+    period_start = recon_request.period_start if recon_request else None
+    period_end = recon_request.period_end if recon_request else None
+
+    # Count matched entries (pairs)
+    matched_count_stmt = select(func.count(MatchResultModel.id)).where(
+        MatchResultModel.case_id == case.id
+    )
+    matched_count_result = await session.execute(matched_count_stmt)
+    total_matched_entries = matched_count_result.scalar_one() or 0
+
+    # Count unmatched vendor entries (entries with no match_id)
+    unmatched_vendor_stmt = select(func.count(LedgerEntryModel.id)).where(
+        and_(
+            LedgerEntryModel.case_id == case.id,
+            LedgerEntryModel.side == "vendor",
+            LedgerEntryModel.match_id.is_(None),
+        )
+    )
+    unmatched_vendor_result = await session.execute(unmatched_vendor_stmt)
+    total_unmatched_vendor = unmatched_vendor_result.scalar_one() or 0
+
+    # Build match summary (grouped by match_type)
+    match_summary_stmt = (
+        select(
+            MatchResultModel.match_type,
+            func.count(MatchResultModel.id).label("count"),
+            func.sum(MatchResultModel.matched_amount).label("total_amount"),
+        )
+        .where(MatchResultModel.case_id == case.id)
+        .group_by(MatchResultModel.match_type)
+    )
+    match_summary_result = await session.execute(match_summary_stmt)
+    match_summary = [
+        {
+            "match_type": row.match_type,
+            "count": row.count,
+            "total_amount": str(row.total_amount) if row.total_amount else "0",
+        }
+        for row in match_summary_result.all()
+    ]
+
+    # Generate statement version
+    version_input = f"{case.id}:{case.upload_count}:{case.modified_date.isoformat() if case.modified_date else ''}"
+    statement_version = hashlib.sha256(version_input.encode()).hexdigest()[:16]
+
+    return PortalStatementResultResponse(
+        case_id=case.id,
+        status=case.status,
+        vendor_name=vendor_name,
+        period_start=period_start,
+        period_end=period_end,
+        total_matched_entries=total_matched_entries,
+        total_unmatched_vendor=total_unmatched_vendor,
+        vendor_opening_balance=case.vendor_opening_balance,
+        vendor_closing_balance=case.vendor_closing_balance,
+        net_difference=case.net_difference,
+        match_summary=match_summary,
+        statement_version=statement_version,
+    )
+
+
+@router.post(
+    "/sign-off/{case_id}",
+    response_model=PortalCaseSignOffResponse,
+    summary="Record vendor approval for a specific case",
+    responses={
+        410: {"description": "Token has expired"},
+        404: {"description": "Case not found or access denied"},
+        409: {"description": "Case not in a state that allows sign-off"},
+    },
+)
+async def sign_off_case(
+    case_id: UUID,
+    body: PortalCaseSignOffRequest,
+    request: Request,
+    x_portal_token: str = Header(..., alias="X-Portal-Token"),
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalCaseSignOffResponse:
+    """
+    POST /api/v1/vlr/portal/sign-off/{case_id}
+
+    Records the vendor's confirmation/approval for a specific reconciliation case.
+    Captures IP address, timestamp, confirmation text, and statement version.
+    Creates a PortalSignOff record and updates case status.
+
+    Requirement 24.4: Vendor approval recording.
+    """
+    # Validate token with expiry check
+    case = await _validate_portal_token_with_expiry(x_portal_token, session)
+
+    # Verify the token belongs to this case
+    if str(case.id) != str(case_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found or access denied.",
+        )
+
+    # Ensure the case is in a state that allows sign-off
+    allowed_statuses = ("matched", "review", "pending_approval")
+    if case.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot sign off case in '{case.status}' status. "
+                f"Case must be in one of: {', '.join(allowed_statuses)}."
+            ),
+        )
+
+    # Extract client IP address
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+
+    signed_at = datetime.now(timezone.utc)
+
+    # Create sign-off record with confirmation text
+    sign_off_record = PortalSignOffModel(
+        id=uuid4(),
+        case_id=case.id,
+        ip_address=client_ip,
+        statement_version=body.statement_version,
+        confirmation_text=body.confirmation_text,
+        signed_at=signed_at,
+        created_by="vendor_portal",
+        modified_by="vendor_portal",
+    )
+    session.add(sign_off_record)
+
+    # Transition case to signed_off status
+    case_repo = CaseRepositoryImpl(session)
+    await case_repo.update(
+        case.id,
+        {
+            "status": "signed_off",
+            "modified_by": "vendor_portal",
+            "modified_date": signed_at,
+        },
+    )
+
+    await session.flush()
+
+    logger.info(
+        "Portal sign-off recorded: case_id=%s, ip=%s, version=%s, confirmation='%s'",
+        case.id,
+        client_ip,
+        body.statement_version,
+        body.confirmation_text[:50],
+    )
+
+    # Emit audit event for vendor case sign-off (Requirement 38.2)
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username="vendor_portal",
+        event_type=AuditEventType.VENDOR_INTERACTION,
+        case_id=case.id,
+        event_details={
+            "action": "case_sign_off",
+            "statement_version": body.statement_version,
+            "confirmation_text": body.confirmation_text[:100],
+        },
+        ip_address=client_ip,
+    ))
+
+    return PortalCaseSignOffResponse(
+        case_id=case.id,
+        signed_at=signed_at,
+        ip_address=client_ip,
+        confirmation_text=body.confirmation_text,
+        statement_version=body.statement_version,
+        status="signed_off",
+        message="Vendor approval recorded successfully.",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helper — Token validation with 410 Gone on expiry
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _validate_portal_token_with_expiry(
+    token: str,
+    session: AsyncSession,
+) -> ReconciliationCaseModel:
+    """
+    Validate a portal token and return the associated case.
+    Returns 410 Gone for expired tokens (per design.md error handling).
+
+    Raises:
+        HTTPException 404: Token not found.
+        HTTPException 410: Token has expired (90-day validity exceeded).
+    """
+    case_repo = CaseRepositoryImpl(session)
+    case = await case_repo.get_by_token(token)
+
+    if case is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Portal token not found.",
+        )
+
+    # Check token expiry — return 410 Gone per design.md
+    if case.token_expiry and case.token_expiry < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "This portal link has expired. Portal links are valid for 90 days. "
+                "Please contact the reconciliation team to request a new invitation."
+            ),
+        )
+
+    return case

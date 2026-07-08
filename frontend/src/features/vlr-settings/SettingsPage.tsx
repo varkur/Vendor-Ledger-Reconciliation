@@ -1,10 +1,13 @@
 /**
  * Settings & Configuration page — VLR system configuration.
+ * Wired to backend GET/PUT /api/v1/vlr/settings with loading/error states.
  * Sections: Tolerance Config, Matching Preferences, Notification Intervals,
  *           Approval Thresholds, TDS/GST Defaults, SAP Connection
+ *
+ * Requirements: 23.7, 25.1, 25.2
  */
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { InputText } from 'primereact/inputtext';
 import { InputNumber } from 'primereact/inputnumber';
 import { Dropdown } from 'primereact/dropdown';
@@ -12,60 +15,196 @@ import { Button } from 'primereact/button';
 import { InputSwitch } from 'primereact/inputswitch';
 import { Password } from 'primereact/password';
 import { Toast } from 'primereact/toast';
-import { useRef } from 'react';
+import { ProgressSpinner } from 'primereact/progressspinner';
+import { Message } from 'primereact/message';
+
+import { useVLRSettings, useUpdateSettings, useTestSAPConnection } from './hooks/useSettings';
+import type { VLRSettings } from './api/settingsApi';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MATCHING_METHODS = [
+  { label: 'Automatic (AI-based)', value: 'auto' },
+  { label: 'Rule-based', value: 'rules' },
+  { label: 'Manual Only', value: 'manual' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Component
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const SettingsPage = () => {
   const toast = useRef<Toast>(null);
 
-  // Tolerance Configuration
+  // API hooks
+  const { data: settings, isLoading, isError, error, refetch } = useVLRSettings();
+  const updateMutation = useUpdateSettings();
+  const testConnectionMutation = useTestSAPConnection();
+
+  // Local form state
   const [amountTolerance, setAmountTolerance] = useState<number | null>(500);
   const [percentTolerance, setPercentTolerance] = useState<number | null>(2);
   const [dateTolerance, setDateTolerance] = useState<number | null>(3);
-
-  // Matching Preferences
   const [matchingMethod, setMatchingMethod] = useState('auto');
   const [autoMatchThreshold, setAutoMatchThreshold] = useState<number | null>(95);
   const [enableFuzzyMatch, setEnableFuzzyMatch] = useState(true);
-
-  // Notification Intervals
   const [reminderInterval, setReminderInterval] = useState<number | null>(7);
   const [maxReminders, setMaxReminders] = useState<number | null>(3);
   const [escalationDays, setEscalationDays] = useState<number | null>(15);
-
-  // Approval Thresholds
   const [autoApproveLimit, setAutoApproveLimit] = useState<number | null>(10000);
   const [managerApproveLimit, setManagerApproveLimit] = useState<number | null>(500000);
   const [requireDualApproval, setRequireDualApproval] = useState(true);
-
-  // TDS/GST Defaults
   const [defaultTdsRate, setDefaultTdsRate] = useState<number | null>(2);
   const [defaultGstRate, setDefaultGstRate] = useState<number | null>(18);
   const [tdsThreshold, setTdsThreshold] = useState<number | null>(30000);
-
-  // SAP Connection
-  const [sapHost, setSapHost] = useState('sap-prod.company.local');
-  const [sapClient, setSapClient] = useState('100');
-  const [sapUsername, setSapUsername] = useState('VLR_SERVICE');
+  const [sapHost, setSapHost] = useState('');
+  const [sapClient, setSapClient] = useState('');
+  const [sapUsername, setSapUsername] = useState('');
   const [sapPassword, setSapPassword] = useState('');
-  const [sapSystemNumber, setSapSystemNumber] = useState('00');
+  const [sapSystemNumber, setSapSystemNumber] = useState('');
 
-  const matchingMethods = [
-    { label: 'Automatic (AI-based)', value: 'auto' },
-    { label: 'Rule-based', value: 'rules' },
-    { label: 'Manual Only', value: 'manual' },
-  ];
+  // Sync local state when server data loads
+  useEffect(() => {
+    if (settings) {
+      setAmountTolerance(settings.tolerance.amount_tolerance);
+      setPercentTolerance(settings.tolerance.percent_tolerance);
+      setDateTolerance(settings.tolerance.date_tolerance);
+      setMatchingMethod(settings.matching.matching_method);
+      setAutoMatchThreshold(settings.matching.auto_match_threshold);
+      setEnableFuzzyMatch(settings.matching.enable_fuzzy_match);
+      setReminderInterval(settings.notifications.reminder_interval_days);
+      setMaxReminders(settings.notifications.max_reminders);
+      setEscalationDays(settings.notifications.escalation_days);
+      setAutoApproveLimit(settings.approvals.auto_approve_limit);
+      setManagerApproveLimit(settings.approvals.manager_approve_limit);
+      setRequireDualApproval(settings.approvals.require_dual_approval);
+      setDefaultTdsRate(settings.tax.default_tds_rate);
+      setDefaultGstRate(settings.tax.default_gst_rate);
+      setTdsThreshold(settings.tax.tds_threshold);
+      setSapHost(settings.sap_connection.sap_host);
+      setSapClient(settings.sap_connection.sap_client);
+      setSapUsername(settings.sap_connection.sap_username);
+      setSapSystemNumber(settings.sap_connection.sap_system_number);
+      // Don't set password from server (it should be masked)
+    }
+  }, [settings]);
+
+  // Build settings payload from local state
+  const buildSettingsPayload = (): Partial<VLRSettings> => ({
+    tolerance: {
+      amount_tolerance: amountTolerance ?? 0,
+      percent_tolerance: percentTolerance ?? 0,
+      date_tolerance: dateTolerance ?? 0,
+    },
+    matching: {
+      matching_method: matchingMethod as 'auto' | 'rules' | 'manual',
+      auto_match_threshold: autoMatchThreshold ?? 0,
+      enable_fuzzy_match: enableFuzzyMatch,
+    },
+    notifications: {
+      reminder_interval_days: reminderInterval ?? 7,
+      max_reminders: maxReminders ?? 3,
+      escalation_days: escalationDays ?? 15,
+    },
+    approvals: {
+      auto_approve_limit: autoApproveLimit ?? 0,
+      manager_approve_limit: managerApproveLimit ?? 0,
+      require_dual_approval: requireDualApproval,
+    },
+    tax: {
+      default_tds_rate: defaultTdsRate ?? 0,
+      default_gst_rate: defaultGstRate ?? 0,
+      tds_threshold: tdsThreshold ?? 0,
+    },
+    sap_connection: {
+      sap_host: sapHost,
+      sap_client: sapClient,
+      sap_username: sapUsername,
+      ...(sapPassword ? { sap_password: sapPassword } : {}),
+      sap_system_number: sapSystemNumber,
+    },
+  });
 
   const handleSave = () => {
-    toast.current?.show({ severity: 'success', summary: 'Settings Saved', detail: 'Configuration has been updated successfully.' });
+    updateMutation.mutate(buildSettingsPayload(), {
+      onSuccess: () => {
+        toast.current?.show({
+          severity: 'success',
+          summary: 'Settings Saved',
+          detail: 'Configuration has been updated successfully.',
+        });
+      },
+      onError: (err) => {
+        toast.current?.show({
+          severity: 'error',
+          summary: 'Save Failed',
+          detail: err.message || 'Failed to save settings. Please try again.',
+        });
+      },
+    });
   };
 
   const handleTestConnection = () => {
-    toast.current?.show({ severity: 'info', summary: 'Testing Connection', detail: 'SAP connection test in progress...' });
-    setTimeout(() => {
-      toast.current?.show({ severity: 'success', summary: 'Connection Successful', detail: 'SAP system is reachable.' });
-    }, 2000);
+    testConnectionMutation.mutate(
+      {
+        sap_host: sapHost,
+        sap_client: sapClient,
+        sap_username: sapUsername,
+        sap_password: sapPassword,
+        sap_system_number: sapSystemNumber,
+      },
+      {
+        onSuccess: (response) => {
+          if (response.success) {
+            toast.current?.show({
+              severity: 'success',
+              summary: 'Connection Successful',
+              detail: response.message || 'SAP system is reachable.',
+            });
+          } else {
+            toast.current?.show({
+              severity: 'warn',
+              summary: 'Connection Failed',
+              detail: response.message || 'Unable to connect to SAP system.',
+            });
+          }
+        },
+        onError: (err) => {
+          toast.current?.show({
+            severity: 'error',
+            summary: 'Connection Test Failed',
+            detail: err.message || 'Could not test SAP connection.',
+          });
+        },
+      }
+    );
   };
 
+  // ─── Loading state ─────────────────────────────────────────────────────────
+  if (isLoading) {
+    return (
+      <div className="flex justify-content-center align-items-center" style={{ minHeight: 300 }}>
+        <ProgressSpinner style={{ width: '50px', height: '50px' }} />
+      </div>
+    );
+  }
+
+  // ─── Error state ───────────────────────────────────────────────────────────
+  if (isError) {
+    return (
+      <div className="flex flex-column align-items-center gap-3" style={{ padding: '2rem' }}>
+        <Message
+          severity="error"
+          text={error?.message || 'Failed to load settings. Please try again.'}
+        />
+        <Button label="Retry" icon="pi pi-refresh" onClick={() => refetch()} />
+      </div>
+    );
+  }
+
+  // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div>
       <Toast ref={toast} />
@@ -74,7 +213,12 @@ export const SettingsPage = () => {
       <div className="em-page-header">
         <h2>Settings & Configuration</h2>
         <div className="em-page-header-actions">
-          <Button label="Save All Settings" icon="pi pi-save" onClick={handleSave} />
+          <Button
+            label="Save All Settings"
+            icon="pi pi-save"
+            onClick={handleSave}
+            loading={updateMutation.isPending}
+          />
         </div>
       </div>
 
@@ -146,7 +290,7 @@ export const SettingsPage = () => {
                 <Dropdown
                   id="matching-method"
                   value={matchingMethod}
-                  options={matchingMethods}
+                  options={MATCHING_METHODS}
                   onChange={(e) => setMatchingMethod(e.value)}
                   className="w-full"
                 />
@@ -393,6 +537,7 @@ export const SettingsPage = () => {
                 icon="pi pi-bolt"
                 className="p-button-outlined"
                 onClick={handleTestConnection}
+                loading={testConnectionMutation.isPending}
               />
             </div>
           </div>

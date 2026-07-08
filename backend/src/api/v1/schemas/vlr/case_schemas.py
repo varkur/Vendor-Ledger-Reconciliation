@@ -76,3 +76,13 @@ class ReconcileResponse(BaseModel):
     task_id: str | None = Field(default=None, description="Celery task ID if async")
     status: str
     message: str
+
+
+class CaseListResponse(BaseModel):
+    """Paginated reconciliation case list response."""
+
+    items: list[ReconciliationCaseResponse]
+    total: int = Field(default=0, description="Total matching records")
+    page: int = Field(default=1, description="Current page number")
+    page_size: int = Field(default=10, description="Items per page")
+    total_pages: int = Field(default=0, description="Total pages available")

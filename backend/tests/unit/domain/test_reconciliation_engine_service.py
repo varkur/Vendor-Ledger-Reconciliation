@@ -1,10 +1,10 @@
 """
 Unit tests for ReconciliationEngineService domain logic.
 
-Tests the 6-pass matching algorithm, no-double-match invariant,
+Tests the 7-pass matching algorithm, no-double-match invariant,
 statistics calculation, and clear_previous_results for re-reconciliation.
 
-Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.9, 5.10, 5.11, 5.12, 5.13
+Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.9, 5.10, 5.11, 5.12, 5.13, 17.1
 """
 
 import pytest
@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from src.domain.services.vlr.reconciliation_engine_service import (
+    CONFIDENCE_SCORES,
     LedgerEntryData,
     MatchPassType,
     ReconciliationEngineService,
@@ -389,7 +390,8 @@ class TestFuzzyReferenceMatch:
 
         assert len(pairs) == 1
         assert pairs[0].pass_number == MatchPassType.FUZZY_REFERENCE
-        assert pairs[0].confidence_score > 0.8
+        # BRD: Pass 3 confidence = 0.70 (normalized from MatchScore 70)
+        assert pairs[0].confidence_score == 0.70
 
     def test_fuzzy_match_very_different_references(
         self, service: ReconciliationEngineService
@@ -864,3 +866,881 @@ class TestPartitionInvariant:
             len(matched_vendor_ids) + len(result.unmatched_vendor_ids)
             == len(vendor)
         )
+
+
+# ─── Pass 6: Date-proximity Match Tests ────────────────────────────────────────
+
+
+class TestDateProximityMatch:
+    """Tests for Pass 6: Date-proximity Match (amount matches + date within N days)."""
+
+    def test_date_proximity_match_same_amount_within_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match entries with same absolute amount and dates within tolerance."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 17), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        assert pairs[0].company_entry_id == company[0].id
+        assert pairs[0].vendor_entry_id == vendor[0].id
+        assert pairs[0].confidence_score == 0.70
+        assert pairs[0].pass_number == MatchPassType.DATE_PROXIMITY
+        assert pairs[0].difference_amount == Decimal("0")
+
+    def test_date_proximity_match_date_exceeds_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Should not match when date difference exceeds tolerance."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 20), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_date_proximity_match_different_amounts_no_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Should not match when amounts differ even if dates are close."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("999"),
+                posting_date=date(2024, 3, 16), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_date_proximity_match_exact_boundary(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match when date difference is exactly at the tolerance boundary."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("500"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("500"),
+                posting_date=date(2024, 3, 18), reference_number="VENDOR-ABC"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 1
+
+    def test_date_proximity_match_vendor_date_before_company(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match when vendor date is before company date (within tolerance)."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("2000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("2000"),
+                posting_date=date(2024, 3, 13), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 1
+
+    def test_date_proximity_match_picks_closest_date(
+        self, service: ReconciliationEngineService
+    ):
+        """Should prefer the vendor entry with the closest date when multiple candidates exist."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 18), reference_number="VENDOR-A"
+        )
+        v2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 16), reference_number="VENDOR-B"
+        )
+
+        pairs = service._date_proximity_match([c1], [v1, v2], date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        assert pairs[0].vendor_entry_id == v2.id  # closer date
+
+    def test_date_proximity_match_no_double_vendor_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Each vendor entry should be matched at most once."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        c2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 16), reference_number="REF-002"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="VENDOR-XYZ"
+        )
+
+        pairs = service._date_proximity_match([c1, c2], [v1], date_tolerance_days=3)
+        assert len(pairs) == 1
+
+    def test_date_proximity_match_configurable_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Should respect the configurable date tolerance parameter."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 20), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        # 5 days apart - should not match with 3-day tolerance
+        pairs_3 = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs_3) == 0
+
+        # 5 days apart - should match with 5-day tolerance
+        pairs_5 = service._date_proximity_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs_5) == 1
+
+    def test_date_proximity_match_uses_absolute_amount(
+        self, service: ReconciliationEngineService
+    ):
+        """Should compare absolute amounts (handles negative amounts for credits)."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("-1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("-1000"),
+                posting_date=date(2024, 3, 16), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 1
+
+    def test_date_proximity_match_zero_tolerance_only_same_date(
+        self, service: ReconciliationEngineService
+    ):
+        """With zero day tolerance, should only match if dates are identical."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor_same_date = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="VENDOR-XYZ"
+            )
+        ]
+        vendor_diff_date = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 16), reference_number="VENDOR-ABC"
+            )
+        ]
+
+        pairs_same = service._date_proximity_match(company, vendor_same_date, date_tolerance_days=0)
+        assert len(pairs_same) == 1
+
+        pairs_diff = service._date_proximity_match(company, vendor_diff_date, date_tolerance_days=0)
+        assert len(pairs_diff) == 0
+
+    def test_date_proximity_match_multiple_matches(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match multiple distinct pairs correctly."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("500"),
+            posting_date=date(2024, 3, 10), reference_number="REF-A"
+        )
+        c2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("750"),
+            posting_date=date(2024, 3, 20), reference_number="REF-B"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("500"),
+            posting_date=date(2024, 3, 12), reference_number="VENDOR-1"
+        )
+        v2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("750"),
+            posting_date=date(2024, 3, 21), reference_number="VENDOR-2"
+        )
+
+        pairs = service._date_proximity_match([c1, c2], [v1, v2], date_tolerance_days=3)
+
+        assert len(pairs) == 2
+        matched_vendor_ids = {p.vendor_entry_id for p in pairs}
+        assert v1.id in matched_vendor_ids
+        assert v2.id in matched_vendor_ids
+
+
+class TestDateProximityMatchInFullExecution:
+    """Tests verifying Pass 6 is correctly wired into the full execution pipeline."""
+
+    @pytest.fixture
+    def service(
+        self,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+        mock_case_repo: AsyncMock,
+        mock_exception_repo: AsyncMock,
+    ) -> ReconciliationEngineService:
+        """Create ReconciliationEngineService with mocked repositories."""
+        return ReconciliationEngineService(
+            ledger_entry_repository=mock_ledger_repo,
+            match_result_repository=mock_match_repo,
+            case_repository=mock_case_repo,
+            exception_repository=mock_exception_repo,
+        )
+
+    @pytest.mark.asyncio
+    async def test_date_proximity_match_in_pipeline(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Pass 6 should match entries that don't match on reference but match on amount+date."""
+        case_id = uuid4()
+        # Same amount, close dates, different references - should match in pass 6
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1]
+            return [v1]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, date_tolerance_days=3)
+
+        assert len(result.match_pairs) == 1
+        assert result.match_pairs[0].pass_number == MatchPassType.DATE_PROXIMITY
+        assert result.match_pairs[0].confidence_score == 0.70
+        assert result.unmatched_company_ids == []
+        assert result.unmatched_vendor_ids == []
+
+    @pytest.mark.asyncio
+    async def test_exact_match_takes_priority_over_date_proximity(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Entries matched in Pass 1 (exact) should not be available for Pass 6."""
+        case_id = uuid4()
+        # This should match exactly in Pass 1
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1]
+            return [v1]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, date_tolerance_days=3)
+
+        # Should be exact match, not date-proximity
+        assert len(result.match_pairs) == 1
+        assert result.match_pairs[0].pass_number == MatchPassType.EXACT
+
+    @pytest.mark.asyncio
+    async def test_date_proximity_needs_confirmation(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Date-proximity matches should flag needs_confirmation."""
+        case_id = uuid4()
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1]
+            return [v1]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, date_tolerance_days=3)
+
+        assert result.needs_confirmation is True
+
+# ─── Confidence Scoring Tests ─────────────────────────────────────────────────
+
+
+class TestConfidenceScoring:
+    """Tests verifying correct confidence scores per BRD Section 5.6.10.
+
+    Requirements: 17.2 - Assign confidence score to each match result.
+    """
+
+    def test_exact_match_confidence_is_1_0(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 1 (Exact): BRD MatchScore = 100 → confidence = 1.0."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+
+        pairs = service._exact_match(company, vendor)
+
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 1.0
+        assert pairs[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.EXACT]
+
+    def test_tolerance_match_confidence_is_0_85(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 2 (Tolerance): BRD MatchScore = 85 → confidence = 0.85."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1005"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+
+        pairs = service._tolerance_match(company, vendor, Decimal("10"))
+
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 0.85
+        assert pairs[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.TOLERANCE]
+
+    def test_fuzzy_reference_match_confidence_is_0_70(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 3 (Fuzzy Reference): BRD MatchScore = 70 → confidence = 0.70."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="INV-2024-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="INV-2024-0O1"
+            )
+        ]
+
+        pairs = service._fuzzy_reference_match(company, vendor, 0.8)
+
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 0.70
+        assert pairs[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.FUZZY_REFERENCE]
+
+    def test_one_to_many_confidence_is_0_80(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 4 (One-to-Many): BRD MatchScore = 80 → confidence = 0.80."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("600"),
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        v2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("400"),
+            posting_date=date(2024, 3, 15), reference_number="REF-B"
+        )
+
+        groups = service._one_to_many_match([c1], [v1, v2])
+
+        assert len(groups) == 1
+        assert groups[0].confidence_score == 0.80
+        assert groups[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.ONE_TO_MANY]
+
+    def test_many_to_one_confidence_is_0_75(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 5 (Many-to-One): BRD MatchScore = 75 → confidence = 0.75."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("400"),
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        c2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("600"),
+            posting_date=date(2024, 3, 15), reference_number="REF-B"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+
+        groups = service._many_to_one_match([c1, c2], [v1])
+
+        assert len(groups) == 1
+        assert groups[0].confidence_score == 0.75
+        assert groups[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.MANY_TO_ONE]
+
+    def test_date_proximity_match_confidence_is_0_70(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 6 (Date-proximity): BRD MatchScore = 70 → confidence = 0.70."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 17), reference_number="REF-999"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 0.70
+        assert pairs[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.DATE_PROXIMITY]
+
+    def test_confidence_scores_all_in_valid_range(
+        self, service: ReconciliationEngineService
+    ):
+        """All confidence scores must be in [0.0, 1.0] range."""
+        for pass_type, score in CONFIDENCE_SCORES.items():
+            assert 0.0 <= score <= 1.0, (
+                f"Pass {pass_type}: confidence {score} not in [0.0, 1.0]"
+            )
+
+    def test_confidence_score_constant_values_match_brd(self):
+        """Verify CONFIDENCE_SCORES constant matches BRD Section 5.6.10."""
+        assert CONFIDENCE_SCORES[MatchPassType.EXACT] == 1.0
+        assert CONFIDENCE_SCORES[MatchPassType.TOLERANCE] == 0.85
+        assert CONFIDENCE_SCORES[MatchPassType.FUZZY_REFERENCE] == 0.70
+        assert CONFIDENCE_SCORES[MatchPassType.ONE_TO_MANY] == 0.80
+        assert CONFIDENCE_SCORES[MatchPassType.MANY_TO_ONE] == 0.75
+        assert CONFIDENCE_SCORES[MatchPassType.DATE_PROXIMITY] == 0.70
+        assert CONFIDENCE_SCORES[MatchPassType.UNMATCHED] == 0.0
+
+
+# ─── No-Double-Match Invariant Tests ──────────────────────────────────────────
+
+
+class TestNoDoubleMatchInvariant:
+    """Tests verifying the no-double-match invariant (MR-001, MR-002).
+
+    Requirements: 17.3, 17.4, 36.1, 36.2, 36.3
+    - MR-001: A transaction can only be matched to one counterpart.
+    - MR-002: Once matched in Pass N, excluded from Pass N+1 onward.
+    """
+
+    async def test_entries_matched_in_pass1_excluded_from_pass2(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Entries matched in Pass 1 (Exact) must be excluded from Pass 2 (Tolerance).
+
+        Requirement 36.1: Mark all matched entries as consumed after Pass 1.
+        Requirement 36.2: Exclude consumed entries from Pass 2 through Pass 7.
+        """
+        case_id = uuid4()
+        # c1/v1 will match exactly in Pass 1
+        # c1 should NOT be re-matched in Pass 2 even if it would also match
+        # within tolerance against v2
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+        # v2 is close to c1's amount and has same reference - would match in Pass 2
+        v2 = make_entry("vendor", "1002.00", date(2024, 3, 15), "REF-001")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1]
+            return [v1, v2]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, tolerance=Decimal("5"))
+
+        # c1 should be matched exactly once (in Pass 1)
+        c1_matches = [p for p in result.match_pairs if p.company_entry_id == c1.id]
+        assert len(c1_matches) == 1
+        assert c1_matches[0].pass_number == MatchPassType.EXACT
+        # v1 should be matched exactly once
+        v1_matches = [p for p in result.match_pairs if p.vendor_entry_id == v1.id]
+        assert len(v1_matches) == 1
+
+    async def test_entries_matched_in_pass2_excluded_from_pass3(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Entries matched in Pass 2 (Tolerance) must be excluded from Pass 3 (Fuzzy).
+
+        Requirement 36.3: Exclusion rule applies after each subsequent pass.
+        """
+        case_id = uuid4()
+        # c1/v1 will match in Pass 2 (tolerance) because refs match and amounts within tolerance
+        c1 = make_entry("company", "1005.00", date(2024, 3, 15), "REF-001")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+        # v2 has same amount as c1 and similar ref - could match in Pass 3
+        v2 = make_entry("vendor", "1005.00", date(2024, 3, 15), "REF-0O1")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1]
+            return [v1, v2]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, tolerance=Decimal("10"))
+
+        # c1 should only appear once across all matches
+        c1_matches = [p for p in result.match_pairs if p.company_entry_id == c1.id]
+        assert len(c1_matches) == 1
+        # Should be matched in Pass 2 (not Pass 3)
+        assert c1_matches[0].pass_number == MatchPassType.TOLERANCE
+
+    async def test_no_entry_appears_in_multiple_match_results(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """No single entry should appear in more than one match result.
+
+        Requirement 17.3: No-double-match invariant.
+        """
+        case_id = uuid4()
+        # Create entries that could potentially match across multiple passes
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        c2 = make_entry("company", "500.00", date(2024, 3, 16), "REF-002")
+        c3 = make_entry("company", "750.00", date(2024, 3, 17), "REF-003")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+        v2 = make_entry("vendor", "500.00", date(2024, 3, 16), "REF-002")
+        v3 = make_entry("vendor", "750.00", date(2024, 3, 18), "REF-003")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1, c2, c3]
+            return [v1, v2, v3]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id, tolerance=Decimal("5"))
+
+        # Collect all matched entry IDs from pairs
+        all_company_ids = [p.company_entry_id for p in result.match_pairs]
+        all_vendor_ids = [p.vendor_entry_id for p in result.match_pairs]
+        # Also from groups
+        for group in result.match_groups:
+            all_company_ids.extend(group.company_entry_ids)
+            all_vendor_ids.extend(group.vendor_entry_ids)
+
+        # No duplicates allowed (MR-001)
+        assert len(all_company_ids) == len(set(all_company_ids)), \
+            "Company entry matched more than once"
+        assert len(all_vendor_ids) == len(set(all_vendor_ids)), \
+            "Vendor entry matched more than once"
+
+    async def test_consumed_entries_excluded_from_all_subsequent_passes(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Once matched, entries must not appear in any subsequent pass results.
+
+        Requirement 17.4: When Pass 1 produces matches, exclude from subsequent passes.
+        Requirement 36.3: Entries matched in Pass N excluded from Pass N+1 onward.
+        """
+        case_id = uuid4()
+        # c1/v1: exact match (Pass 1)
+        # c2/v2: only amount within tolerance, different ref would NOT match
+        # c3/v3: same amount, close dates, different refs → date proximity
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        c2 = make_entry("company", "2000.00", date(2024, 3, 20), "REF-002")
+        c3 = make_entry("company", "3000.00", date(2024, 3, 25), "REF-003")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+        v2 = make_entry("vendor", "2000.00", date(2024, 3, 20), "REF-002")
+        v3 = make_entry("vendor", "3000.00", date(2024, 3, 27), "XYZ-999")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1, c2, c3]
+            return [v1, v2, v3]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(
+            case_id, tolerance=Decimal("5"), date_tolerance_days=3
+        )
+
+        # c1 and c2 matched exactly in Pass 1
+        # c3/v3: same amount, dates 2 days apart, different refs → date proximity pass
+        all_company_ids = []
+        all_vendor_ids = []
+        for pair in result.match_pairs:
+            all_company_ids.append(pair.company_entry_id)
+            all_vendor_ids.append(pair.vendor_entry_id)
+        for group in result.match_groups:
+            all_company_ids.extend(group.company_entry_ids)
+            all_vendor_ids.extend(group.vendor_entry_ids)
+
+        # Verify no duplicates
+        assert len(all_company_ids) == len(set(all_company_ids))
+        assert len(all_vendor_ids) == len(set(all_vendor_ids))
+
+        # c1/v1, c2/v2 should be exact matches
+        exact_pairs = [p for p in result.match_pairs if p.pass_number == MatchPassType.EXACT]
+        exact_company_ids = {p.company_entry_id for p in exact_pairs}
+        assert c1.id in exact_company_ids
+        assert c2.id in exact_company_ids
+
+    async def test_matched_entries_not_in_unmatched_lists(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Entries that are matched must not appear in unmatched lists (Pass 7).
+
+        Requirement 36.2: Exclude consumed entries from Pass 7 (Unmatched).
+        """
+        case_id = uuid4()
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
+        c2 = make_entry("company", "9999.00", date(2024, 3, 20), "UNIQUE-XYZ")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 15), "REF-001")
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1, c2]
+            return [v1]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+
+        result = await service.execute(case_id)
+
+        # c1/v1 match exactly → should NOT be in unmatched
+        assert c1.id not in result.unmatched_company_ids
+        assert v1.id not in result.unmatched_vendor_ids
+        # c2 is unmatched
+        assert c2.id in result.unmatched_company_ids
+
+
+# ─── Pass 6: Date-proximity Match Tests ───────────────────────────────────────
+
+
+class TestDateProximityMatch:
+    """Tests for Pass 6: Date-proximity Match (amount equal, date within N days).
+
+    Requirement 17.1: Match by amount + date within configurable N days.
+    """
+
+    def test_date_proximity_match_within_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match when amounts are equal and dates within tolerance days."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 17), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.DATE_PROXIMITY
+        assert pairs[0].matched_amount == Decimal("1000")
+        assert pairs[0].difference_amount == Decimal("0")
+
+    def test_date_proximity_match_exact_boundary(
+        self, service: ReconciliationEngineService
+    ):
+        """Should match when date difference equals exactly the tolerance."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("500"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("500"),
+                posting_date=date(2024, 3, 18), reference_number="VENDOR-A"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 1
+
+    def test_date_proximity_no_match_exceeds_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Should not match when date difference exceeds tolerance."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 20), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_date_proximity_no_match_different_amounts(
+        self, service: ReconciliationEngineService
+    ):
+        """Should not match when amounts differ even if dates are close."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("999"),
+                posting_date=date(2024, 3, 15), reference_number="VENDOR-XYZ"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_date_proximity_picks_closest_date(
+        self, service: ReconciliationEngineService
+    ):
+        """Should pick the vendor entry with the closest date."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 17), reference_number="VENDOR-A"
+        )
+        v2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 16), reference_number="VENDOR-B"
+        )
+
+        pairs = service._date_proximity_match([c1], [v1, v2], date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        # v2 is closer (1 day vs 2 days)
+        assert pairs[0].vendor_entry_id == v2.id
+
+    def test_date_proximity_no_double_vendor_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Each vendor entry should be matched at most once in date-proximity pass."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        c2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 16), reference_number="REF-B"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"),
+            posting_date=date(2024, 3, 15), reference_number="VENDOR-X"
+        )
+
+        pairs = service._date_proximity_match([c1, c2], [v1], date_tolerance_days=3)
+
+        assert len(pairs) == 1
+        # v1 should only be matched once
+
+    def test_date_proximity_with_none_posting_date_skipped(
+        self, service: ReconciliationEngineService
+    ):
+        """Entries with None posting_date should be skipped."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=None, reference_number="REF-001"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("1000"),
+                posting_date=date(2024, 3, 15), reference_number="VENDOR-A"
+            )
+        ]
+
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0

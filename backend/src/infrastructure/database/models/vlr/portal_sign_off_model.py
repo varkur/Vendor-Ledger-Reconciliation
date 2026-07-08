@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,7 +13,8 @@ class PortalSignOffModel(BaseModel):
     """
     Record of a vendor's digital sign-off on the reconciliation statement.
 
-    Captures IP address, statement version, and timestamp for audit purposes.
+    Captures IP address, statement version, confirmation text, and timestamp
+    for audit purposes.
     """
 
     __tablename__ = "vlr_portal_sign_offs"
@@ -26,6 +27,9 @@ class PortalSignOffModel(BaseModel):
     )
     ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
     statement_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    confirmation_text: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Vendor confirmation/approval text"
+    )
     signed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

@@ -1,73 +1,139 @@
 /**
- * Vendor Portal Statement page — Shows reconciliation statement to the vendor.
- * Displays matched/unmatched items for vendor review.
+ * Vendor Portal Statement page — Shows reconciliation results to the vendor.
+ * Loads data from the backend API instead of using mock data.
+ *
+ * Connects to: GET /api/v1/vlr/portal/statement/{case_id} (with X-Portal-Token header)
+ * Requirements: 24.3
  */
 
-import { useState } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Tag } from 'primereact/tag';
 import { Button } from 'primereact/button';
+import { ProgressSpinner } from 'primereact/progressspinner';
+import { Message } from 'primereact/message';
 import { useNavigate } from 'react-router-dom';
 
-interface StatementLine {
-  id: string;
-  date: string;
-  reference: string;
-  description: string;
-  companyAmount: number;
-  vendorAmount: number;
-  difference: number;
-  matchStatus: 'Matched' | 'Mismatch' | 'Missing in Company' | 'Missing in Vendor';
-}
-
-const sampleStatement: StatementLine[] = [
-  { id: '1', date: '05-Apr-25', reference: 'INV-10001', description: 'Supply of raw materials - Batch A', companyAmount: 125000, vendorAmount: 125000, difference: 0, matchStatus: 'Matched' },
-  { id: '2', date: '12-Apr-25', reference: 'INV-10025', description: 'Packaging materials Q1', companyAmount: 85000, vendorAmount: 87500, difference: -2500, matchStatus: 'Mismatch' },
-  { id: '3', date: '20-May-25', reference: 'INV-10048', description: 'Chemical solvents delivery', companyAmount: 210000, vendorAmount: 210000, difference: 0, matchStatus: 'Matched' },
-  { id: '4', date: '03-Jun-25', reference: 'INV-10062', description: 'Lab equipment maintenance', companyAmount: 45000, vendorAmount: 0, difference: 45000, matchStatus: 'Missing in Vendor' },
-  { id: '5', date: '15-Jul-25', reference: 'INV-10089', description: 'API intermediates supply', companyAmount: 380000, vendorAmount: 380000, difference: 0, matchStatus: 'Matched' },
-  { id: '6', date: '22-Aug-25', reference: 'CN-2001', description: 'Credit note - quality return', companyAmount: -15000, vendorAmount: -15000, difference: 0, matchStatus: 'Matched' },
-  { id: '7', date: '10-Sep-25', reference: 'INV-10110', description: 'Tablet coating materials', companyAmount: 0, vendorAmount: 92000, difference: -92000, matchStatus: 'Missing in Company' },
-  { id: '8', date: '28-Oct-25', reference: 'INV-10135', description: 'Warehousing charges Q3', companyAmount: 67500, vendorAmount: 67500, difference: 0, matchStatus: 'Matched' },
-  { id: '9', date: '15-Dec-25', reference: 'INV-10160', description: 'Year-end supply batch', companyAmount: 195000, vendorAmount: 198500, difference: -3500, matchStatus: 'Mismatch' },
-  { id: '10', date: '20-Feb-26', reference: 'INV-10190', description: 'Capsule materials shipment', companyAmount: 142000, vendorAmount: 142000, difference: 0, matchStatus: 'Matched' },
-];
+import { usePortalStatement } from './hooks/usePortal';
+import { usePortalContext } from './context/PortalContext';
+import type { MatchSummaryItem } from './api/portalApi';
 
 export const PortalStatementPage = () => {
-  const [statement] = useState<StatementLine[]>(sampleStatement);
   const navigate = useNavigate();
+  const { portalToken, caseInfo, isAuthenticated } = usePortalContext();
 
-  const matchStatusTemplate = (rowData: StatementLine) => {
-    const severityMap: Record<string, 'success' | 'danger' | 'warning' | 'info'> = {
-      Matched: 'success',
-      Mismatch: 'danger',
-      'Missing in Company': 'warning',
-      'Missing in Vendor': 'info',
-    };
-    return <Tag value={rowData.matchStatus} severity={severityMap[rowData.matchStatus]} />;
-  };
+  const caseId = caseInfo?.case_id || null;
+  const { data: statement, isLoading, error, refetch } = usePortalStatement(
+    caseId,
+    portalToken
+  );
 
-  const amountTemplate = (field: string) => (rowData: Record<string, unknown>) => {
-    const value = rowData[field] as number;
-    if (value === 0 && (rowData.matchStatus === 'Missing in Company' || rowData.matchStatus === 'Missing in Vendor')) {
-      return <span style={{ color: 'var(--color-text-muted)' }}>—</span>;
-    }
-    return <span style={{ color: value < 0 ? 'var(--color-error)' : 'inherit' }}>₹{value.toLocaleString('en-IN')}</span>;
-  };
-
-  const differenceTemplate = (rowData: StatementLine) => {
-    if (rowData.difference === 0) return <span style={{ color: 'var(--color-success)' }}>₹0</span>;
+  // Redirect to auth if not authenticated
+  if (!isAuthenticated || !portalToken) {
     return (
-      <span style={{ color: 'var(--color-error)', fontWeight: 500 }}>
-        ₹{rowData.difference.toLocaleString('en-IN')}
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <div className="em-card" style={{ padding: 40 }}>
+          <i
+            className="pi pi-lock"
+            style={{ fontSize: '3rem', color: 'var(--color-warning, #f59e0b)' }}
+          />
+          <h3 style={{ marginTop: 16 }}>Authentication Required</h3>
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            Please use the link from your email to access the portal.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Loading state
+  if (isLoading) {
+    return (
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <ProgressSpinner style={{ width: 50, height: 50 }} />
+        <p style={{ marginTop: 16, color: 'var(--color-text-muted)' }}>
+          Loading reconciliation statement...
+        </p>
+      </div>
+    );
+  }
+
+  // Error state
+  if (error) {
+    const errorMessage =
+      error.response?.data?.detail || 'Failed to load reconciliation statement.';
+    return (
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <div className="em-card" style={{ padding: 40 }}>
+          <i
+            className="pi pi-exclamation-triangle"
+            style={{ fontSize: '3rem', color: 'var(--color-error, #ef4444)' }}
+          />
+          <h3 style={{ marginTop: 16 }}>Unable to Load Statement</h3>
+          <Message severity="error" text={errorMessage} className="mb-3 w-full" />
+          <Button label="Retry" icon="pi pi-refresh" onClick={() => refetch()} className="mt-2" />
+        </div>
+      </div>
+    );
+  }
+
+  // No data state
+  if (!statement) {
+    return (
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <div className="em-card" style={{ padding: 40 }}>
+          <i
+            className="pi pi-info-circle"
+            style={{ fontSize: '3rem', color: 'var(--color-text-muted)' }}
+          />
+          <h3 style={{ marginTop: 16 }}>No Statement Available</h3>
+          <p style={{ color: 'var(--color-text-muted)' }}>
+            The reconciliation has not produced results yet. Please check back later.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const formatCurrency = (value: number | null | undefined) => {
+    if (value === null || value === undefined) return '—';
+    return `₹${Number(value).toLocaleString('en-IN')}`;
+  };
+
+  const matchTypeTemplate = (rowData: MatchSummaryItem) => {
+    const labels: Record<string, string> = {
+      exact: 'Exact Match',
+      tolerance: 'Tolerance Match',
+      fuzzy_reference: 'Fuzzy Reference',
+      one_to_many: 'One-to-Many',
+      many_to_one: 'Many-to-One',
+      date_proximity: 'Date Proximity',
+    };
+    return <span>{labels[rowData.match_type] || rowData.match_type}</span>;
+  };
+
+  const amountTemplate = (rowData: MatchSummaryItem) => {
+    const amount = parseFloat(rowData.total_amount);
+    return (
+      <span style={{ color: amount < 0 ? 'var(--color-error)' : 'inherit' }}>
+        ₹{amount.toLocaleString('en-IN')}
       </span>
     );
   };
 
-  const totalCompany = statement.reduce((sum, s) => sum + s.companyAmount, 0);
-  const totalVendor = statement.reduce((sum, s) => sum + s.vendorAmount, 0);
-  const matchedCount = statement.filter((s) => s.matchStatus === 'Matched').length;
+  const periodDisplay =
+    statement.period_start && statement.period_end
+      ? `${statement.period_start} – ${statement.period_end}`
+      : 'Not specified';
+
+  const statusSeverity: Record<string, 'success' | 'warning' | 'info' | 'danger'> = {
+    matched: 'success',
+    signed_off: 'success',
+    review: 'warning',
+    pending_approval: 'warning',
+    data_received: 'info',
+    initiated: 'info',
+  };
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px' }}>
@@ -76,51 +142,124 @@ export const PortalStatementPage = () => {
         <div>
           <h2 style={{ margin: 0 }}>Reconciliation Statement</h2>
           <p style={{ color: 'var(--color-text-muted)', margin: '4px 0 0' }}>
-            Period: April 2025 – March 2026 | Request: EPL-00087
+            Vendor: {statement.vendor_name} | Period: {periodDisplay}
           </p>
         </div>
-        <Button label="Proceed to Sign-Off" icon="pi pi-check" onClick={() => navigate('/portal/sign-off')} />
+        <div className="flex gap-2 align-items-center">
+          <Tag
+            value={statement.status.replace(/_/g, ' ').toUpperCase()}
+            severity={statusSeverity[statement.status] || 'info'}
+          />
+          <Button
+            label="Proceed to Sign-Off"
+            icon="pi pi-check"
+            onClick={() => navigate('/portal/sign-off')}
+          />
+        </div>
       </div>
 
-      {/* Summary */}
+      {/* Summary Cards */}
       <div className="flex gap-3 mb-3">
         <div className="em-card flex-1 text-center">
-          <div style={{ fontSize: '1.25rem', fontWeight: 600 }}>₹{totalCompany.toLocaleString('en-IN')}</div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>Company Balance</div>
+          <div style={{ fontSize: '1.25rem', fontWeight: 600 }}>
+            {formatCurrency(statement.vendor_opening_balance)}
+          </div>
+          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            Vendor Opening Balance
+          </div>
         </div>
         <div className="em-card flex-1 text-center">
-          <div style={{ fontSize: '1.25rem', fontWeight: 600 }}>₹{totalVendor.toLocaleString('en-IN')}</div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>Vendor Balance</div>
+          <div style={{ fontSize: '1.25rem', fontWeight: 600 }}>
+            {formatCurrency(statement.vendor_closing_balance)}
+          </div>
+          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            Vendor Closing Balance
+          </div>
         </div>
         <div className="em-card flex-1 text-center">
-          <div style={{ fontSize: '1.25rem', fontWeight: 600, color: 'var(--color-success)' }}>{matchedCount}/{statement.length}</div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>Matched Items</div>
+          <div
+            style={{ fontSize: '1.25rem', fontWeight: 600, color: 'var(--color-success)' }}
+          >
+            {statement.total_matched_entries}
+          </div>
+          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            Matched Entries
+          </div>
         </div>
         <div className="em-card flex-1 text-center">
-          <div style={{ fontSize: '1.25rem', fontWeight: 600, color: 'var(--color-error)' }}>₹{Math.abs(totalCompany - totalVendor).toLocaleString('en-IN')}</div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>Net Difference</div>
+          <div
+            style={{ fontSize: '1.25rem', fontWeight: 600, color: 'var(--color-warning)' }}
+          >
+            {statement.total_unmatched_vendor}
+          </div>
+          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            Unmatched Vendor Items
+          </div>
+        </div>
+        <div className="em-card flex-1 text-center">
+          <div
+            style={{
+              fontSize: '1.25rem',
+              fontWeight: 600,
+              color:
+                statement.net_difference && Number(statement.net_difference) !== 0
+                  ? 'var(--color-error)'
+                  : 'var(--color-success)',
+            }}
+          >
+            {formatCurrency(statement.net_difference)}
+          </div>
+          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            Net Difference
+          </div>
         </div>
       </div>
 
-      {/* Statement Table */}
-      <div className="em-card" style={{ padding: 0 }}>
-        <DataTable
-          value={statement}
-          paginator
-          rows={10}
-          rowsPerPageOptions={[10, 25, 50]}
-          sortMode="multiple"
-          emptyMessage="No statement data available."
-        >
-          <Column field="date" header="Date" sortable style={{ width: '9%' }} />
-          <Column field="reference" header="Reference" sortable style={{ width: '10%' }} />
-          <Column field="description" header="Description" sortable style={{ width: '24%' }} />
-          <Column header="Company Amt." body={amountTemplate('companyAmount')} sortable sortField="companyAmount" style={{ width: '13%' }} />
-          <Column header="Vendor Amt." body={amountTemplate('vendorAmount')} sortable sortField="vendorAmount" style={{ width: '13%' }} />
-          <Column header="Difference" body={differenceTemplate} sortable sortField="difference" style={{ width: '12%' }} />
-          <Column header="Status" body={matchStatusTemplate} sortable sortField="matchStatus" style={{ width: '14%' }} />
-        </DataTable>
-      </div>
+      {/* Match Summary Table */}
+      {statement.match_summary.length > 0 && (
+        <div className="em-card" style={{ padding: 0 }}>
+          <div
+            style={{
+              padding: '12px 16px',
+              borderBottom: '1px solid var(--color-border, #e5e7eb)',
+            }}
+          >
+            <h3 style={{ margin: 0, fontSize: '1rem' }}>Match Summary by Type</h3>
+          </div>
+          <DataTable
+            value={statement.match_summary}
+            emptyMessage="No match results available."
+          >
+            <Column
+              header="Match Type"
+              body={matchTypeTemplate}
+              style={{ width: '40%' }}
+            />
+            <Column field="count" header="Count" style={{ width: '20%' }} sortable />
+            <Column
+              header="Total Amount"
+              body={amountTemplate}
+              style={{ width: '40%' }}
+              sortable
+              sortField="total_amount"
+            />
+          </DataTable>
+        </div>
+      )}
+
+      {/* Empty match summary */}
+      {statement.match_summary.length === 0 && (
+        <div className="em-card text-center" style={{ padding: 32 }}>
+          <i
+            className="pi pi-info-circle"
+            style={{ fontSize: '2rem', color: 'var(--color-text-muted)' }}
+          />
+          <p style={{ marginTop: 12, color: 'var(--color-text-muted)' }}>
+            Reconciliation matching has not been completed yet. Results will appear
+            here once the auto-reconciliation process finishes.
+          </p>
+        </div>
+      )}
     </div>
   );
 };

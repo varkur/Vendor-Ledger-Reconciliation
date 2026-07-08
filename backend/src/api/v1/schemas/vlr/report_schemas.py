@@ -2,8 +2,8 @@
 Report API Pydantic schemas (request/response).
 
 Provides validation for reconciliation statement, exception report,
-vendor status, monthly MIS, and export operations.
-Requirements: 9.5, 9.6, 9.8, 11.2, 11.3
+vendor status, monthly MIS, aging analysis, and export operations.
+Requirements: 9.5, 9.6, 9.8, 11.2, 11.3, 27.1, 27.3, 28.1, 28.2, 28.3, 29.1, 29.2, 29.3, 29.4
 """
 
 from datetime import date, datetime
@@ -60,6 +60,30 @@ class ReconciliationStatementResponse(BaseModel):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Reconciliation Summary Schemas (Requirement 27.1, 27.2)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class ReconciliationSummaryRowResponse(BaseModel):
+    """A single row in the 10-row reconciliation summary report."""
+
+    row_number: int
+    description: str
+    amount: Decimal = Decimal("0.00")
+
+
+class ReconciliationSummaryResponse(BaseModel):
+    """10-row reconciliation summary report."""
+
+    case_id: UUID
+    generated_at: datetime
+    rows: list[ReconciliationSummaryRowResponse] = Field(default_factory=list)
+    company_closing_balance: Decimal = Decimal("0.00")
+    vendor_closing_balance: Decimal = Decimal("0.00")
+    net_difference: Decimal = Decimal("0.00")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Exception Report Schemas
 # ──────────────────────────────────────────────────────────────────────
 
@@ -92,6 +116,85 @@ class ExceptionReportResponse(BaseModel):
     ageing_amounts: dict[str, Decimal] = Field(default_factory=dict)
     entries: list[AgeingEntryResponse] = Field(default_factory=list)
     total_exception_amount: Decimal = Decimal("0")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Enhanced Exception Report with Resolution History (Requirement 29.1)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class ResolutionHistoryEntryResponse(BaseModel):
+    """A single resolution action for an exception."""
+
+    action: str
+    action_by: str = ""
+    action_date: datetime | None = None
+    notes: str = ""
+
+
+class ExceptionWithHistoryResponse(BaseModel):
+    """Exception item with its full resolution history."""
+
+    exception_id: UUID
+    case_id: UUID
+    amount: Decimal = Decimal("0.00")
+    severity: str = ""
+    category: str = ""
+    status: str = ""
+    first_flagged_date: date | None = None
+    resolution_history: list[ResolutionHistoryEntryResponse] = Field(default_factory=list)
+
+
+class EnhancedExceptionReportResponse(BaseModel):
+    """Exception report with resolution history per Requirement 29.1."""
+
+    generated_at: datetime
+    total_exceptions: int = 0
+    exceptions_by_status: dict[str, int] = Field(default_factory=dict)
+    exceptions_by_category: dict[str, int] = Field(default_factory=dict)
+    items: list[ExceptionWithHistoryResponse] = Field(default_factory=list)
+    total_amount: Decimal = Decimal("0.00")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Aging Analysis Schemas (Requirements 28.1, 28.2)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class AgingBucketSummaryResponse(BaseModel):
+    """Summary for a single aging bucket."""
+
+    bucket: str
+    count: int = 0
+    total_amount: Decimal = Decimal("0.00")
+
+
+class AgingItemResponse(BaseModel):
+    """A single item in the aging analysis report."""
+
+    entry_id: UUID
+    case_id: UUID
+    vendor_id: UUID | None = None
+    vendor_name: str = ""
+    amount: Decimal = Decimal("0.00")
+    posting_date: date | None = None
+    reference_number: str = ""
+    status: str = "unmatched"
+    age_days: int = 0
+    aging_bucket: str = "0-30_days"
+
+
+class AgingAnalysisResponse(BaseModel):
+    """Aging analysis report groupable by vendor, bucket, and status."""
+
+    generated_at: datetime
+    as_of_date: date
+    total_items: int = 0
+    total_amount: Decimal = Decimal("0.00")
+    bucket_summaries: list[AgingBucketSummaryResponse] = Field(default_factory=list)
+    by_vendor: dict[str, list[AgingBucketSummaryResponse]] = Field(default_factory=dict)
+    by_status: dict[str, list[AgingBucketSummaryResponse]] = Field(default_factory=dict)
+    items: list[AgingItemResponse] = Field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,3 +258,32 @@ class MonthlyMISReportResponse(BaseModel):
     ageing_amounts: dict[str, Decimal] = Field(default_factory=dict)
     average_resolution_days: float = 0.0
     cases_by_status: dict[str, int] = Field(default_factory=dict)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Export Request/Response Schemas
+# ──────────────────────────────────────────────────────────────────────
+
+
+class GenerateReportRequest(BaseModel):
+    """Request to generate and store a report for later download."""
+
+    report_type: str = Field(
+        description="One of: reconciliation_summary, aging_analysis, exception_report, vendor_status, monthly_mis"
+    )
+    format: str = Field(default="excel", description="Export format: pdf or excel")
+    case_id: UUID | None = None
+    company_code: str | None = None
+    period_start: date | None = None
+    period_end: date | None = None
+
+
+class GenerateReportResponse(BaseModel):
+    """Response after triggering report generation."""
+
+    report_id: str
+    report_type: str
+    format: str
+    status: str = "generated"
+    download_url: str = ""
+

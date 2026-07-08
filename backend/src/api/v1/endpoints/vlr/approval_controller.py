@@ -50,6 +50,14 @@ from src.infrastructure.database.repositories.vlr.setting_repository_impl import
 )
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.security.permission_manager import require_permission
+from src.domain.services.vlr.audit_trail_service import (
+    AuditEvent,
+    AuditEventType,
+    AuditTrailService,
+)
+from src.infrastructure.database.repositories.vlr.audit_trail_repository_impl import (
+    AuditTrailRepositoryImpl,
+)
 
 router = APIRouter(prefix="/vlr/approvals", tags=["VLR - Approval Workflow"])
 
@@ -140,6 +148,7 @@ async def approve_case(
     company_code: str = Query(..., min_length=1, description="Company code"),
     current_user: User = Depends(get_current_active_user),
     service: ApprovalEngineService = Depends(_get_approval_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> ApprovalResponse:
     """
     POST /api/v1/vlr/approvals/{id}/approve
@@ -157,6 +166,20 @@ async def approve_case(
         comments=request.comments,
         company_code=company_code,
     )
+
+    # Emit audit event for approval (Requirement 38.2)
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username=current_user.username or str(current_user.id),
+        actor_id=current_user.id,
+        event_type=AuditEventType.APPROVAL,
+        case_id=case_id,
+        event_details={
+            "decision": "approved",
+            "comments": request.comments,
+            "approval_level": result.approval_level,
+        },
+    ))
 
     return ApprovalResponse(
         approval_id=result.approval_id,
@@ -181,6 +204,7 @@ async def reject_case(
     company_code: str = Query(..., min_length=1, description="Company code"),
     current_user: User = Depends(get_current_active_user),
     service: ApprovalEngineService = Depends(_get_approval_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> ApprovalResponse:
     """
     POST /api/v1/vlr/approvals/{id}/reject
@@ -197,6 +221,19 @@ async def reject_case(
         comments=request.comments,
         company_code=company_code,
     )
+
+    # Emit audit event for rejection (Requirement 38.2)
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username=current_user.username or str(current_user.id),
+        actor_id=current_user.id,
+        event_type=AuditEventType.REJECTION,
+        case_id=case_id,
+        event_details={
+            "decision": "rejected",
+            "comments": request.comments,
+        },
+    ))
 
     return ApprovalResponse(
         approval_id=result.approval_id,

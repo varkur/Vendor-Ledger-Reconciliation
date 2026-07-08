@@ -1,46 +1,126 @@
 /**
  * Notification History page — Shows sent notifications per case with status tracking.
- * Includes Send Reminder functionality.
+ * Wired to backend GET /api/v1/vlr/notifications with server-side pagination and search.
+ * Includes Send Reminder and Mark as Read functionality.
+ *
+ * Requirements: 23.5, 25.1, 25.2
  */
 
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
 import { InputText } from 'primereact/inputtext';
 import { Tag } from 'primereact/tag';
 import { Toast } from 'primereact/toast';
-import { useRef } from 'react';
+import { ProgressSpinner } from 'primereact/progressspinner';
+import { Message } from 'primereact/message';
 
-interface NotificationEntry {
-  id: string;
-  notificationId: string;
-  caseId: string;
-  type: 'Email' | 'SMS' | 'In-App' | 'WhatsApp';
-  recipient: string;
-  subject: string;
-  timestamp: string;
-  status: 'Sent' | 'Delivered' | 'Read' | 'Failed' | 'Pending';
-  vendorName: string;
-}
+import { useNotificationList, useMarkAsRead, useSendReminder } from '../hooks/useNotifications';
+import type { NotificationEntry } from '../api/notificationsApi';
 
-const sampleNotifications: NotificationEntry[] = [
-  { id: '1', notificationId: 'NTF-001', caseId: 'EPL-00087', type: 'Email', recipient: 'accounts@arlifesciences.com', subject: 'Reconciliation Statement Request - Apr 2025 to Mar 2026', timestamp: '01-Jul-26 09:30 AM', status: 'Delivered', vendorName: 'A R LIFE SCIENCES PVT LTD' },
-  { id: '2', notificationId: 'NTF-002', caseId: 'EPL-00087', type: 'Email', recipient: 'RHEA@ACPHARMS.COM', subject: 'Reconciliation Statement Request - Apr 2025 to Mar 2026', timestamp: '01-Jul-26 09:30 AM', status: 'Read', vendorName: 'A S C PHARMASPECIALITIES LLP' },
-  { id: '3', notificationId: 'NTF-003', caseId: 'EPL-00087', type: 'SMS', recipient: '+91-98765XXXXX', subject: 'Statement reminder sent', timestamp: '01-Jul-26 09:31 AM', status: 'Sent', vendorName: 'AAF INDIA PVT LTD' },
-  { id: '4', notificationId: 'NTF-004', caseId: 'EPL-00090', type: 'Email', recipient: 'accounts@aadtech.in', subject: 'Reminder: Pending Reconciliation', timestamp: '28-Jun-26 02:15 PM', status: 'Failed', vendorName: 'AAD TECH INDIA PVT LTD' },
-  { id: '5', notificationId: 'NTF-005', caseId: 'EPL-00089', type: 'Email', recipient: 'amit.suryawanshi@aafindia.net', subject: 'Reconciliation Statement Request', timestamp: '27-Jun-26 11:00 AM', status: 'Read', vendorName: 'AAF INDIA PVT LTD' },
-  { id: '6', notificationId: 'NTF-006', caseId: 'EPL-00087', type: 'In-App', recipient: 'System', subject: 'Reconciliation batch initiated for 366 vendors', timestamp: '26-May-26 10:00 AM', status: 'Delivered', vendorName: 'Multiple Vendors' },
-  { id: '7', notificationId: 'NTF-007', caseId: 'EPL-00092', type: 'WhatsApp', recipient: '+91-87654XXXXX', subject: 'Statement upload confirmation', timestamp: '22-Jun-26 03:45 PM', status: 'Delivered', vendorName: 'Vaishal Enterprise' },
-  { id: '8', notificationId: 'NTF-008', caseId: 'EPL-00087', type: 'Email', recipient: 'DAIRYFRESH1992@GMAIL.COM', subject: '2nd Reminder: Reconciliation Pending', timestamp: '15-Jun-26 09:00 AM', status: 'Sent', vendorName: 'A.V.C PACKERS' },
-];
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_PAGE_SIZE = 10;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Component
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const NotificationHistoryPage = () => {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [notifications] = useState<NotificationEntry[]>(sampleNotifications);
-  const [selectedNotifications, setSelectedNotifications] = useState<NotificationEntry[]>([]);
   const toast = useRef<Toast>(null);
 
+  // State
+  const [searchQuery, setSearchQuery] = useState('');
+  const [appliedSearch, setAppliedSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
+  const [selectedNotifications, setSelectedNotifications] = useState<NotificationEntry[]>([]);
+
+  // API hooks
+  const { data, isLoading, isError, error, refetch } = useNotificationList({
+    page,
+    page_size: pageSize,
+    search: appliedSearch || undefined,
+  });
+
+  const markAsReadMutation = useMarkAsRead();
+  const sendReminderMutation = useSendReminder();
+
+  // Handlers
+  const handleSearch = useCallback(() => {
+    setAppliedSearch(searchQuery);
+    setPage(1);
+  }, [searchQuery]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter') handleSearch();
+    },
+    [handleSearch]
+  );
+
+  const handleSendReminder = useCallback(() => {
+    if (selectedNotifications.length === 0) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'No Selection',
+        detail: 'Please select notifications to resend reminders.',
+      });
+      return;
+    }
+
+    const ids = selectedNotifications.map((n) => n.id);
+    sendReminderMutation.mutate(ids, {
+      onSuccess: (response) => {
+        toast.current?.show({
+          severity: 'success',
+          summary: 'Reminders Sent',
+          detail: `Sent ${response.sent_count} reminder(s) successfully.`,
+        });
+        setSelectedNotifications([]);
+      },
+      onError: (err) => {
+        toast.current?.show({
+          severity: 'error',
+          summary: 'Send Failed',
+          detail: err.message || 'Failed to send reminders. Please try again.',
+        });
+      },
+    });
+  }, [selectedNotifications, sendReminderMutation]);
+
+  const handleMarkAsRead = useCallback(() => {
+    if (selectedNotifications.length === 0) return;
+
+    const ids = selectedNotifications.map((n) => n.id);
+    markAsReadMutation.mutate(ids, {
+      onSuccess: (response) => {
+        toast.current?.show({
+          severity: 'info',
+          summary: 'Marked as Read',
+          detail: `${response.updated_count} notification(s) marked as read.`,
+        });
+        setSelectedNotifications([]);
+      },
+      onError: (err) => {
+        toast.current?.show({
+          severity: 'error',
+          summary: 'Update Failed',
+          detail: err.message || 'Failed to mark notifications. Please try again.',
+        });
+      },
+    });
+  }, [selectedNotifications, markAsReadMutation]);
+
+  const handlePageChange = useCallback((event: { page: number; rows: number }) => {
+    setPage(event.page + 1);
+    setPageSize(event.rows);
+  }, []);
+
+  // Column templates
   const typeTemplate = (rowData: NotificationEntry) => {
     const iconMap: Record<string, string> = {
       Email: 'pi pi-envelope',
@@ -67,27 +147,37 @@ export const NotificationHistoryPage = () => {
     return <Tag value={rowData.status} severity={severityMap[rowData.status]} />;
   };
 
-  const handleSendReminder = () => {
-    if (selectedNotifications.length === 0) {
-      toast.current?.show({ severity: 'warn', summary: 'No Selection', detail: 'Please select notifications to resend reminders.' });
-      return;
-    }
-    toast.current?.show({
-      severity: 'success',
-      summary: 'Reminders Sent',
-      detail: `Sent ${selectedNotifications.length} reminder(s) successfully.`,
-    });
-    setSelectedNotifications([]);
-  };
+  // Derived values
+  const notifications = data?.items ?? [];
+  const totalRecords = data?.total ?? 0;
+  const deliveredCount = notifications.filter(
+    (n) => n.status === 'Delivered' || n.status === 'Read'
+  ).length;
+  const failedCount = notifications.filter((n) => n.status === 'Failed').length;
 
-  const filteredNotifications = notifications.filter(
-    (n) =>
-      n.recipient.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      n.vendorName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      n.caseId.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      n.notificationId.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  // ─── Loading state ─────────────────────────────────────────────────────────
+  if (isLoading && !data) {
+    return (
+      <div className="flex justify-content-center align-items-center" style={{ minHeight: 300 }}>
+        <ProgressSpinner style={{ width: '50px', height: '50px' }} />
+      </div>
+    );
+  }
 
+  // ─── Error state ───────────────────────────────────────────────────────────
+  if (isError) {
+    return (
+      <div className="flex flex-column align-items-center gap-3" style={{ padding: '2rem' }}>
+        <Message
+          severity="error"
+          text={error?.message || 'Failed to load notifications. Please try again.'}
+        />
+        <Button label="Retry" icon="pi pi-refresh" onClick={() => refetch()} />
+      </div>
+    );
+  }
+
+  // ─── Render ────────────────────────────────────────────────────────────────
   return (
     <div>
       <Toast ref={toast} />
@@ -101,15 +191,25 @@ export const NotificationHistoryPage = () => {
               placeholder="Search notifications..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={handleKeyDown}
               style={{ border: 'none', boxShadow: 'none', width: 200 }}
             />
-            <i className="pi pi-search" />
+            <i className="pi pi-search" style={{ cursor: 'pointer' }} onClick={handleSearch} />
           </div>
+          <Button
+            label="Mark as Read"
+            icon="pi pi-check"
+            className="p-button-outlined"
+            onClick={handleMarkAsRead}
+            disabled={selectedNotifications.length === 0}
+            loading={markAsReadMutation.isPending}
+          />
           <Button
             label="Send Reminder"
             icon="pi pi-send"
             onClick={handleSendReminder}
             disabled={selectedNotifications.length === 0}
+            loading={sendReminderMutation.isPending}
           />
         </div>
       </div>
@@ -117,18 +217,18 @@ export const NotificationHistoryPage = () => {
       {/* Summary */}
       <div className="flex gap-3 mb-3">
         <div className="em-card flex-1 text-center">
-          <div style={{ fontSize: '1.5rem', fontWeight: 600 }}>{notifications.length}</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 600 }}>{totalRecords}</div>
           <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>Total Sent</div>
         </div>
         <div className="em-card flex-1 text-center">
           <div style={{ fontSize: '1.5rem', fontWeight: 600, color: 'var(--color-success)' }}>
-            {notifications.filter((n) => n.status === 'Delivered' || n.status === 'Read').length}
+            {deliveredCount}
           </div>
           <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>Delivered</div>
         </div>
         <div className="em-card flex-1 text-center">
           <div style={{ fontSize: '1.5rem', fontWeight: 600, color: 'var(--color-error)' }}>
-            {notifications.filter((n) => n.status === 'Failed').length}
+            {failedCount}
           </div>
           <div style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>Failed</div>
         </div>
@@ -136,27 +236,39 @@ export const NotificationHistoryPage = () => {
 
       {/* Data Table */}
       <div className="em-card" style={{ padding: 0 }}>
-        <DataTable
-          value={filteredNotifications}
-          paginator
-          rows={10}
-          rowsPerPageOptions={[10, 25, 50]}
-          sortMode="multiple"
-          emptyMessage="No notifications found."
-          selection={selectedNotifications}
-          onSelectionChange={(e) => setSelectedNotifications(e.value as NotificationEntry[])}
-          selectionMode="checkbox"
-        >
-          <Column selectionMode="multiple" style={{ width: '3%' }} />
-          <Column field="notificationId" header="ID" sortable style={{ width: '8%' }} />
-          <Column field="caseId" header="Case ID" sortable style={{ width: '9%' }} />
-          <Column header="Type" body={typeTemplate} sortable sortField="type" style={{ width: '9%' }} />
-          <Column field="vendorName" header="Vendor" sortable style={{ width: '18%' }} />
-          <Column field="recipient" header="Recipient" sortable style={{ width: '18%' }} />
-          <Column field="subject" header="Subject" sortable style={{ width: '18%' }} />
-          <Column field="timestamp" header="Timestamp" sortable style={{ width: '12%' }} />
-          <Column header="Status" body={statusTemplate} sortable sortField="status" style={{ width: '8%' }} />
-        </DataTable>
+        {notifications.length === 0 && !isLoading ? (
+          <div className="flex flex-column align-items-center gap-2" style={{ padding: '3rem' }}>
+            <i className="pi pi-bell" style={{ fontSize: '2rem', color: 'var(--color-text-muted)' }} />
+            <p style={{ color: 'var(--color-text-muted)' }}>No notifications found.</p>
+          </div>
+        ) : (
+          <DataTable
+            value={notifications}
+            paginator
+            rows={pageSize}
+            totalRecords={totalRecords}
+            first={(page - 1) * pageSize}
+            onPage={handlePageChange}
+            rowsPerPageOptions={[10, 25, 50]}
+            lazy
+            loading={isLoading}
+            sortMode="multiple"
+            emptyMessage="No notifications found."
+            selection={selectedNotifications}
+            onSelectionChange={(e) => setSelectedNotifications(e.value as NotificationEntry[])}
+            selectionMode="checkbox"
+          >
+            <Column selectionMode="multiple" style={{ width: '3%' }} />
+            <Column field="notification_id" header="ID" sortable style={{ width: '8%' }} />
+            <Column field="case_id" header="Case ID" sortable style={{ width: '9%' }} />
+            <Column header="Type" body={typeTemplate} sortable sortField="type" style={{ width: '9%' }} />
+            <Column field="vendor_name" header="Vendor" sortable style={{ width: '18%' }} />
+            <Column field="recipient" header="Recipient" sortable style={{ width: '18%' }} />
+            <Column field="subject" header="Subject" sortable style={{ width: '18%' }} />
+            <Column field="timestamp" header="Timestamp" sortable style={{ width: '12%' }} />
+            <Column header="Status" body={statusTemplate} sortable sortField="status" style={{ width: '8%' }} />
+          </DataTable>
+        )}
       </div>
     </div>
   );

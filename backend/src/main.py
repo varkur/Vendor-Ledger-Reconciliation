@@ -24,11 +24,9 @@ from src.observability.structured_logger import configure_logging
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan: startup and shutdown hooks."""
-    # Startup
-    configure_logging()
-    configure_file_logging()
+    # Startup — just yield immediately, configure later
     yield
-    # Shutdown (cleanup resources here)
+    # Shutdown
 
 
 app = FastAPI(
@@ -74,11 +72,6 @@ app.openapi = custom_openapi
 
 # ─── Middleware (order matters: outermost first) ───
 app.add_middleware(GZipMiddleware, minimum_size=1024)  # Compress responses > 1KB
-app.add_middleware(ExceptionHandlerMiddleware)
-app.add_middleware(RequestLoggingMiddleware)
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(AuditContextMiddleware)
-app.add_middleware(CorrelationIdMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,

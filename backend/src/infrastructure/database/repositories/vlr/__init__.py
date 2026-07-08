@@ -18,6 +18,8 @@ from src.infrastructure.database.repositories.vlr.approval_repository_impl impor
 from src.infrastructure.database.repositories.vlr.notification_repository_impl import NotificationRepositoryImpl
 from src.infrastructure.database.repositories.vlr.setting_repository_impl import SettingRepositoryImpl
 from src.infrastructure.database.repositories.vlr.automation_rule_repository_impl import AutomationRuleRepositoryImpl
+from src.infrastructure.database.repositories.vlr.column_mapping_template_repository_impl import ColumnMappingTemplateRepositoryImpl
+from src.infrastructure.database.repositories.vlr.recovery_repository_impl import RecoveryRepositoryImpl
 
 __all__ = [
     "VendorRepositoryImpl",
@@ -30,4 +32,6 @@ __all__ = [
     "NotificationRepositoryImpl",
     "SettingRepositoryImpl",
     "AutomationRuleRepositoryImpl",
+    "ColumnMappingTemplateRepositoryImpl",
+    "RecoveryRepositoryImpl",
 ]

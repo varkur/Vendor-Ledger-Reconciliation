@@ -1,42 +1,106 @@
 /**
  * Main application layout — Sakai-style with Emcure Red branding.
- * Dark sidebar, top header with company selector, Firmway-equivalent navigation.
+ * Dark sidebar with nested navigation matching Firmway's structure:
+ * - Dashboard
+ * - Confirmation (submenu)
+ * - Account Reco (submenu with Manage Party, Request Statement, etc.)
+ * - Data Management
+ * - Settings (submenu with sub-pages)
+ * - Utilities
  */
 
 import { useState } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useAppSelector } from '@app/store';
 
+interface SubNavItem {
+  label: string;
+  icon?: string;
+  path: string;
+}
+
 interface NavItem {
   label: string;
   icon: string;
-  path: string;
-  hasSubmenu?: boolean;
+  path?: string;
+  children?: SubNavItem[];
 }
 
 const navItems: NavItem[] = [
-  { label: 'Manage Party', icon: 'pi pi-users', path: '/manage-party' },
-  { label: 'Request Statement', icon: 'pi pi-file-edit', path: '/request-statement' },
-  { label: 'Direct Reconciliation', icon: 'pi pi-check-circle', path: '/direct-reconciliation' },
-  { label: 'Track Reconciliation', icon: 'pi pi-chart-line', path: '/track-reconciliation' },
-  { label: 'Reports', icon: 'pi pi-chart-bar', path: '/reports' },
-  { label: 'Automation', icon: 'pi pi-cog', path: '/automation', hasSubmenu: true },
-  { label: 'Access Management', icon: 'pi pi-lock', path: '/access-management', hasSubmenu: true },
-  { label: 'Settings', icon: 'pi pi-sliders-h', path: '/settings', hasSubmenu: true },
-  { label: 'ERP Integration', icon: 'pi pi-link', path: '/erp-integration', hasSubmenu: true },
+  {
+    label: 'Dashboard',
+    icon: 'pi pi-home',
+    path: '/dashboard',
+  },
+  {
+    label: 'Confirmation',
+    icon: 'pi pi-check-square',
+    children: [
+      { label: 'Pending Confirmations', path: '/track-reconciliation' },
+      { label: 'Exceptions', path: '/exceptions' },
+    ],
+  },
+  {
+    label: 'Account Reco',
+    icon: 'pi pi-sync',
+    children: [
+      { label: 'Manage Party', path: '/manage-party' },
+      { label: 'Request Statement', path: '/request-statement' },
+      { label: 'Direct Reconciliation', path: '/direct-reconciliation' },
+      { label: 'Track Reconciliation', path: '/track-reconciliation' },
+      { label: 'Reports', path: '/reports' },
+      { label: 'Notifications', path: '/notifications' },
+    ],
+  },
+  {
+    label: 'Data Management',
+    icon: 'pi pi-database',
+    children: [
+      { label: 'Recovery & Follow-up', path: '/recovery' },
+    ],
+  },
+  {
+    label: 'Settings',
+    icon: 'pi pi-cog',
+    children: [
+      { label: 'Manage Users', path: '/access-management/roles' },
+      { label: 'Company Profile', path: '/settings' },
+      { label: 'Email Attachments', path: '/settings' },
+      { label: 'Document Types', path: '/settings' },
+      { label: 'Reminders', path: '/settings' },
+      { label: 'Email Config', path: '/settings' },
+      { label: 'Domain Config', path: '/settings' },
+      { label: 'Notification', path: '/settings' },
+      { label: 'Global Settings', path: '/settings' },
+    ],
+  },
+  {
+    label: 'Utilities',
+    icon: 'pi pi-wrench',
+    children: [
+      { label: 'Audit Logs', path: '/access-management/audit-logs' },
+      { label: 'ERP Integration', path: '/erp-integration' },
+      { label: 'Automation', path: '/automation' },
+    ],
+  },
 ];
 
 export const MainLayout = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useAppSelector((state) => state.auth);
-  const [expandedMenus, setExpandedMenus] = useState<string[]>([]);
+  const [expandedMenus, setExpandedMenus] = useState<string[]>(['Account Reco']);
 
-  const isActive = (path: string) => location.pathname.startsWith(path);
+  const isActive = (path: string) => location.pathname === path || location.pathname.startsWith(path + '/');
 
-  const toggleSubmenu = (path: string) => {
+  const isParentActive = (item: NavItem) => {
+    if (item.path) return isActive(item.path);
+    return item.children?.some((child) => isActive(child.path)) ?? false;
+  };
+
+  const toggleSubmenu = (label: string) => {
     setExpandedMenus((prev) =>
-      prev.includes(path) ? prev.filter((p) => p !== path) : [...prev, path]
+      prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label]
     );
   };
 
@@ -65,28 +129,48 @@ export const MainLayout = () => {
         {/* Navigation */}
         <nav className="em-sidebar-nav">
           {navItems.map((item) => (
-            <button
-              key={item.path}
-              className={`em-nav-item ${isActive(item.path) ? 'active' : ''}`}
-              onClick={() => {
-                if (item.hasSubmenu) {
-                  toggleSubmenu(item.path);
-                } else {
-                  navigate(item.path);
-                }
-              }}
-              aria-label={item.label}
-              aria-current={isActive(item.path) ? 'page' : undefined}
-            >
-              <i className={item.icon} />
-              <span style={{ flex: 1 }}>{item.label}</span>
-              {item.hasSubmenu && (
-                <i
-                  className={`pi ${expandedMenus.includes(item.path) ? 'pi-chevron-down' : 'pi-chevron-right'}`}
-                  style={{ fontSize: 10 }}
-                />
+            <div key={item.label}>
+              {/* Parent item */}
+              <button
+                className={`em-nav-item ${isParentActive(item) ? 'active' : ''}`}
+                onClick={() => {
+                  if (item.children) {
+                    toggleSubmenu(item.label);
+                  } else if (item.path) {
+                    navigate(item.path);
+                  }
+                }}
+                aria-label={item.label}
+                aria-expanded={item.children ? expandedMenus.includes(item.label) : undefined}
+              >
+                <i className={item.icon} />
+                <span style={{ flex: 1 }}>{item.label}</span>
+                {item.children && (
+                  <i
+                    className={`pi ${expandedMenus.includes(item.label) ? 'pi-chevron-down' : 'pi-chevron-right'}`}
+                    style={{ fontSize: 10 }}
+                  />
+                )}
+              </button>
+
+              {/* Children submenu */}
+              {item.children && expandedMenus.includes(item.label) && (
+                <div className="em-submenu">
+                  {item.children.map((child) => (
+                    <button
+                      key={child.path + child.label}
+                      className={`em-nav-subitem ${isActive(child.path) ? 'active' : ''}`}
+                      onClick={() => navigate(child.path)}
+                      aria-label={child.label}
+                      aria-current={isActive(child.path) ? 'page' : undefined}
+                    >
+                      {child.icon && <i className={child.icon} />}
+                      <span>{child.label}</span>
+                    </button>
+                  ))}
+                </div>
               )}
-            </button>
+            </div>
           ))}
         </nav>
       </aside>

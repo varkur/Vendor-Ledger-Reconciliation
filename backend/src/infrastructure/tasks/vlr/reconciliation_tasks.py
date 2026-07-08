@@ -17,14 +17,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from celery import Task
 
 from src.infrastructure.background.celery_app import celery_app
+from src.infrastructure.logging.structured_logger import get_structured_logger
 
 logger = logging.getLogger(__name__)
+_structured_logger = get_structured_logger("celery_reconciliation")
 
 # Redis key prefix for reconciliation idempotency
 IDEMPOTENCY_KEY_PREFIX = "vlr:reconciliation:idempotency:"
@@ -45,6 +48,14 @@ class ReconciliationTask(Task):
         idempotency_key = kwargs.get("idempotency_key") or (
             args[1] if len(args) > 1 else None
         )
+        _structured_logger.log_failure(
+            operation="reconciliation_task",
+            duration_ms=0.0,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.error(
             "Reconciliation task failed: task_id=%s, case_id=%s, error=%s",
             task_id,
@@ -58,6 +69,12 @@ class ReconciliationTask(Task):
     def on_success(self, retval, task_id, args, kwargs):
         """Log task success."""
         case_id = kwargs.get("case_id") or (args[0] if args else "unknown")
+        _structured_logger.log_success(
+            operation="reconciliation_task",
+            duration_ms=retval.get("duration_seconds", 0) * 1000 if isinstance(retval, dict) else 0.0,
+            case_id=case_id,
+            task_id=task_id,
+        )
         logger.info(
             "Reconciliation task completed: task_id=%s, case_id=%s",
             task_id,

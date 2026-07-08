@@ -23,6 +23,13 @@ from src.api.v1.endpoints.vlr.approval_controller import router as vlr_approval_
 from src.api.v1.endpoints.vlr.notification_controller import router as vlr_notification_router
 from src.api.v1.endpoints.vlr.portal_controller import router as vlr_portal_router
 from src.api.v1.endpoints.vlr.report_controller import router as vlr_report_router
+from src.api.v1.endpoints.vlr.transformation_controller import router as vlr_transformation_router
+from src.api.v1.endpoints.vlr.column_mapping_controller import router as vlr_column_mapping_router
+from src.api.v1.endpoints.vlr.workflow_controller import router as vlr_workflow_router
+from src.api.v1.endpoints.vlr.reconciliation_output_controller import router as vlr_reconciliation_output_router
+from src.api.v1.endpoints.vlr.dashboard_controller import router as vlr_dashboard_router
+from src.api.v1.endpoints.vlr.recovery_controller import router as vlr_recovery_router
+from src.api.v1.endpoints.vlr.audit_controller import router as vlr_audit_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -45,3 +52,10 @@ api_v1_router.include_router(vlr_approval_router)
 api_v1_router.include_router(vlr_notification_router)
 api_v1_router.include_router(vlr_portal_router)
 api_v1_router.include_router(vlr_report_router)
+api_v1_router.include_router(vlr_transformation_router)
+api_v1_router.include_router(vlr_column_mapping_router)
+api_v1_router.include_router(vlr_workflow_router)
+api_v1_router.include_router(vlr_reconciliation_output_router)
+api_v1_router.include_router(vlr_dashboard_router)
+api_v1_router.include_router(vlr_recovery_router)
+api_v1_router.include_router(vlr_audit_router)

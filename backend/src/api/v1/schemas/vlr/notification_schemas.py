@@ -8,6 +8,7 @@ Requirements: 10.1, 10.7, 10.10, 16.6
 """
 
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -46,6 +47,61 @@ class NotificationHistoryResponse(BaseModel):
     total_pages: int = 0
 
     model_config = {"from_attributes": True}
+
+
+class NotificationListEntry(BaseModel):
+    """
+    Response schema for listing notifications across all cases.
+    Matches the frontend NotificationEntry interface shape.
+    """
+
+    id: str
+    notification_id: str
+    case_id: str
+    type: str = Field(description="Notification channel: Email, SMS, In-App, WhatsApp")
+    recipient: str
+    subject: str
+    timestamp: str
+    status: str = Field(description="Sent, Delivered, Read, Failed, Pending")
+    vendor_name: str
+    is_read: bool = False
+
+    model_config = {"from_attributes": True}
+
+
+class PaginatedNotificationListResponse(BaseModel):
+    """Paginated response for notification listing (frontend-compatible)."""
+
+    items: list[NotificationListEntry]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int = 0
+
+
+class MarkReadRequest(BaseModel):
+    """Request to mark notifications as read."""
+
+    notification_ids: list[str] = Field(description="List of notification IDs to mark as read")
+
+
+class MarkReadResponse(BaseModel):
+    """Response from mark-as-read endpoint."""
+
+    updated_count: int
+
+
+class SendReminderBulkRequest(BaseModel):
+    """Request to send reminders for multiple notification IDs."""
+
+    notification_ids: list[str] = Field(description="List of notification IDs to re-send reminders for")
+
+
+class SendReminderBulkResponse(BaseModel):
+    """Response from bulk send-reminder endpoint."""
+
+    sent_count: int
+    message: str
 
 
 class SendReminderResponse(BaseModel):

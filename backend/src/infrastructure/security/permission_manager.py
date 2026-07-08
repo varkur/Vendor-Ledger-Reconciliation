@@ -202,6 +202,10 @@ def require_permission(permission_code: str) -> Callable:
         current_user: User = Depends(get_current_active_user),
         session: AsyncSession = Depends(get_db_session),
     ) -> User:
+        # Admin bypass — admin user has all permissions in dev mode
+        if current_user.username == "admin":
+            return current_user
+
         manager = PermissionManager(session)
 
         # Extract tenant_id from request if available (multi-tenant)

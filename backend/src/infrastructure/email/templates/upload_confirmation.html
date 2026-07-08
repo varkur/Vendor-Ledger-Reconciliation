@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Confirmation: Statement Received</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Arial, sans-serif; background-color: #f4f6f8; line-height: 1.6;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f4f6f8;">
+        <tr>
+            <td align="center" style="padding: 40px 20px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                    <!-- Header -->
+                    <tr>
+                        <td style="padding: 32px 40px 24px; border-bottom: 2px solid #16a34a;">
+                            <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+                                <tr>
+                                    <td>
+                                        <!-- Company Logo Placeholder -->
+                                        <img src="cid:company_logo" alt="VLR System" style="max-height: 48px; max-width: 200px;" onerror="this.style.display='none'">
+                                        <h1 style="margin: 8px 0 0; font-size: 20px; color: #1e293b; font-weight: 600;">Vendor Ledger Reconciliation</h1>
+                                        <p style="margin: 4px 0 0; font-size: 14px; color: #16a34a; font-weight: 600;">Upload Confirmation</p>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <!-- Body -->
+                    <tr>
+                        <td style="padding: 32px 40px;">
+                            <p style="margin: 0 0 16px; font-size: 16px; color: #334155;">Dear {{ vendor_name }},</p>
+                            <p style="margin: 0 0 16px; font-size: 15px; color: #475569;">
+                                Your vendor statement has been successfully received and is now being processed for reconciliation.
+                            </p>
+                            <!-- Success Banner -->
+                            <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin: 0 0 24px;">
+                                <tr>
+                                    <td style="padding: 16px; background-color: #f0fdf4; border-left: 4px solid #16a34a; border-radius: 4px;">
+                                        <p style="margin: 0; font-size: 14px; color: #166534; font-weight: 500;">
+                                            Upload completed successfully
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            <!-- Upload Details -->
+                            <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin: 0 0 24px; border: 1px solid #e2e8f0; border-radius: 6px;">
+                                <tr>
+                                    <td style="padding: 16px;">
+                                        <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+                                            <tr>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #64748b; width: 140px;">File Name:</td>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #1e293b; font-weight: 500;">{{ file_name }}</td>
+                                            </tr>
+                                            <tr>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #64748b;">Rows Detected:</td>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #1e293b; font-weight: 500;">{{ row_count }}</td>
+                                            </tr>
+                                            <tr>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #64748b;">Upload Time:</td>
+                                                <td style="padding: 4px 0; font-size: 14px; color: #1e293b; font-weight: 500;">{{ timestamp }}</td>
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                            <p style="margin: 0 0 24px; font-size: 15px; color: #475569;">
+                                You can view the reconciliation status and track progress using the link below:
+                            </p>
+                            <!-- CTA Button -->
+                            <table role="presentation" cellpadding="0" cellspacing="0" style="margin: 0 auto 24px;">
+                                <tr>
+                                    <td align="center" style="background-color: #16a34a; border-radius: 6px;">
+                                        <a href="{{ case_url }}" target="_blank" style="display: inline-block; padding: 14px 32px; font-size: 16px; font-weight: 600; color: #ffffff; text-decoration: none; border-radius: 6px;">View Case Status</a>
+                                    </td>
+                                </tr>
+                            </table>
+                            <p style="margin: 0 0 8px; font-size: 13px; color: #64748b;">
+                                If the button doesn't work, copy and paste this link into your browser:
+                            </p>
+                            <p style="margin: 0 0 16px; font-size: 13px; color: #2563eb; word-break: break-all;">
+                                {{ case_url }}
+                            </p>
+                            <p style="margin: 0; font-size: 15px; color: #475569;">
+                                Thank you for your cooperation. We will notify you once the reconciliation is complete.
+                            </p>
+                        </td>
+                    </tr>
+                    <!-- Footer -->
+                    <tr>
+                        <td style="padding: 24px 40px; background-color: #f8fafc; border-top: 1px solid #e2e8f0; border-radius: 0 0 8px 8px;">
+                            <p style="margin: 0 0 8px; font-size: 12px; color: #94a3b8; text-align: center;">
+                                This is an automated notification from the Vendor Ledger Reconciliation system. Please do not reply to this email.
+                            </p>
+                            <p style="margin: 0; font-size: 12px; color: #94a3b8; text-align: center;">
+                                &copy; VLR System. All rights reserved.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>

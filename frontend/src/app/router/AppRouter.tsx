@@ -22,6 +22,8 @@ import { PortalAuthPage } from '@features/vendor-portal/PortalAuthPage';
 import { PortalUploadPage } from '@features/vendor-portal/PortalUploadPage';
 import { PortalStatementPage } from '@features/vendor-portal/PortalStatementPage';
 import { PortalSignOffPage } from '@features/vendor-portal/PortalSignOffPage';
+import { PortalProvider } from '@features/vendor-portal/context/PortalContext';
+import { DashboardPage } from '@features/dashboard/pages/DashboardPage';
 import { MainLayout } from '@app/layouts/MainLayout';
 import { PrivateRoute } from './PrivateRoute';
 
@@ -33,11 +35,11 @@ export const AppRouter = () => {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/auth/microsoft/callback" element={<MicrosoftCallbackPage />} />
 
-        {/* Vendor Portal — public routes (token-based auth) */}
-        <Route path="/portal/auth" element={<PortalAuthPage />} />
-        <Route path="/portal/upload" element={<PortalUploadPage />} />
-        <Route path="/portal/statement" element={<PortalStatementPage />} />
-        <Route path="/portal/sign-off" element={<PortalSignOffPage />} />
+        {/* Vendor Portal — public routes (token-based auth, wrapped in PortalProvider) */}
+        <Route path="/portal/auth" element={<PortalProvider><PortalAuthPage /></PortalProvider>} />
+        <Route path="/portal/upload" element={<PortalProvider><PortalUploadPage /></PortalProvider>} />
+        <Route path="/portal/statement" element={<PortalProvider><PortalStatementPage /></PortalProvider>} />
+        <Route path="/portal/sign-off" element={<PortalProvider><PortalSignOffPage /></PortalProvider>} />
 
         {/* Protected routes with layout */}
         <Route
@@ -48,7 +50,8 @@ export const AppRouter = () => {
             </PrivateRoute>
           }
         >
-          <Route index element={<Navigate to="/manage-party" replace />} />
+          <Route index element={<DashboardPage />} />
+          <Route path="dashboard" element={<DashboardPage />} />
 
           {/* Core reconciliation pages */}
           <Route path="manage-party" element={<ManagePartyPage />} />

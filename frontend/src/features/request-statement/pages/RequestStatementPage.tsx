@@ -2,17 +2,33 @@
  * Request Statement page — Multi-step form for creating a new party request.
  * Step 1: Configure (sender settings, responder settings, reconciliation settings, email settings)
  * Step 2: Upload Statement
+ *
+ * Wired to backend APIs:
+ * - POST /api/v1/vlr/requests (create reconciliation request with vendor_ids)
+ * - GET /api/v1/vlr/vendors (fetch vendor list for selection)
+ *
+ * Implements loading indicators, error handling, and form validation.
+ *
+ * Requirements: 23.3, 25.1, 25.2
  */
 
-import { useState } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { RadioButton } from 'primereact/radiobutton';
 import { Calendar } from 'primereact/calendar';
 import { InputTextarea } from 'primereact/inputtextarea';
 import { Button } from 'primereact/button';
+import { MultiSelect } from 'primereact/multiselect';
+import { Message } from 'primereact/message';
+import { ProgressSpinner } from 'primereact/progressspinner';
+
+import { useVendorSelection, useCreateStatementRequest } from '../hooks/useRequestStatement';
 
 type Step = 'configure' | 'upload';
+
+const DEFAULT_COMPANY_CODE = '1000';
+const DEFAULT_FISCAL_YEAR = '2024-25';
 
 export const RequestStatementPage = () => {
   const [currentStep, setCurrentStep] = useState<Step>('configure');
@@ -25,6 +41,8 @@ export const RequestStatementPage = () => {
   const [endDate, setEndDate] = useState<Date | null>(null);
   const [branch, setBranch] = useState('All');
   const [remarks, setRemarks] = useState('');
+  const [selectedVendorIds, setSelectedVendorIds] = useState<string[]>([]);
+  const [vendorSearch, setVendorSearch] = useState('');
 
   // Responder settings
   const [requestOpenItem, setRequestOpenItem] = useState('No');
@@ -48,6 +66,33 @@ export const RequestStatementPage = () => {
   const [contactPerson, setContactPerson] = useState('');
   const [sendNow, setSendNow] = useState('Now');
 
+  // Success state
+  const [showSuccess, setShowSuccess] = useState(false);
+
+  // Validation errors
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
+
+  // ─── API Hooks ───────────────────────────────────────────────────────────────
+  const {
+    data: vendorData,
+    isLoading: isLoadingVendors,
+    isError: isVendorError,
+    error: vendorError,
+    refetch: refetchVendors,
+  } = useVendorSelection(DEFAULT_COMPANY_CODE, vendorSearch);
+
+  const createMutation = useCreateStatementRequest();
+
+  // ─── Derived Data ────────────────────────────────────────────────────────────
+  const vendorOptions = useMemo(() => {
+    if (!vendorData?.items) return [];
+    return vendorData.items.map((v) => ({
+      label: `${v.vendor_code} — ${v.name}`,
+      value: v.id,
+    }));
+  }, [vendorData]);
+
+  // ─── Dropdown Options ────────────────────────────────────────────────────────
   const requestTypeOptions = [
     { label: 'Ledger', value: 'Ledger' },
     { label: 'Balance Confirmation', value: 'Balance Confirmation' },
@@ -75,6 +120,110 @@ export const RequestStatementPage = () => {
     { label: 'No', value: 'No' },
   ];
 
+  // ─── Form Validation ─────────────────────────────────────────────────────────
+  const validateForm = useCallback((): boolean => {
+    const errors: Record<string, string> = {};
+
+    if (!title.trim()) {
+      errors.title = 'Title is required';
+    }
+    if (!startDate) {
+      errors.startDate = 'Start date is required';
+    }
+    if (!endDate) {
+      errors.endDate = 'End date is required';
+    }
+    if (startDate && endDate && startDate >= endDate) {
+      errors.endDate = 'End date must be after start date';
+    }
+    if (selectedVendorIds.length === 0) {
+      errors.vendors = 'At least one vendor must be selected';
+    }
+
+    setValidationErrors(errors);
+    return Object.keys(errors).length === 0;
+  }, [title, startDate, endDate, selectedVendorIds]);
+
+  // ─── Handlers ────────────────────────────────────────────────────────────────
+  const formatDateToISO = (d: Date | null): string => {
+    if (!d) return '';
+    const iso = d.toISOString();
+    return iso.substring(0, iso.indexOf('T'));
+  };
+
+  const handleSubmit = useCallback(() => {
+    if (!validateForm()) return;
+
+    createMutation.mutate(
+      {
+        company_code: DEFAULT_COMPANY_CODE,
+        fiscal_year: DEFAULT_FISCAL_YEAR,
+        period_start: formatDateToISO(startDate),
+        period_end: formatDateToISO(endDate),
+        vendor_ids: selectedVendorIds,
+        tolerance_amount: parseFloat(amountTolerance) || 0,
+        tds_percentage: parseFloat(tdsMax) || 0,
+        gst_percentage: parseFloat(gstPercentage) || 0,
+      },
+      {
+        onSuccess: () => {
+          setShowSuccess(true);
+          setCurrentStep('upload');
+        },
+      }
+    );
+  }, [
+    validateForm, createMutation, startDate, endDate,
+    selectedVendorIds, amountTolerance, tdsMax, gstPercentage,
+  ]);
+
+  const handleVendorFilter = useCallback((e: { filter: string }) => {
+    setVendorSearch(e.filter);
+  }, []);
+
+  const handleResetSuccess = useCallback(() => {
+    setShowSuccess(false);
+    setTitle('');
+    setSelectedVendorIds([]);
+    setStartDate(null);
+    setEndDate(null);
+    setRemarks('');
+    setCurrentStep('configure');
+    createMutation.reset();
+  }, [createMutation]);
+
+  // ─── Success State ──────────────────────────────────────────────────────────
+  if (showSuccess && createMutation.isSuccess) {
+    return (
+      <div>
+        <h2>New Party Request</h2>
+        <div className="em-form-section">
+          <div className="flex flex-column align-items-center justify-content-center p-5">
+            <i
+              className="pi pi-check-circle"
+              style={{ fontSize: '3rem', color: 'var(--green-500)' }}
+            />
+            <h3 className="mt-3 mb-1">Statement Request Created Successfully</h3>
+            <p className="text-color-secondary text-center" style={{ maxWidth: '500px' }}>
+              Your request has been submitted for {selectedVendorIds.length} vendor(s).
+              The reconciliation workflow will begin processing shortly.
+            </p>
+            <p className="text-sm text-color-secondary">
+              Request ID: {createMutation.data?.id}
+            </p>
+            <Button
+              label="Create Another Request"
+              icon="pi pi-plus"
+              className="mt-3"
+              onClick={handleResetSuccess}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Main Render ────────────────────────────────────────────────────────────
   return (
     <div>
       <h2>New Party Request</h2>
@@ -97,6 +246,18 @@ export const RequestStatementPage = () => {
         </div>
       </div>
 
+      {/* Mutation Error Banner */}
+      {createMutation.isError && (
+        <Message
+          severity="error"
+          text={
+            createMutation.error?.message ??
+            'Failed to create statement request. Please try again.'
+          }
+          className="w-full mb-3"
+        />
+      )}
+
       {currentStep === 'configure' && (
         <div>
           {/* Request Title */}
@@ -109,8 +270,63 @@ export const RequestStatementPage = () => {
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   placeholder="Eg. request for vendors"
-                  className="w-full"
+                  className={`w-full ${validationErrors.title ? 'p-invalid' : ''}`}
+                  aria-label="Request title"
                 />
+                {validationErrors.title && (
+                  <small className="p-error">{validationErrors.title}</small>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Vendor Selection */}
+          <div className="em-form-section">
+            <div className="em-form-section-title">Vendor Selection</div>
+            <div className="grid">
+              <div className="col-12 md:col-8">
+                <label className="block mb-2 font-medium text-sm">Select Vendors*</label>
+                {isVendorError && (
+                  <div className="mb-2">
+                    <Message
+                      severity="error"
+                      text={vendorError?.message ?? 'Failed to load vendors.'}
+                      className="w-full"
+                    />
+                    <Button
+                      label="Retry"
+                      icon="pi pi-refresh"
+                      severity="secondary"
+                      size="small"
+                      className="mt-1"
+                      onClick={() => refetchVendors()}
+                      aria-label="Retry loading vendors"
+                    />
+                  </div>
+                )}
+                <MultiSelect
+                  value={selectedVendorIds}
+                  options={vendorOptions}
+                  onChange={(e) => setSelectedVendorIds(e.value)}
+                  onFilter={handleVendorFilter}
+                  filter
+                  filterPlaceholder="Search vendors..."
+                  placeholder="Select vendors"
+                  className={`w-full ${validationErrors.vendors ? 'p-invalid' : ''}`}
+                  display="chip"
+                  maxSelectedLabels={5}
+                  loading={isLoadingVendors}
+                  emptyFilterMessage={isLoadingVendors ? 'Loading...' : 'No vendors found'}
+                  aria-label="Select vendors for statement request"
+                />
+                {isLoadingVendors && (
+                  <small className="text-color-secondary">
+                    <ProgressSpinner style={{ width: '14px', height: '14px' }} /> Loading vendors...
+                  </small>
+                )}
+                {validationErrors.vendors && (
+                  <small className="p-error">{validationErrors.vendors}</small>
+                )}
               </div>
             </div>
           </div>
@@ -167,9 +383,13 @@ export const RequestStatementPage = () => {
                   onChange={(e) => setStartDate(e.value as Date)}
                   dateFormat="dd/mm/yy"
                   placeholder="DD/MM/YYYY"
-                  className="w-full"
+                  className={`w-full ${validationErrors.startDate ? 'p-invalid' : ''}`}
                   showIcon
+                  aria-label="Period start date"
                 />
+                {validationErrors.startDate && (
+                  <small className="p-error">{validationErrors.startDate}</small>
+                )}
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">End Date*</label>
@@ -178,9 +398,13 @@ export const RequestStatementPage = () => {
                   onChange={(e) => setEndDate(e.value as Date)}
                   dateFormat="dd/mm/yy"
                   placeholder="DD/MM/YYYY"
-                  className="w-full"
+                  className={`w-full ${validationErrors.endDate ? 'p-invalid' : ''}`}
                   showIcon
+                  aria-label="Period end date"
                 />
+                {validationErrors.endDate && (
+                  <small className="p-error">{validationErrors.endDate}</small>
+                )}
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Select Branch*</label>
@@ -385,7 +609,13 @@ export const RequestStatementPage = () => {
 
           <div className="flex justify-content-end gap-3 mt-4">
             <Button label="Preview" className="p-button-outlined" />
-            <Button label="Submit" onClick={() => setCurrentStep('upload')} />
+            <Button
+              label="Submit"
+              onClick={handleSubmit}
+              loading={createMutation.isPending}
+              disabled={createMutation.isPending}
+              icon={createMutation.isPending ? 'pi pi-spin pi-spinner' : undefined}
+            />
           </div>
         </div>
       )}

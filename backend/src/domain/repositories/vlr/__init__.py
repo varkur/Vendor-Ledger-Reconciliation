@@ -15,6 +15,8 @@ from src.domain.repositories.vlr.approval_repository import IApprovalRepository
 from src.domain.repositories.vlr.notification_repository import INotificationRepository
 from src.domain.repositories.vlr.setting_repository import ISettingRepository
 from src.domain.repositories.vlr.automation_rule_repository import IAutomationRuleRepository
+from src.domain.repositories.vlr.column_mapping_template_repository import IColumnMappingTemplateRepository
+from src.domain.repositories.vlr.recovery_repository import IRecoveryRepository
 
 __all__ = [
     "IVendorRepository",
@@ -27,4 +29,6 @@ __all__ = [
     "INotificationRepository",
     "ISettingRepository",
     "IAutomationRuleRepository",
+    "IColumnMappingTemplateRepository",
+    "IRecoveryRepository",
 ]

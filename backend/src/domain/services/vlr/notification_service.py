@@ -7,15 +7,25 @@ Implements the notification lifecycle for reconciliation cases including:
 - Reminder scheduling at configurable intervals (default: 3, 7, 14 days)
 - Escalation when reminder count exceeds maximum
 - Logging all notifications with recipient, type, timestamp, delivery status
+- Enhanced EmailNotificationService with Jinja2 templates and Celery task dispatch
+- BRD-specific D3/D7/D10 reminder scheduling with escalation
 
 Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10
+Requirements: 14.1, 14.3, 14.4, 15.1, 15.2, 15.3, 15.4, 16.1, 16.2
 """
 
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from uuid import UUID, uuid4
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from src.infrastructure.logging.structured_logger import get_structured_logger
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -25,7 +35,15 @@ DEFAULT_MAX_REMINDERS: int = 3
 MAX_RETRY_ATTEMPTS: int = 3
 RETRY_BACKOFF_SECONDS: list[int] = [30, 120, 480]
 
+# BRD-specified reminder intervals (D3, D7, D10)
+BRD_REMINDER_INTERVALS_DAYS: list[int] = [3, 7, 10]
+BRD_MAX_REMINDERS: int = 3
+
+# Template directory path
+TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "infrastructure" / "email" / "templates"
+
 logger = logging.getLogger(__name__)
+_structured_logger = get_structured_logger("email_service")
 
 
 # ─── Enumerations ─────────────────────────────────────────────────────────────
@@ -41,6 +59,11 @@ class NotificationType(str, Enum):
     REJECTION = "rejection"
     SIGN_OFF_REQUEST = "sign_off_request"
     SIGN_OFF_COMPLETE = "sign_off_complete"
+    UPLOAD_CONFIRMATION = "upload_confirmation"
+    VENDOR_INVITE = "vendor_invite"
+    REMINDER_D3 = "reminder_d3"
+    REMINDER_D7 = "reminder_d7"
+    REMINDER_D10 = "reminder_d10"
 
 
 class NotificationStatus(str, Enum):
@@ -95,6 +118,66 @@ class ReminderSchedule:
     max_reminders: int = DEFAULT_MAX_REMINDERS
     next_reminder_index: int = 0
     next_reminder_date: datetime | None = None
+
+
+@dataclass
+class BRDReminderSchedule:
+    """
+    BRD-specified reminder schedule with D3/D7/D10 intervals.
+
+    Defines the exact reminder cadence per the BRD:
+    - D3: First reminder, 3 days after invite with no upload
+    - D7: Second reminder, 7 days after invite with no upload
+    - D10: Third (final) reminder, 10 days after invite with no upload
+    - After D10 with no response: escalation to Reconciliation Manager
+
+    Requirements: 15.1, 15.2, 15.3, 15.4
+    """
+
+    INTERVALS_DAYS: list[int] = field(
+        default_factory=lambda: list(BRD_REMINDER_INTERVALS_DAYS)
+    )
+    MAX_REMINDERS: int = BRD_MAX_REMINDERS
+
+    # Mapping of reminder number (1-indexed) to template name
+    REMINDER_TEMPLATES: dict[int, str] = field(default_factory=lambda: {
+        1: "reminder_d3.html",
+        2: "reminder_d7.html",
+        3: "reminder_d10.html",
+    })
+
+    def get_interval_days(self, reminder_number: int) -> int | None:
+        """
+        Get the interval in days for a given reminder number (1-indexed).
+
+        Returns None if reminder_number exceeds the schedule.
+        """
+        if reminder_number < 1 or reminder_number > len(self.INTERVALS_DAYS):
+            return None
+        return self.INTERVALS_DAYS[reminder_number - 1]
+
+    def get_template_name(self, reminder_number: int) -> str | None:
+        """
+        Get the template filename for a given reminder number (1-indexed).
+
+        Returns None if reminder_number exceeds the schedule.
+        """
+        return self.REMINDER_TEMPLATES.get(reminder_number)
+
+    def is_exhausted(self, reminders_sent: int) -> bool:
+        """Check if all reminders have been sent and escalation is needed."""
+        return reminders_sent >= self.MAX_REMINDERS
+
+    def get_next_reminder_number(self, reminders_sent: int) -> int | None:
+        """
+        Get the next reminder number to send.
+
+        Returns None if all reminders are exhausted.
+        """
+        next_num = reminders_sent + 1
+        if next_num > self.MAX_REMINDERS:
+            return None
+        return next_num
 
 
 @dataclass
@@ -934,3 +1017,821 @@ class NotificationService:
         """
         # In a full implementation, this would look up case -> request -> manager
         return "manager@example.com"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Enhanced Email Notification Service with Jinja2 Templates & Celery Dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class EmailNotificationService:
+    """
+    Enhanced notification service with Jinja2 template rendering,
+    BRD-specified D3/D7/D10 reminder scheduling, and Celery task dispatch.
+
+    All emails are sent as non-blocking Celery tasks and rendered using
+    Jinja2 templates from the templates directory.
+
+    Requirements: 14.1, 14.3, 14.4, 15.1, 15.2, 15.3, 15.4, 16.1, 16.2
+    """
+
+    def __init__(
+        self,
+        notification_repository: object,
+        case_repository: object,
+        setting_repository: object,
+        email_sender: IEmailSender | None = None,
+        templates_dir: str | Path | None = None,
+        base_url: str = "http://localhost:3000",
+    ) -> None:
+        self._notification_repo = notification_repository
+        self._case_repo = case_repository
+        self._setting_repo = setting_repository
+        self._email_sender = email_sender
+        self._base_url = base_url.rstrip("/")
+        self._reminder_schedule = BRDReminderSchedule()
+
+        # Initialize Jinja2 environment
+        template_path = Path(templates_dir) if templates_dir else TEMPLATES_DIR
+        self._jinja_env = Environment(
+            loader=FileSystemLoader(str(template_path)),
+            autoescape=select_autoescape(["html"]),
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Send Vendor Invite
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_vendor_invite(
+        self,
+        case_id: UUID,
+        vendor_email: str,
+        vendor_name: str,
+        portal_token: str,
+        company_name: str = "Emcure Pharmaceuticals",
+        period_start: str = "",
+        period_end: str = "",
+        deadline: str = "",
+    ) -> NotificationResult:
+        """
+        Send a vendor invite email with a unique portal link.
+
+        Generates a unique portal URL using the provided token and dispatches
+        the email as a Celery task to avoid blocking.
+
+        Requirement 14.1: Send invite email with unique portal link.
+        Requirement 14.3: Send via SMTP integration.
+        Requirement 14.4: Schedule as Celery task (non-blocking).
+
+        Args:
+            case_id: The reconciliation case ID.
+            vendor_email: Email address of the vendor contact.
+            vendor_name: Display name of the vendor.
+            portal_token: Unique token for portal access.
+            company_name: Name of the company sending the invite.
+            period_start: Reconciliation period start date (display string).
+            period_end: Reconciliation period end date (display string).
+            deadline: Deadline for statement upload (display string).
+
+        Returns:
+            NotificationResult with the delivery details.
+        """
+        portal_url = f"{self._base_url}/portal/access/{portal_token}"
+        case_url = f"{self._base_url}/vlr/cases/{case_id}"
+
+        context_data = {
+            "vendor_name": vendor_name,
+            "company_name": company_name,
+            "portal_url": portal_url,
+            "case_id": str(case_id),
+            "case_url": case_url,
+            "period_start": period_start,
+            "period_end": period_end,
+            "deadline": deadline,
+        }
+
+        # Render Jinja2 template
+        body_html = self._render_jinja_template("vendor_invite.html", context_data)
+
+        subject = "Vendor Ledger Reconciliation - Statement Request"
+
+        # Dispatch via Celery task (non-blocking)
+        notification_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        await self._dispatch_email_task(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.VENDOR_INVITE,
+            recipient_email=vendor_email,
+            subject=subject,
+            body_html=body_html,
+            context_data=context_data,
+        )
+
+        # Persist notification record
+        await self._persist_notification(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.VENDOR_INVITE,
+            recipient_email=vendor_email,
+            template_name="vendor_invite.html",
+            context_data=context_data,
+        )
+
+        logger.info(
+            "Vendor invite dispatched",
+            extra={
+                "case_id": str(case_id),
+                "recipient": vendor_email,
+                "portal_url": portal_url,
+            },
+        )
+
+        return NotificationResult(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.VENDOR_INVITE.value,
+            recipient_email=vendor_email,
+            status=NotificationStatus.PENDING.value,
+            sent_date=now,
+            template_code="vendor_invite.html",
+            context_data=context_data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Send Scheduled Reminder (D3/D7/D10)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_scheduled_reminder(
+        self,
+        case_id: UUID,
+        reminder_number: int,
+        vendor_email: str,
+        vendor_name: str,
+        portal_token: str,
+        company_name: str = "Emcure Pharmaceuticals",
+        period_start: str = "",
+        period_end: str = "",
+    ) -> NotificationResult:
+        """
+        Send a scheduled reminder email (D3, D7, or D10) based on the BRD schedule.
+
+        Uses the BRDReminderSchedule to determine which template to use.
+        Dispatches via Celery task for non-blocking execution.
+
+        Requirement 15.1: D3 reminder after 3 days with no upload.
+        Requirement 15.2: D7 reminder after 7 days with no upload.
+        Requirement 15.3: D10 reminder after 10 days with no upload.
+
+        Args:
+            case_id: The reconciliation case ID.
+            reminder_number: Which reminder to send (1=D3, 2=D7, 3=D10).
+            vendor_email: Email address of the vendor contact.
+            vendor_name: Display name of the vendor.
+            portal_token: Unique token for portal access.
+            company_name: Name of the company.
+            period_start: Reconciliation period start date.
+            period_end: Reconciliation period end date.
+
+        Returns:
+            NotificationResult with delivery details.
+
+        Raises:
+            ValueError: If reminder_number is invalid or schedule is exhausted.
+        """
+        # Validate reminder number
+        template_name = self._reminder_schedule.get_template_name(reminder_number)
+        if template_name is None:
+            raise ValueError(
+                f"Invalid reminder number {reminder_number}. "
+                f"Valid range: 1-{self._reminder_schedule.MAX_REMINDERS}"
+            )
+
+        interval_days = self._reminder_schedule.get_interval_days(reminder_number)
+        portal_url = f"{self._base_url}/portal/access/{portal_token}"
+        case_url = f"{self._base_url}/vlr/cases/{case_id}"
+
+        # Determine notification type based on reminder number
+        reminder_type_map = {
+            1: NotificationType.REMINDER_D3,
+            2: NotificationType.REMINDER_D7,
+            3: NotificationType.REMINDER_D10,
+        }
+        notification_type = reminder_type_map.get(
+            reminder_number, NotificationType.REMINDER
+        )
+
+        context_data = {
+            "vendor_name": vendor_name,
+            "company_name": company_name,
+            "portal_url": portal_url,
+            "case_id": str(case_id),
+            "case_url": case_url,
+            "period_start": period_start,
+            "period_end": period_end,
+            "reminder_number": reminder_number,
+            "interval_days": interval_days,
+        }
+
+        # Render the appropriate Jinja2 template
+        body_html = self._render_jinja_template(template_name, context_data)
+
+        subject_map = {
+            1: "Reminder: Statement Upload Required (Day 3)",
+            2: "Urgent: Statement Upload Required (Day 7)",
+            3: "Final Reminder: Statement Upload Required (Day 10)",
+        }
+        subject = subject_map.get(
+            reminder_number,
+            "Vendor Ledger Reconciliation - Reminder",
+        )
+
+        # Dispatch via Celery task
+        notification_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        await self._dispatch_email_task(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=notification_type,
+            recipient_email=vendor_email,
+            subject=subject,
+            body_html=body_html,
+            context_data=context_data,
+        )
+
+        # Persist notification record
+        await self._persist_notification(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=notification_type,
+            recipient_email=vendor_email,
+            template_name=template_name,
+            context_data=context_data,
+        )
+
+        logger.info(
+            "Scheduled reminder dispatched",
+            extra={
+                "case_id": str(case_id),
+                "reminder_number": reminder_number,
+                "interval_days": interval_days,
+                "template": template_name,
+                "recipient": vendor_email,
+            },
+        )
+
+        return NotificationResult(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=notification_type.value,
+            recipient_email=vendor_email,
+            status=NotificationStatus.PENDING.value,
+            sent_date=now,
+            template_code=template_name,
+            context_data=context_data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Send Escalation
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_escalation(
+        self,
+        case_id: UUID,
+        manager_email: str,
+        manager_name: str = "Reconciliation Manager",
+        vendor_name: str = "",
+        company_name: str = "Emcure Pharmaceuticals",
+        period_start: str = "",
+        period_end: str = "",
+        reminder_count: int = 3,
+        days_since_invite: int = 10,
+    ) -> NotificationResult:
+        """
+        Send an escalation notification when all reminders are exhausted.
+
+        Triggered after D10 reminder with no vendor response.
+        Notifies the Reconciliation Manager for manual intervention.
+
+        Requirement 15.4: Escalate when all reminders exhausted.
+
+        Args:
+            case_id: The reconciliation case ID.
+            manager_email: Email of the Reconciliation Manager.
+            manager_name: Display name of the manager.
+            vendor_name: Name of the non-responsive vendor.
+            company_name: Name of the company.
+            period_start: Reconciliation period start date.
+            period_end: Reconciliation period end date.
+            reminder_count: Number of reminders already sent.
+            days_since_invite: Days elapsed since original invite.
+
+        Returns:
+            NotificationResult with delivery details.
+        """
+        case_url = f"{self._base_url}/vlr/cases/{case_id}"
+
+        context_data = {
+            "manager_name": manager_name,
+            "vendor_name": vendor_name,
+            "company_name": company_name,
+            "case_id": str(case_id),
+            "case_url": case_url,
+            "period_start": period_start,
+            "period_end": period_end,
+            "reminder_count": reminder_count,
+            "days_since_invite": days_since_invite,
+        }
+
+        # Render Jinja2 escalation template
+        body_html = self._render_jinja_template("escalation.html", context_data)
+
+        subject = "ESCALATION: Vendor Non-Response - Reconciliation Case"
+
+        notification_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        await self._dispatch_email_task(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.ESCALATION,
+            recipient_email=manager_email,
+            subject=subject,
+            body_html=body_html,
+            context_data=context_data,
+        )
+
+        await self._persist_notification(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.ESCALATION,
+            recipient_email=manager_email,
+            template_name="escalation.html",
+            context_data=context_data,
+        )
+
+        logger.info(
+            "Escalation dispatched",
+            extra={
+                "case_id": str(case_id),
+                "manager_email": manager_email,
+                "reminder_count": reminder_count,
+                "days_since_invite": days_since_invite,
+            },
+        )
+
+        return NotificationResult(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.ESCALATION.value,
+            recipient_email=manager_email,
+            status=NotificationStatus.PENDING.value,
+            sent_date=now,
+            template_code="escalation.html",
+            context_data=context_data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Send Approval Request
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_approval_request(
+        self,
+        case_id: UUID,
+        approver_email: str,
+        approver_name: str = "Finance Reviewer",
+        vendor_name: str = "",
+        requested_by: str = "",
+        company_name: str = "Emcure Pharmaceuticals",
+        period_start: str = "",
+        period_end: str = "",
+    ) -> NotificationResult:
+        """
+        Send an approval request notification to the assigned Finance User.
+
+        Triggered when a case reaches the Finance Approval step.
+
+        Requirement 16.1: Send approval request to Finance_User.
+        Requirement 16.2: Send upload confirmation (handled separately).
+
+        Args:
+            case_id: The reconciliation case ID.
+            approver_email: Email of the finance approver.
+            approver_name: Display name of the approver.
+            vendor_name: Name of the vendor for the case.
+            requested_by: Who requested the approval.
+            company_name: Name of the company.
+            period_start: Reconciliation period start date.
+            period_end: Reconciliation period end date.
+
+        Returns:
+            NotificationResult with delivery details.
+        """
+        case_url = f"{self._base_url}/vlr/cases/{case_id}"
+
+        context_data = {
+            "approver_name": approver_name,
+            "vendor_name": vendor_name,
+            "company_name": company_name,
+            "case_id": str(case_id),
+            "case_url": case_url,
+            "period_start": period_start,
+            "period_end": period_end,
+            "requested_by": requested_by,
+        }
+
+        # Render Jinja2 approval request template
+        body_html = self._render_jinja_template("approval_request.html", context_data)
+
+        subject = "Approval Required: Vendor Ledger Reconciliation Case"
+
+        notification_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        await self._dispatch_email_task(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.APPROVAL_REQUEST,
+            recipient_email=approver_email,
+            subject=subject,
+            body_html=body_html,
+            context_data=context_data,
+        )
+
+        await self._persist_notification(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.APPROVAL_REQUEST,
+            recipient_email=approver_email,
+            template_name="approval_request.html",
+            context_data=context_data,
+        )
+
+        logger.info(
+            "Approval request dispatched",
+            extra={
+                "case_id": str(case_id),
+                "approver_email": approver_email,
+                "vendor_name": vendor_name,
+            },
+        )
+
+        return NotificationResult(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.APPROVAL_REQUEST.value,
+            recipient_email=approver_email,
+            status=NotificationStatus.PENDING.value,
+            sent_date=now,
+            template_code="approval_request.html",
+            context_data=context_data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Send Upload Confirmation
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def send_upload_confirmation(
+        self,
+        case_id: UUID,
+        user_email: str,
+        user_name: str = "Finance User",
+        vendor_name: str = "",
+        company_name: str = "Emcure Pharmaceuticals",
+        uploaded_at: str = "",
+    ) -> NotificationResult:
+        """
+        Send an upload confirmation notification to the Finance User.
+
+        Triggered when a vendor uploads their statement.
+
+        Requirement 16.2: Send upload confirmation to the initiating Finance_User.
+
+        Args:
+            case_id: The reconciliation case ID.
+            user_email: Email of the finance user who initiated the case.
+            user_name: Display name of the user.
+            vendor_name: Name of the vendor who uploaded.
+            company_name: Name of the company.
+            uploaded_at: Timestamp of upload (display string).
+
+        Returns:
+            NotificationResult with delivery details.
+        """
+        case_url = f"{self._base_url}/vlr/cases/{case_id}"
+
+        context_data = {
+            "user_name": user_name,
+            "vendor_name": vendor_name,
+            "company_name": company_name,
+            "case_id": str(case_id),
+            "case_url": case_url,
+            "uploaded_at": uploaded_at or datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            ),
+        }
+
+        body_html = self._render_jinja_template(
+            "upload_confirmation.html", context_data
+        )
+
+        subject = "Vendor Statement Received - Reconciliation Case"
+
+        notification_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        await self._dispatch_email_task(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.UPLOAD_CONFIRMATION,
+            recipient_email=user_email,
+            subject=subject,
+            body_html=body_html,
+            context_data=context_data,
+        )
+
+        await self._persist_notification(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.UPLOAD_CONFIRMATION,
+            recipient_email=user_email,
+            template_name="upload_confirmation.html",
+            context_data=context_data,
+        )
+
+        logger.info(
+            "Upload confirmation dispatched",
+            extra={
+                "case_id": str(case_id),
+                "user_email": user_email,
+                "vendor_name": vendor_name,
+            },
+        )
+
+        return NotificationResult(
+            notification_id=notification_id,
+            case_id=case_id,
+            notification_type=NotificationType.UPLOAD_CONFIRMATION.value,
+            recipient_email=user_email,
+            status=NotificationStatus.PENDING.value,
+            sent_date=now,
+            template_code="upload_confirmation.html",
+            context_data=context_data,
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Determine Next Reminder Action
+    # ──────────────────────────────────────────────────────────────────────
+
+    def determine_reminder_action(
+        self,
+        reminders_sent: int,
+        invite_date: datetime,
+    ) -> dict:
+        """
+        Determine what reminder action to take based on reminders already sent.
+
+        Returns a dict describing the action:
+        - {"action": "send_reminder", "reminder_number": N, "interval_days": D}
+        - {"action": "escalate"} if all reminders exhausted
+        - {"action": "none", "reason": "..."} if not yet time
+
+        Args:
+            reminders_sent: Number of reminders already sent.
+            invite_date: When the original invite was sent.
+
+        Returns:
+            Dict describing the appropriate action.
+        """
+        now = datetime.now(timezone.utc)
+        days_elapsed = (now - invite_date).days
+
+        if self._reminder_schedule.is_exhausted(reminders_sent):
+            return {"action": "escalate", "days_elapsed": days_elapsed}
+
+        next_num = self._reminder_schedule.get_next_reminder_number(reminders_sent)
+        if next_num is None:
+            return {"action": "escalate", "days_elapsed": days_elapsed}
+
+        interval = self._reminder_schedule.get_interval_days(next_num)
+        if interval is None:
+            return {"action": "none", "reason": "No interval defined"}
+
+        if days_elapsed >= interval:
+            return {
+                "action": "send_reminder",
+                "reminder_number": next_num,
+                "interval_days": interval,
+                "days_elapsed": days_elapsed,
+            }
+
+        return {
+            "action": "none",
+            "reason": f"Not yet time (day {days_elapsed}, next at day {interval})",
+            "next_reminder_day": interval,
+            "days_remaining": interval - days_elapsed,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Get Reminder Schedule
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def reminder_schedule(self) -> BRDReminderSchedule:
+        """Get the BRD reminder schedule configuration."""
+        return self._reminder_schedule
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal: Jinja2 Template Rendering
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _render_jinja_template(
+        self,
+        template_name: str,
+        context: dict,
+    ) -> str:
+        """
+        Render a Jinja2 email template with the given context.
+
+        Requirement 14.2: Use configurable Jinja2 templates for email content.
+
+        Args:
+            template_name: Filename of the template (e.g., "vendor_invite.html").
+            context: Dictionary of template variables.
+
+        Returns:
+            Rendered HTML string.
+        """
+        try:
+            template = self._jinja_env.get_template(template_name)
+            return template.render(**context)
+        except Exception as e:
+            logger.error(
+                "Template rendering failed",
+                extra={
+                    "template_name": template_name,
+                    "error": str(e),
+                },
+            )
+            # Fallback to a simple HTML rendering
+            return self._fallback_render(template_name, context)
+
+    @staticmethod
+    def _fallback_render(template_name: str, context: dict) -> str:
+        """Fallback template rendering when Jinja2 template is unavailable."""
+        html = f"<html><body><h2>{template_name}</h2>"
+        for key, value in context.items():
+            html += f"<p><strong>{key}:</strong> {value}</p>"
+        html += "</body></html>"
+        return html
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal: Celery Task Dispatch
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _dispatch_email_task(
+        self,
+        notification_id: UUID,
+        case_id: UUID,
+        notification_type: NotificationType,
+        recipient_email: str,
+        subject: str,
+        body_html: str,
+        context_data: dict,
+    ) -> None:
+        """
+        Dispatch email sending as a Celery task to avoid blocking.
+
+        Requirement 14.4: Schedule email sending as Celery task.
+
+        In production, this enqueues the actual SMTP send as a background task.
+        In dev/test mode (no Celery available), sends directly via email_sender.
+        """
+        start = time.perf_counter()
+        try:
+            from src.infrastructure.tasks.vlr.notification_tasks import (
+                send_notification_task,
+            )
+
+            # Dispatch to Celery as a non-blocking task
+            send_notification_task.delay(
+                case_id=str(case_id),
+                notification_type=notification_type.value,
+                recipient_email=recipient_email,
+                triggered_by="system",
+                context_data={
+                    **context_data,
+                    "_subject": subject,
+                    "_body_html": body_html,
+                    "_notification_id": str(notification_id),
+                },
+            )
+            duration_ms = (time.perf_counter() - start) * 1000
+            _structured_logger.log_success(
+                operation="dispatch_email",
+                duration_ms=duration_ms,
+                case_id=str(case_id),
+                notification_type=notification_type.value,
+            )
+            logger.debug(
+                "Email task dispatched to Celery",
+                extra={
+                    "notification_id": str(notification_id),
+                    "case_id": str(case_id),
+                    "type": notification_type.value,
+                },
+            )
+        except Exception as e:
+            # Celery not available (dev/test mode) - send directly
+            logger.debug(
+                "Celery not available, sending directly: %s", str(e)
+            )
+            if self._email_sender:
+                await self._email_sender.send_email(
+                    to_email=recipient_email,
+                    subject=subject,
+                    body_html=body_html,
+                    template_code=notification_type.value,
+                )
+            duration_ms = (time.perf_counter() - start) * 1000
+            _structured_logger.log_success(
+                operation="dispatch_email_direct",
+                duration_ms=duration_ms,
+                case_id=str(case_id),
+                notification_type=notification_type.value,
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal: Persist Notification Record
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _persist_notification(
+        self,
+        notification_id: UUID,
+        case_id: UUID,
+        notification_type: NotificationType,
+        recipient_email: str,
+        template_name: str,
+        context_data: dict,
+    ) -> None:
+        """Persist notification record in the database."""
+        now = datetime.now(timezone.utc)
+        try:
+            await self._notification_repo.create({
+                "id": str(notification_id),
+                "case_id": str(case_id),
+                "type": notification_type.value,
+                "recipient_email": recipient_email,
+                "status": NotificationStatus.PENDING.value,
+                "retry_count": 0,
+                "template_code": template_name,
+                "context_data": context_data,
+                "sent_date": now,
+                "next_retry_date": None,
+            })
+        except Exception as e:
+            logger.error(
+                "Failed to persist notification record",
+                extra={
+                    "notification_id": str(notification_id),
+                    "error": str(e),
+                },
+            )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Generate Portal Link
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_portal_link(self, portal_token: str) -> str:
+        """
+        Generate a unique portal link for vendor access.
+
+        Requirement 14.1: Each invite includes a unique portal link.
+
+        Args:
+            portal_token: Unique token for the vendor's portal session.
+
+        Returns:
+            Full portal URL string.
+        """
+        return f"{self._base_url}/portal/access/{portal_token}"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public: Generate Case Link
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_case_link(self, case_id: UUID) -> str:
+        """
+        Generate a direct link to the relevant case.
+
+        Requirement 16.3: All emails include a direct link to the relevant case.
+
+        Args:
+            case_id: The reconciliation case ID.
+
+        Returns:
+            Full case URL string.
+        """
+        return f"{self._base_url}/vlr/cases/{case_id}"

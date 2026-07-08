@@ -18,6 +18,8 @@ from src.domain.services.vlr.report_service import (
     ExceptionReportData,
     MonthlyMISReport,
     ReconciliationStatementReport,
+    ReconciliationSummaryReport,
+    ReconciliationSummaryRow,
     ReportService,
     ReportType,
     VendorStatusReport,
@@ -934,3 +936,793 @@ class TestAgeingBucketHelper:
         assert report_service._get_ageing_bucket(91) == AgeingBucket.OVER_90.value
         assert report_service._get_ageing_bucket(120) == AgeingBucket.OVER_90.value
         assert report_service._get_ageing_bucket(365) == AgeingBucket.OVER_90.value
+
+
+# ─── Reconciliation Summary Report Tests (Requirements 27.1, 27.2) ────────────
+
+
+@dataclass
+class FakeCaseWithBalances:
+    """Fake case with balance fields for reconciliation summary tests."""
+
+    id: UUID = field(default_factory=uuid4)
+    status: str = "matched"
+    vendor_id: UUID = field(default_factory=uuid4)
+    company_closing_balance: Decimal = Decimal("0.00")
+    vendor_closing_balance: Decimal = Decimal("0.00")
+    upload_count: int = 1
+    edit_count: int = 0
+    updated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+@dataclass
+class FakeLedgerEntryWithTDS:
+    """Fake ledger entry with TDS and amount fields for summary tests."""
+
+    id: UUID = field(default_factory=uuid4)
+    case_id: UUID = field(default_factory=uuid4)
+    amount: Decimal = Decimal("5000.00")
+    side: str = "company"
+    reference_number: str = "REF001"
+    posting_date: date = field(default_factory=date.today)
+    match_id: UUID | None = None
+    pass_number: int | None = None
+    confidence_score: float | None = None
+    is_tds: bool = False
+    document_category: str | None = None
+
+
+@dataclass
+class FakeMatchResult:
+    """Fake match result for tolerance/date-proximity matches."""
+
+    id: UUID = field(default_factory=uuid4)
+    case_id: UUID = field(default_factory=uuid4)
+    pass_number: int = 2
+    match_type: str = "tolerance"
+    confidence_score: float = 0.90
+    matched_amount: Decimal = Decimal("10000.00")
+    difference_amount: Decimal | None = None
+    company_entry_ids: list = field(default_factory=list)
+    vendor_entry_ids: list = field(default_factory=list)
+
+
+class TestReconciliationSummaryReport:
+    """Tests for the 10-row reconciliation summary report (Requirements 27.1, 27.2)."""
+
+    async def test_generate_empty_case_all_zeros(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Should generate a report with all zeros for a case with no data."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(id=case_id)
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.case_id == case_id
+        assert len(result.rows) == 10
+        assert result.net_difference == Decimal("0.00")
+        assert result.company_closing_balance == Decimal("0.00")
+        assert result.vendor_closing_balance == Decimal("0.00")
+
+    async def test_row_10_zero_for_fully_reconciled(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """
+        Row 10 (Net Difference) must be 0 for a fully reconciled case
+        where all entries are matched and balances agree.
+
+        Requirement 27.2: Net Difference = 0 for fully reconciled cases.
+        """
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("100000.00"),
+            vendor_closing_balance=Decimal("100000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+        # No unmatched entries (fully reconciled)
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        # No tolerance or date-proximity matches with differences
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.net_difference == Decimal("0.00")
+        assert result.rows[9].row_number == 10
+        assert result.rows[9].amount == Decimal("0.00")
+
+    async def test_row_10_zero_with_adjustments_explaining_difference(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """
+        Row 10 should be 0 when unmatched entries fully explain
+        the difference between company and vendor closing balances.
+
+        Example: Company Closing = 150,000; Vendor Closing = 100,000
+        Gap = 50,000 (company higher)
+        Unmatched company credit = +50,000 (our payment vendor hasn't recorded)
+        Net Diff = 150,000 - 100,000 - (50,000) = 0
+        """
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("150000.00"),
+            vendor_closing_balance=Decimal("100000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+
+        # Unmatched company credit (positive amount) explaining the gap
+        unmatched_company = [
+            FakeLedgerEntryWithTDS(
+                amount=Decimal("50000.00"),
+                side="company",
+                is_tds=False,
+            ),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.side_effect = [
+            unmatched_company,  # company side
+            [],  # vendor side
+        ]
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.company_closing_balance == Decimal("150000.00")
+        assert result.vendor_closing_balance == Decimal("100000.00")
+        assert result.unmatched_company_credit == Decimal("50000.00")
+        assert result.net_difference == Decimal("0.00")
+
+    async def test_unmatched_entries_split_by_debit_credit(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Should split unmatched entries into debit (negative) and credit (positive)."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("200000.00"),
+            vendor_closing_balance=Decimal("150000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+
+        # Company: mix of debit and credit unmatched entries
+        unmatched_company = [
+            FakeLedgerEntryWithTDS(amount=Decimal("-30000.00"), side="company"),
+            FakeLedgerEntryWithTDS(amount=Decimal("10000.00"), side="company"),
+        ]
+        # Vendor: mix of debit and credit unmatched entries
+        unmatched_vendor = [
+            FakeLedgerEntryWithTDS(amount=Decimal("-5000.00"), side="vendor"),
+            FakeLedgerEntryWithTDS(amount=Decimal("15000.00"), side="vendor"),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.side_effect = [
+            unmatched_company,
+            unmatched_vendor,
+        ]
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        # Row 3: Unmatched company debit
+        assert result.unmatched_company_debit == Decimal("-30000.00")
+        assert result.rows[2].amount == Decimal("-30000.00")
+        # Row 4: Unmatched company credit
+        assert result.unmatched_company_credit == Decimal("10000.00")
+        assert result.rows[3].amount == Decimal("10000.00")
+        # Row 5: Unmatched vendor debit
+        assert result.unmatched_vendor_debit == Decimal("-5000.00")
+        assert result.rows[4].amount == Decimal("-5000.00")
+        # Row 6: Unmatched vendor credit
+        assert result.unmatched_vendor_credit == Decimal("15000.00")
+        assert result.rows[5].amount == Decimal("15000.00")
+
+    async def test_tds_entries_counted_separately(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """TDS entries should be counted in Row 7, not in Rows 3/4."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("100000.00"),
+            vendor_closing_balance=Decimal("80000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+
+        # Company unmatched: one regular credit and one TDS credit
+        # Gap = 20,000 explained by: credit 15,000 + TDS 5,000 = 20,000
+        unmatched_company = [
+            FakeLedgerEntryWithTDS(
+                amount=Decimal("15000.00"), side="company", is_tds=False
+            ),
+            FakeLedgerEntryWithTDS(
+                amount=Decimal("5000.00"), side="company", is_tds=True
+            ),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.side_effect = [
+            unmatched_company,
+            [],  # vendor side
+        ]
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        # TDS entry should be in Row 7, not Row 4
+        assert result.unmatched_company_credit == Decimal("15000.00")
+        assert result.tds_difference == Decimal("5000.00")
+        assert result.rows[6].amount == Decimal("5000.00")  # Row 7
+        # Net diff: 100000 - 80000 - (15000 + 5000) = 20000 - 20000 = 0
+        assert result.net_difference == Decimal("0.00")
+
+    async def test_tolerance_match_differences_in_row_8(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Row 8 should contain the sum of difference_amount from tolerance matches."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("100000.00"),
+            vendor_closing_balance=Decimal("99700.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+
+        # Tolerance matches with small differences
+        tolerance_matches = [
+            FakeMatchResult(pass_number=2, difference_amount=Decimal("150.00")),
+            FakeMatchResult(pass_number=2, difference_amount=Decimal("150.00")),
+        ]
+
+        # Return tolerance matches for pass 2, empty for pass 6
+        mock_match_repo.get_by_case_and_pass.side_effect = [
+            tolerance_matches,  # pass 2 (tolerance)
+            [],  # pass 6 (date proximity)
+        ]
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.amount_difference == Decimal("300.00")
+        assert result.rows[7].amount == Decimal("300.00")
+        # Net diff: 100000 - 99700 - 300 = 0
+        assert result.net_difference == Decimal("0.00")
+
+    async def test_date_proximity_differences_in_row_9(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Row 9 should contain the sum of difference_amount from date-proximity matches."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("50000.00"),
+            vendor_closing_balance=Decimal("49500.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+
+        date_prox_matches = [
+            FakeMatchResult(pass_number=6, match_type="date_proximity", difference_amount=Decimal("500.00")),
+        ]
+
+        mock_match_repo.get_by_case_and_pass.side_effect = [
+            [],  # pass 2 (tolerance)
+            date_prox_matches,  # pass 6 (date proximity)
+        ]
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.timing_difference == Decimal("500.00")
+        assert result.rows[8].amount == Decimal("500.00")
+        # Net diff: 50000 - 49500 - 500 = 0
+        assert result.net_difference == Decimal("0.00")
+
+    async def test_report_has_exactly_10_rows(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """The report must contain exactly 10 rows."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(id=case_id)
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert len(result.rows) == 10
+        for i, row in enumerate(result.rows, start=1):
+            assert row.row_number == i
+
+    async def test_row_descriptions_match_brd(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Row descriptions should match BRD Section 10.2 format."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(id=case_id)
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        expected_descriptions = [
+            "Closing Balance as per Emcure Books",
+            "Closing Balance as per Vendor Books",
+            "Amounts not reflected in Vendor Books (Debit)",
+            "Amounts not reflected in Vendor Books (Credit)",
+            "Amounts not reflected in Emcure Books (Debit)",
+            "Amounts not reflected in Emcure Books (Credit)",
+            "TDS Deducted by Emcure",
+            "Amount Difference",
+            "Timing Differences",
+            "Net Difference",
+        ]
+        for i, desc in enumerate(expected_descriptions):
+            assert result.rows[i].description == desc
+
+    async def test_non_zero_net_difference_for_partial_reconciliation(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Net Difference should be non-zero when adjustments don't fully explain the gap."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("200000.00"),
+            vendor_closing_balance=Decimal("150000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+
+        # Only partial unmatched entries (explaining 30000 of the 50000 gap)
+        unmatched_company = [
+            FakeLedgerEntryWithTDS(amount=Decimal("-30000.00"), side="company"),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.side_effect = [
+            unmatched_company,
+            [],
+        ]
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        # Net diff: 200000 - 150000 - (-30000) = 80000 (not fully reconciled)
+        assert result.net_difference == Decimal("80000.00")
+        assert result.rows[9].amount == Decimal("80000.00")
+
+    async def test_case_not_found_returns_zeros(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Should return zeros when the case is not found."""
+        case_id = uuid4()
+        mock_case_repo.get_by_id.return_value = None
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.company_closing_balance == Decimal("0.00")
+        assert result.vendor_closing_balance == Decimal("0.00")
+        assert result.net_difference == Decimal("0.00")
+
+    async def test_caching_works_for_summary(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """Should return cached result on second call."""
+        case_id = uuid4()
+        case = FakeCaseWithBalances(id=case_id)
+        mock_case_repo.get_by_id.return_value = case
+        mock_ledger_repo.get_unmatched_by_case.return_value = []
+        mock_match_repo.get_by_case_and_pass.return_value = []
+
+        # First call
+        result1 = await report_service.generate_reconciliation_summary(case_id)
+
+        # Reset mocks
+        mock_case_repo.get_by_id.reset_mock()
+
+        # Second call should use cache
+        result2 = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result1 is result2
+        mock_case_repo.get_by_id.assert_not_called()
+
+    async def test_full_reconciliation_scenario_with_all_adjustment_types(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_match_repo: AsyncMock,
+    ):
+        """
+        Complete scenario: company closing 500,000 vs vendor closing 450,000.
+        Gap of 50,000 is explained by adjustments that sum to 50,000:
+        - Unmatched company debit: -30,000 (Row 3)
+        - Unmatched company credit: 5,000 (Row 4)
+        - Unmatched vendor debit: -3,000 (Row 5)
+        - Unmatched vendor credit: 8,000 (Row 6)
+        - TDS: -40,000 (Row 7)
+        - Tolerance diff: 5,000 (Row 8)
+        - Timing diff: 5,000 (Row 9)
+        Adjustments = -30000 + 5000 + (-3000) + 8000 + (-40000) + 5000 + 5000 = -50000
+        Net Diff = 500000 - 450000 - (-50000) = 500000 - 450000 + 50000 = 100000
+        Wait, let me use values that yield 0:
+        Adjustments must equal company - vendor = 50000
+        -30000 + 5000 + (-3000) + 8000 + 60000 + 5000 + 5000 = 50000
+
+        Requirement 27.2: Row 10 = 0 when fully reconciled.
+        """
+        case_id = uuid4()
+        case = FakeCaseWithBalances(
+            id=case_id,
+            company_closing_balance=Decimal("500000.00"),
+            vendor_closing_balance=Decimal("450000.00"),
+        )
+        mock_case_repo.get_by_id.return_value = case
+
+        # Adjustments that sum to 50,000 (matching the gap):
+        # company_debit(-30000) + company_credit(15000) + vendor_debit(-5000) +
+        # vendor_credit(20000) + tds(40000) + tolerance(5000) + timing(5000) = 50000
+        unmatched_company = [
+            FakeLedgerEntryWithTDS(amount=Decimal("-30000.00"), side="company", is_tds=False),
+            FakeLedgerEntryWithTDS(amount=Decimal("15000.00"), side="company", is_tds=False),
+            FakeLedgerEntryWithTDS(amount=Decimal("40000.00"), side="company", is_tds=True),
+        ]
+        unmatched_vendor = [
+            FakeLedgerEntryWithTDS(amount=Decimal("-5000.00"), side="vendor"),
+            FakeLedgerEntryWithTDS(amount=Decimal("20000.00"), side="vendor"),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.side_effect = [
+            unmatched_company,
+            unmatched_vendor,
+        ]
+
+        tolerance_matches = [
+            FakeMatchResult(pass_number=2, difference_amount=Decimal("5000.00")),
+        ]
+        date_prox_matches = [
+            FakeMatchResult(pass_number=6, difference_amount=Decimal("5000.00")),
+        ]
+        mock_match_repo.get_by_case_and_pass.side_effect = [
+            tolerance_matches,
+            date_prox_matches,
+        ]
+
+        result = await report_service.generate_reconciliation_summary(case_id)
+
+        assert result.company_closing_balance == Decimal("500000.00")
+        assert result.vendor_closing_balance == Decimal("450000.00")
+        assert result.unmatched_company_debit == Decimal("-30000.00")
+        assert result.unmatched_company_credit == Decimal("15000.00")
+        assert result.unmatched_vendor_debit == Decimal("-5000.00")
+        assert result.unmatched_vendor_credit == Decimal("20000.00")
+        assert result.tds_difference == Decimal("40000.00")
+        assert result.amount_difference == Decimal("5000.00")
+        assert result.timing_difference == Decimal("5000.00")
+        # Adjustments = -30000 + 15000 + (-5000) + 20000 + 40000 + 5000 + 5000 = 50000
+        # Net Diff = 500000 - 450000 - 50000 = 0
+        assert result.net_difference == Decimal("0.00")
+
+
+# ─── Aging Analysis Report Tests (Requirements 28.1, 28.2) ────────────────────
+
+
+class TestAgingBucketHelper:
+    """Tests for the new 5-bucket aging bucket classification."""
+
+    def test_0_30_days(self, report_service: ReportService):
+        """0-30 days should be DAYS_0_30."""
+        from src.domain.services.vlr.report_service import AgingBucket
+        assert report_service._get_aging_bucket(0) == AgingBucket.DAYS_0_30.value
+        assert report_service._get_aging_bucket(15) == AgingBucket.DAYS_0_30.value
+        assert report_service._get_aging_bucket(30) == AgingBucket.DAYS_0_30.value
+
+    def test_31_60_days(self, report_service: ReportService):
+        """31-60 days should be DAYS_31_60."""
+        from src.domain.services.vlr.report_service import AgingBucket
+        assert report_service._get_aging_bucket(31) == AgingBucket.DAYS_31_60.value
+        assert report_service._get_aging_bucket(45) == AgingBucket.DAYS_31_60.value
+        assert report_service._get_aging_bucket(60) == AgingBucket.DAYS_31_60.value
+
+    def test_61_90_days(self, report_service: ReportService):
+        """61-90 days should be DAYS_61_90."""
+        from src.domain.services.vlr.report_service import AgingBucket
+        assert report_service._get_aging_bucket(61) == AgingBucket.DAYS_61_90.value
+        assert report_service._get_aging_bucket(75) == AgingBucket.DAYS_61_90.value
+        assert report_service._get_aging_bucket(90) == AgingBucket.DAYS_61_90.value
+
+    def test_91_180_days(self, report_service: ReportService):
+        """91-180 days should be DAYS_91_180."""
+        from src.domain.services.vlr.report_service import AgingBucket
+        assert report_service._get_aging_bucket(91) == AgingBucket.DAYS_91_180.value
+        assert report_service._get_aging_bucket(120) == AgingBucket.DAYS_91_180.value
+        assert report_service._get_aging_bucket(180) == AgingBucket.DAYS_91_180.value
+
+    def test_180_plus_days(self, report_service: ReportService):
+        """Over 180 days should be DAYS_180_PLUS."""
+        from src.domain.services.vlr.report_service import AgingBucket
+        assert report_service._get_aging_bucket(181) == AgingBucket.DAYS_180_PLUS.value
+        assert report_service._get_aging_bucket(365) == AgingBucket.DAYS_180_PLUS.value
+        assert report_service._get_aging_bucket(1000) == AgingBucket.DAYS_180_PLUS.value
+
+
+class TestAgingAnalysisReport:
+    """Tests for aging analysis report generation."""
+
+    async def test_generate_empty_company(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+    ):
+        """Should return empty report when no cases exist."""
+        mock_case_repo.list_cases.return_value = PaginatedResult(
+            items=[], total=0, page=1, page_size=10000
+        )
+
+        result = await report_service.generate_aging_analysis(
+            company_code="EMCURE"
+        )
+
+        assert result.total_items == 0
+        assert result.total_amount == Decimal("0.00")
+        assert len(result.bucket_summaries) == 5
+        assert result.items == []
+
+    async def test_aging_buckets_with_entries(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_vendor_repo: AsyncMock,
+    ):
+        """Should correctly classify entries into aging buckets."""
+        from src.domain.services.vlr.report_service import AgingBucket
+
+        case_id = uuid4()
+        vendor_id = uuid4()
+        today = date.today()
+
+        case = FakeCase(id=case_id, vendor_id=vendor_id, status="matching")
+        mock_case_repo.list_cases.return_value = PaginatedResult(
+            items=[case], total=1, page=1, page_size=10000
+        )
+
+        vendor = FakeVendor(id=vendor_id, name="Acme Corp")
+        mock_vendor_repo.get_by_id.return_value = vendor
+
+        # Create entries with various ages
+        entries = [
+            FakeLedgerEntry(
+                amount=Decimal("1000.00"),
+                posting_date=today - timedelta(days=10),
+            ),
+            FakeLedgerEntry(
+                amount=Decimal("2000.00"),
+                posting_date=today - timedelta(days=45),
+            ),
+            FakeLedgerEntry(
+                amount=Decimal("3000.00"),
+                posting_date=today - timedelta(days=100),
+            ),
+            FakeLedgerEntry(
+                amount=Decimal("4000.00"),
+                posting_date=today - timedelta(days=200),
+            ),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.return_value = entries
+
+        result = await report_service.generate_aging_analysis(
+            company_code="EMCURE"
+        )
+
+        assert result.total_items == 4
+        assert result.total_amount == Decimal("10000.00")
+
+        # Check bucket distribution
+        bucket_map = {s.bucket: s for s in result.bucket_summaries}
+        assert bucket_map[AgingBucket.DAYS_0_30.value].count == 1
+        assert bucket_map[AgingBucket.DAYS_0_30.value].total_amount == Decimal("1000.00")
+        assert bucket_map[AgingBucket.DAYS_31_60.value].count == 1
+        assert bucket_map[AgingBucket.DAYS_31_60.value].total_amount == Decimal("2000.00")
+        assert bucket_map[AgingBucket.DAYS_91_180.value].count == 1
+        assert bucket_map[AgingBucket.DAYS_91_180.value].total_amount == Decimal("3000.00")
+        assert bucket_map[AgingBucket.DAYS_180_PLUS.value].count == 1
+        assert bucket_map[AgingBucket.DAYS_180_PLUS.value].total_amount == Decimal("4000.00")
+
+    async def test_aging_groups_by_vendor(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_ledger_repo: AsyncMock,
+        mock_vendor_repo: AsyncMock,
+    ):
+        """Should group aging entries by vendor name."""
+        case_id = uuid4()
+        vendor_id = uuid4()
+        today = date.today()
+
+        case = FakeCase(id=case_id, vendor_id=vendor_id, status="open")
+        mock_case_repo.list_cases.return_value = PaginatedResult(
+            items=[case], total=1, page=1, page_size=10000
+        )
+
+        vendor = FakeVendor(id=vendor_id, name="TestVendor")
+        mock_vendor_repo.get_by_id.return_value = vendor
+
+        entries = [
+            FakeLedgerEntry(
+                amount=Decimal("5000.00"),
+                posting_date=today - timedelta(days=20),
+            ),
+        ]
+        mock_ledger_repo.get_unmatched_by_case.return_value = entries
+
+        result = await report_service.generate_aging_analysis(
+            company_code="EMCURE"
+        )
+
+        assert "TestVendor" in result.by_vendor
+        assert len(result.by_vendor["TestVendor"]) == 5  # All 5 buckets
+
+
+# ─── Enhanced Exception Report Tests (Requirement 29.1) ──────────────────────
+
+
+class TestEnhancedExceptionReport:
+    """Tests for exception report with resolution history."""
+
+    async def test_empty_report(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+    ):
+        """Should return empty report when no cases exist."""
+        mock_case_repo.list_cases.return_value = PaginatedResult(
+            items=[], total=0, page=1, page_size=10000
+        )
+
+        result = await report_service.generate_enhanced_exception_report(
+            company_code="EMCURE"
+        )
+
+        assert result.total_exceptions == 0
+        assert result.items == []
+
+    async def test_exception_with_resolution_history(
+        self,
+        report_service: ReportService,
+        mock_case_repo: AsyncMock,
+        mock_exception_repo: AsyncMock,
+    ):
+        """Should include resolution history for resolved exceptions."""
+        case_id = uuid4()
+        now = datetime.now(timezone.utc)
+
+        case = FakeCase(id=case_id)
+        mock_case_repo.list_cases.return_value = PaginatedResult(
+            items=[case], total=1, page=1, page_size=10000
+        )
+
+        exc = FakeException(
+            case_id=case_id,
+            status="resolved",
+            severity="high",
+            category="amount_mismatch",
+            amount=Decimal("10000.00"),
+        )
+        # Add resolution attributes
+        exc.resolved_at = now
+        exc.resolved_by = "finance_user@emcure.com"
+        exc.resolution_notes = "Matched after correction"
+        exc.created_at = now - timedelta(days=5)
+
+        mock_exception_repo.list_by_case.return_value = PaginatedResult(
+            items=[exc], total=1, page=1, page_size=10000
+        )
+
+        result = await report_service.generate_enhanced_exception_report(
+            company_code="EMCURE"
+        )
+
+        assert result.total_exceptions == 1
+        item = result.items[0]
+        assert item.status == "resolved"
+        assert len(item.resolution_history) == 2  # flagged + resolved
+        assert item.resolution_history[0].action == "flagged"
+        assert item.resolution_history[1].action == "resolved"
+        assert item.resolution_history[1].action_by == "finance_user@emcure.com"
+
+
+# ─── Export Tests (Requirements 27.3, 28.3, 29.4) ────────────────────────────
+
+
+class TestExportMethods:
+    """Tests for PDF and Excel export functionality."""
+
+    def test_export_to_excel_produces_bytes(self, report_service: ReportService):
+        """Should produce non-empty bytes for Excel export."""
+        from src.domain.services.vlr.report_service import ReconciliationSummaryReport
+
+        report = ReconciliationSummaryReport(case_id=uuid4())
+        result = report_service.export_to_excel(report, sheet_name="Summary")
+
+        assert isinstance(result, bytes)
+        assert len(result) > 0
+
+    def test_export_to_pdf_produces_bytes(self, report_service: ReportService):
+        """Should produce non-empty bytes for PDF export."""
+        from src.domain.services.vlr.report_service import ReconciliationSummaryReport
+
+        report = ReconciliationSummaryReport(case_id=uuid4())
+        result = report_service.export_to_pdf(report, title="Test Report")
+
+        assert isinstance(result, bytes)
+        assert len(result) > 0
+
+    def test_export_aging_report_to_excel(self, report_service: ReportService):
+        """Should export aging analysis report to Excel."""
+        from src.domain.services.vlr.report_service import (
+            AgingAnalysisReport,
+            AgingBucketSummary,
+        )
+
+        report = AgingAnalysisReport(
+            total_items=5,
+            total_amount=Decimal("50000.00"),
+            bucket_summaries=[
+                AgingBucketSummary(bucket="0-30_days", count=3, total_amount=Decimal("30000")),
+                AgingBucketSummary(bucket="31-60_days", count=2, total_amount=Decimal("20000")),
+            ],
+        )
+        result = report_service.export_to_excel(report, sheet_name="Aging")
+
+        assert isinstance(result, bytes)
+        assert len(result) > 0

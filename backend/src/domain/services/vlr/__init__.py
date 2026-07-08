@@ -1,5 +1,16 @@
 """VLR domain services."""
 
+from src.domain.services.vlr.data_transformation_service import (
+    DataTransformationService,
+    DEFAULT_SPECIAL_CHARACTERS,
+    DerivedInvoice,
+    DocumentCategory,
+    InvoiceSourceField,
+    INVOICE_DOC_TYPES,
+    JOURNAL_DOC_TYPES,
+    PAYMENT_DOC_TYPES,
+    RawSAPEntry,
+)
 from src.domain.services.vlr.automation_rule_service import (
     AutoEscalationConfig,
     AutoEscalationResult,
@@ -54,6 +65,7 @@ from src.domain.services.vlr.file_parser_service import (
     ParsedLedgerEntry,
 )
 from src.domain.services.vlr.reconciliation_engine_service import (
+    CONFIDENCE_SCORES,
     LedgerEntryData,
     MatchGroup,
     MatchPair,
@@ -97,8 +109,30 @@ from src.domain.services.vlr.report_service import (
     VendorStatusEntry,
     VendorStatusReport,
 )
+from src.domain.services.vlr.column_mapping_service import (
+    ColumnMapping,
+    ColumnMappingEntry,
+    ColumnMappingService,
+    ColumnSuggestion,
+    ConfidenceLevel,
+    FilePreview,
+    HeaderLibrary,
+    HeaderLibraryEntry,
+    PREVIEW_ROW_COUNT,
+    TransactionTypeTag,
+)
 
 __all__ = [
+    # Data transformation service
+    "DataTransformationService",
+    "DEFAULT_SPECIAL_CHARACTERS",
+    "DerivedInvoice",
+    "DocumentCategory",
+    "InvoiceSourceField",
+    "INVOICE_DOC_TYPES",
+    "JOURNAL_DOC_TYPES",
+    "PAYMENT_DOC_TYPES",
+    "RawSAPEntry",
     # Automation rule service
     "AutoEscalationConfig",
     "AutoEscalationResult",
@@ -188,4 +222,15 @@ __all__ = [
     "ReportType",
     "VendorStatusEntry",
     "VendorStatusReport",
+    # Column mapping service
+    "ColumnMapping",
+    "ColumnMappingEntry",
+    "ColumnMappingService",
+    "ColumnSuggestion",
+    "ConfidenceLevel",
+    "FilePreview",
+    "HeaderLibrary",
+    "HeaderLibraryEntry",
+    "PREVIEW_ROW_COUNT",
+    "TransactionTypeTag",
 ]

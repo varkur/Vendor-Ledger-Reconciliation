@@ -3,6 +3,7 @@ Reconciliation Case API endpoints.
 Thin controller — delegates business logic to RequestManagerService and related services.
 
 Routes:
+- GET    /api/v1/vlr/cases                      — List all cases with filtering & pagination
 - GET    /api/v1/vlr/cases/{id}                 — Get case detail
 - POST   /api/v1/vlr/cases/{id}/confirm-ledger  — Confirm company ledger
 - POST   /api/v1/vlr/cases/{id}/invite          — Send vendor invitation
@@ -12,7 +13,7 @@ Routes:
 - GET    /api/v1/vlr/cases/{id}/statistics       — Match statistics
 - POST   /api/v1/vlr/cases/direct               — Direct reconciliation (single vendor, dual upload)
 
-Requirements: 3.4, 3.5, 3.6, 3.7, 11.2, 11.6, 18.1, 18.2, 18.3, 18.4, 18.5, 18.6, 18.7, 18.8
+Requirements: 3.4, 3.5, 3.6, 3.7, 11.2, 11.6, 18.1, 18.2, 18.3, 18.4, 18.5, 18.6, 18.7, 18.8, 23.2, 25.3, 25.4
 """
 
 import hashlib
@@ -27,11 +28,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.dependencies import get_current_active_user
 from src.api.v1.schemas.vlr.case_schemas import (
     CaseActionResponse,
+    CaseListResponse,
     CaseStatisticsResponse,
     ReconciliationCaseResponse,
     ReconciliationStatementResponse,
     ReconcileResponse,
 )
+from src.domain.repositories.vlr.case_repository import CaseFilters
+from src.domain.repositories.vlr.vendor_repository import PaginationParams
 from src.api.v1.schemas.vlr.direct_reconciliation_schemas import (
     DirectReconciliationConfig,
     DirectReconciliationResponse,
@@ -97,6 +101,49 @@ def _get_case_repository(
 # ──────────────────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "",
+    response_model=CaseListResponse,
+    summary="List reconciliation cases with filtering and pagination",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def list_cases(
+    company_code: str = Query(..., min_length=1, description="Company code filter"),
+    case_status: str | None = Query(default=None, alias="status", description="Filter by case status"),
+    vendor_id: UUID | None = Query(default=None, description="Filter by vendor ID"),
+    request_id: UUID | None = Query(default=None, description="Filter by request ID"),
+    case_type: str | None = Query(default=None, description="Filter by case type (e.g., 'direct')"),
+    search: str | None = Query(default=None, description="Search by vendor name or case ID"),
+    sort_by: str | None = Query(default=None, description="Sort field"),
+    sort_order: str | None = Query(default="desc", description="Sort order: asc or desc"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    page_size: int = Query(default=10, ge=1, le=200, description="Items per page"),
+    repo: CaseRepositoryImpl = Depends(_get_case_repository),
+) -> CaseListResponse:
+    """GET /api/v1/vlr/cases — List all reconciliation cases with filtering and pagination."""
+    filters = CaseFilters(
+        status=case_status,
+        vendor_id=vendor_id,
+        request_id=request_id,
+        case_type=case_type,
+    )
+    pagination = PaginationParams(page=page, page_size=page_size)
+
+    result = await repo.list_cases(
+        company_code=company_code,
+        filters=filters,
+        pagination=pagination,
+    )
+
+    return CaseListResponse(
+        items=[ReconciliationCaseResponse.model_validate(c) for c in result.items],
+        total=result.total,
+        page=result.page,
+        page_size=result.page_size,
+        total_pages=result.total_pages,
+    )
 
 
 @router.get(

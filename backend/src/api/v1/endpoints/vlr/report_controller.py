@@ -3,13 +3,16 @@ VLR Report API endpoints with export capabilities.
 Thin controller — delegates report generation to ReportService.
 
 Routes:
-- GET  /api/v1/vlr/reports/reconciliation-statement/{case_id}  — Get reconciliation statement
-- GET  /api/v1/vlr/reports/exception-report/{case_id}          — Get exception report
-- GET  /api/v1/vlr/reports/vendor-status/{request_id}          — Get vendor status report
-- GET  /api/v1/vlr/reports/monthly-mis                         — Get monthly MIS report
-- GET  /api/v1/vlr/reports/export/{report_type}/{resource_id}  — Export report to PDF/Excel
+- GET  /api/v1/vlr/reports/reconciliation-summary/{case_id}  — Reconciliation summary (10-row)
+- GET  /api/v1/vlr/reports/reconciliation-statement/{case_id} — Full reconciliation statement
+- GET  /api/v1/vlr/reports/aging-analysis                    — Aging analysis report
+- GET  /api/v1/vlr/reports/exceptions                        — Exception report with history
+- GET  /api/v1/vlr/reports/vendor-status                     — Vendor status tracking
+- GET  /api/v1/vlr/reports/mis                               — Monthly MIS report
+- POST /api/v1/vlr/reports/generate                          — Generate exportable report
+- GET  /api/v1/vlr/reports/export/{report_id}                — Download generated report
 
-Requirements: 9.1-9.6, 9.8, 11.2
+Requirements: 27.1, 27.2, 27.3, 28.1, 28.2, 28.3, 29.1, 29.2, 29.3, 29.4
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import uuid as uuid_module
 from dataclasses import asdict
 from datetime import date, datetime
 from decimal import Decimal
@@ -29,13 +33,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user
 from src.api.v1.schemas.vlr.report_schemas import (
+    AgingAnalysisResponse,
+    EnhancedExceptionReportResponse,
     ExceptionReportResponse,
+    GenerateReportRequest,
+    GenerateReportResponse,
     MonthlyMISReportResponse,
     ReconciliationStatementResponse,
+    ReconciliationSummaryResponse,
     VendorStatusReportResponse,
 )
 from src.domain.entities.user import User
-from src.domain.services.vlr.report_service import ReportService
+from src.domain.services.vlr.report_service import (
+    AgingFilters,
+    ReportService,
+)
 from src.infrastructure.database.repositories.vlr.case_repository_impl import (
     CaseRepositoryImpl,
 )
@@ -72,6 +84,15 @@ class ExportFormat(str, Enum):
 
     PDF = "pdf"
     EXCEL = "excel"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# In-Memory Report Store (for generate/download pattern)
+# ──────────────────────────────────────────────────────────────────────
+
+# Simple in-memory store for generated reports. In production, this would
+# use a persistent store (S3, database blob, etc.)
+_generated_reports: dict[str, dict] = {}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -114,168 +135,438 @@ class _DecimalEncoder(json.JSONEncoder):
 def _dataclass_to_dict(obj) -> dict:
     """Convert a dataclass to a serializable dictionary."""
     raw = asdict(obj)
-    # Convert Decimal/UUID/date/datetime to JSON-safe values
     return json.loads(json.dumps(raw, cls=_DecimalEncoder))
 
 
-def _generate_excel_bytes(report_data: dict, sheet_name: str = "Report") -> bytes:
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints: Reconciliation Summary (Requirement 27.1)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/reconciliation-summary/{case_id}",
+    response_model=ReconciliationSummaryResponse,
+    summary="Generate reconciliation summary (10-row format) for a case",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_reconciliation_summary(
+    case_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> ReconciliationSummaryResponse:
     """
-    Generate an Excel file from report data.
+    GET /api/v1/vlr/reports/reconciliation-summary/{case_id}
 
-    Uses CSV format as a fallback if openpyxl is not available.
-    Requirement 9.5: Export to Excel format.
+    Generates the 10-row reconciliation summary report.
+    Requirements: 27.1, 27.2
     """
-    try:
-        from openpyxl import Workbook
+    report = await service.generate_reconciliation_summary(case_id)
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = sheet_name
-
-        # Write summary fields as header rows
-        row_num = 1
-        for key, value in report_data.items():
-            if isinstance(value, (list, dict)):
-                continue
-            ws.cell(row=row_num, column=1, value=str(key))
-            ws.cell(row=row_num, column=2, value=str(value) if value is not None else "")
-            row_num += 1
-
-        # Write list data (entries) as table
-        list_fields = {k: v for k, v in report_data.items() if isinstance(v, list) and v}
-        for field_name, items in list_fields.items():
-            row_num += 1
-            ws.cell(row=row_num, column=1, value=f"--- {field_name} ---")
-            row_num += 1
-
-            if items and isinstance(items[0], dict):
-                # Write headers
-                headers = list(items[0].keys())
-                for col_num, header in enumerate(headers, 1):
-                    ws.cell(row=row_num, column=col_num, value=header)
-                row_num += 1
-
-                # Write data rows
-                for item in items:
-                    for col_num, header in enumerate(headers, 1):
-                        val = item.get(header, "")
-                        ws.cell(row=row_num, column=col_num, value=str(val) if val is not None else "")
-                    row_num += 1
-
-        buffer = io.BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
-        return buffer.getvalue()
-
-    except ImportError:
-        # Fallback: generate CSV if openpyxl not available
-        import csv
-
-        buffer = io.StringIO()
-        writer = csv.writer(buffer)
-
-        for key, value in report_data.items():
-            if isinstance(value, (list, dict)):
-                continue
-            writer.writerow([key, str(value) if value is not None else ""])
-
-        list_fields = {k: v for k, v in report_data.items() if isinstance(v, list) and v}
-        for field_name, items in list_fields.items():
-            writer.writerow([])
-            writer.writerow([f"--- {field_name} ---"])
-            if items and isinstance(items[0], dict):
-                headers = list(items[0].keys())
-                writer.writerow(headers)
-                for item in items:
-                    writer.writerow([str(item.get(h, "")) for h in headers])
-
-        return buffer.getvalue().encode("utf-8")
-
-
-def _generate_pdf_bytes(report_data: dict, title: str = "VLR Report") -> bytes:
-    """
-    Generate a PDF file from report data.
-
-    Uses a simple text-based PDF if reportlab is not available.
-    Requirement 9.6: Export to PDF format.
-    """
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib import colors
-
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4)
-        styles = getSampleStyleSheet()
-        elements = []
-
-        # Title
-        elements.append(Paragraph(title, styles["Title"]))
-        elements.append(Spacer(1, 12))
-
-        # Summary fields
-        for key, value in report_data.items():
-            if isinstance(value, (list, dict)):
-                continue
-            elements.append(
-                Paragraph(f"<b>{key}:</b> {value}", styles["Normal"])
-            )
-
-        elements.append(Spacer(1, 12))
-
-        # Table data for lists
-        list_fields = {k: v for k, v in report_data.items() if isinstance(v, list) and v}
-        for field_name, items in list_fields.items():
-            elements.append(Paragraph(f"<b>{field_name}</b>", styles["Heading2"]))
-            elements.append(Spacer(1, 6))
-
-            if items and isinstance(items[0], dict):
-                headers = list(items[0].keys())
-                table_data = [headers]
-                for item in items[:100]:  # Limit rows for PDF
-                    table_data.append(
-                        [str(item.get(h, ""))[:50] for h in headers]
-                    )
-
-                table = Table(table_data)
-                table.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ]))
-                elements.append(table)
-                elements.append(Spacer(1, 12))
-
-        doc.build(elements)
-        buffer.seek(0)
-        return buffer.getvalue()
-
-    except ImportError:
-        # Fallback: generate a plain text representation as "PDF"
-        lines = [f"=== {title} ===", ""]
-        for key, value in report_data.items():
-            if isinstance(value, (list, dict)):
-                continue
-            lines.append(f"{key}: {value}")
-
-        lines.append("")
-        list_fields = {k: v for k, v in report_data.items() if isinstance(v, list) and v}
-        for field_name, items in list_fields.items():
-            lines.append(f"--- {field_name} ---")
-            if items and isinstance(items[0], dict):
-                headers = list(items[0].keys())
-                lines.append("\t".join(headers))
-                for item in items:
-                    lines.append("\t".join(str(item.get(h, "")) for h in headers))
-            lines.append("")
-
-        return "\n".join(lines).encode("utf-8")
+    return ReconciliationSummaryResponse(
+        case_id=report.case_id,
+        generated_at=report.generated_at,
+        rows=[
+            {"row_number": r.row_number, "description": r.description, "amount": r.amount}
+            for r in report.rows
+        ],
+        company_closing_balance=report.company_closing_balance,
+        vendor_closing_balance=report.vendor_closing_balance,
+        net_difference=report.net_difference,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Endpoints
+# Endpoints: Aging Analysis (Requirements 28.1, 28.2)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/aging-analysis",
+    response_model=AgingAnalysisResponse,
+    summary="Generate aging analysis report",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_aging_analysis(
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    vendor_id: UUID | None = Query(None, description="Filter by vendor ID"),
+    report_status: str | None = Query(None, alias="status", description="Filter by case status"),
+    as_of_date: date | None = Query(None, description="Reference date (defaults to today)"),
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> AgingAnalysisResponse:
+    """
+    GET /api/v1/vlr/reports/aging-analysis
+
+    Generates aging analysis report with grouping by vendor, bucket, status.
+    Buckets: 0-30 days, 31-60 days, 61-90 days, 91-180 days, 180+ days.
+
+    Requirements: 28.1, 28.2
+    """
+    filters = AgingFilters(
+        vendor_id=vendor_id,
+        company_code=company_code,
+        status=report_status,
+        as_of_date=as_of_date,
+    )
+    report = await service.generate_aging_analysis(
+        company_code=company_code, filters=filters
+    )
+
+    return AgingAnalysisResponse(
+        generated_at=report.generated_at,
+        as_of_date=report.as_of_date,
+        total_items=report.total_items,
+        total_amount=report.total_amount,
+        bucket_summaries=[
+            {"bucket": s.bucket, "count": s.count, "total_amount": s.total_amount}
+            for s in report.bucket_summaries
+        ],
+        by_vendor={
+            k: [{"bucket": s.bucket, "count": s.count, "total_amount": s.total_amount} for s in v]
+            for k, v in report.by_vendor.items()
+        },
+        by_status={
+            k: [{"bucket": s.bucket, "count": s.count, "total_amount": s.total_amount} for s in v]
+            for k, v in report.by_status.items()
+        },
+        items=[
+            {
+                "entry_id": i.entry_id,
+                "case_id": i.case_id,
+                "vendor_id": i.vendor_id,
+                "vendor_name": i.vendor_name,
+                "amount": i.amount,
+                "posting_date": i.posting_date,
+                "reference_number": i.reference_number,
+                "status": i.status,
+                "age_days": i.age_days,
+                "aging_bucket": i.aging_bucket,
+            }
+            for i in report.items
+        ],
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints: Exception Report with History (Requirement 29.1)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/exceptions",
+    response_model=EnhancedExceptionReportResponse,
+    summary="Generate exception report with resolution history",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_exception_report(
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    case_id: UUID | None = Query(None, description="Filter by case ID"),
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> EnhancedExceptionReportResponse:
+    """
+    GET /api/v1/vlr/reports/exceptions
+
+    Generates exception report listing all unmatched and disputed items
+    with their resolution history.
+
+    Requirement 29.1
+    """
+    report = await service.generate_enhanced_exception_report(
+        company_code=company_code,
+        case_id=case_id,
+    )
+
+    return EnhancedExceptionReportResponse(
+        generated_at=report.generated_at,
+        total_exceptions=report.total_exceptions,
+        exceptions_by_status=report.exceptions_by_status,
+        exceptions_by_category=report.exceptions_by_category,
+        items=[
+            {
+                "exception_id": i.exception_id,
+                "case_id": i.case_id,
+                "amount": i.amount,
+                "severity": i.severity,
+                "category": i.category,
+                "status": i.status,
+                "first_flagged_date": i.first_flagged_date,
+                "resolution_history": [
+                    {
+                        "action": h.action,
+                        "action_by": h.action_by,
+                        "action_date": h.action_date,
+                        "notes": h.notes,
+                    }
+                    for h in i.resolution_history
+                ],
+            }
+            for i in report.items
+        ],
+        total_amount=report.total_amount,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints: Vendor Status (Requirement 29.2)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/vendor-status",
+    response_model=VendorStatusReportResponse,
+    summary="Generate vendor status tracking report",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_vendor_status(
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> VendorStatusReportResponse:
+    """
+    GET /api/v1/vlr/reports/vendor-status
+
+    Generates vendor status tracking report showing each vendor's
+    reconciliation progress.
+
+    Requirement 29.2
+    """
+    report = await service.generate_vendor_status_tracking(
+        company_code=company_code,
+    )
+
+    return VendorStatusReportResponse(
+        request_id=report.request_id,
+        generated_at=report.generated_at,
+        total_vendors=report.total_vendors,
+        responded_count=report.responded_count,
+        response_rate=report.response_rate,
+        uploaded_count=report.uploaded_count,
+        upload_rate=report.upload_rate,
+        signed_off_count=report.signed_off_count,
+        sign_off_rate=report.sign_off_rate,
+        vendor_entries=[
+            {
+                "vendor_id": e.vendor_id,
+                "vendor_name": e.vendor_name,
+                "case_id": e.case_id,
+                "case_status": e.case_status,
+                "upload_count": e.upload_count,
+                "has_responded": e.has_responded,
+                "sign_off_status": e.sign_off_status,
+                "last_activity_date": e.last_activity_date,
+            }
+            for e in report.vendor_entries
+        ],
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints: Monthly MIS (Requirement 29.3)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/mis",
+    response_model=MonthlyMISReportResponse,
+    summary="Generate monthly MIS report",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_mis_report(
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    period_start: date | None = Query(None, description="Period start (defaults to 1st of current month)"),
+    period_end: date | None = Query(None, description="Period end (defaults to today)"),
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> MonthlyMISReportResponse:
+    """
+    GET /api/v1/vlr/reports/mis
+
+    Generates monthly MIS report summarizing reconciliation activity.
+
+    Requirement 29.3
+    """
+    if period_start and period_end and period_start > period_end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="period_start must be before or equal to period_end",
+        )
+
+    report = await service.generate_mis_report(
+        company_code=company_code,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+    return MonthlyMISReportResponse(
+        company_code=report.company_code,
+        period_start=report.period_start,
+        period_end=report.period_end,
+        generated_at=report.generated_at,
+        total_requests=report.total_requests,
+        total_cases=report.total_cases,
+        total_entries_processed=report.total_entries_processed,
+        total_matched=report.total_matched,
+        total_unmatched=report.total_unmatched,
+        overall_match_rate=report.overall_match_rate,
+        match_rate_by_pass=report.match_rate_by_pass,
+        total_exceptions=report.total_exceptions,
+        exceptions_resolved=report.exceptions_resolved,
+        exceptions_open=report.exceptions_open,
+        resolution_rate=report.resolution_rate,
+        exception_trends=report.exception_trends,
+        ageing_analysis=report.ageing_analysis,
+        ageing_amounts=report.ageing_amounts,
+        average_resolution_days=report.average_resolution_days,
+        cases_by_status=report.cases_by_status,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Endpoints: Report Generation & Export (Requirements 27.3, 28.3, 29.4)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/generate",
+    response_model=GenerateReportResponse,
+    summary="Trigger report generation for export",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def generate_report(
+    request: GenerateReportRequest,
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> GenerateReportResponse:
+    """
+    POST /api/v1/vlr/reports/generate
+
+    Triggers generation of an exportable report. Returns a report_id
+    that can be used to download the generated file.
+
+    Requirements: 27.3, 28.3, 29.4
+    """
+    report_id = str(uuid_module.uuid4())
+    export_format = request.format or "excel"
+    company_code = request.company_code or "default"
+
+    # Generate the appropriate report
+    report_obj: object
+    title: str
+
+    if request.report_type == "reconciliation_summary":
+        if not request.case_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="case_id is required for reconciliation_summary report",
+            )
+        report_obj = await service.generate_reconciliation_summary(request.case_id)
+        title = "Reconciliation Summary"
+
+    elif request.report_type == "aging_analysis":
+        filters = AgingFilters(company_code=company_code)
+        report_obj = await service.generate_aging_analysis(
+            company_code=company_code, filters=filters
+        )
+        title = "Aging Analysis"
+
+    elif request.report_type == "exception_report":
+        report_obj = await service.generate_enhanced_exception_report(
+            company_code=company_code, case_id=request.case_id
+        )
+        title = "Exception Report"
+
+    elif request.report_type == "vendor_status":
+        report_obj = await service.generate_vendor_status_tracking(
+            company_code=company_code
+        )
+        title = "Vendor Status"
+
+    elif request.report_type == "monthly_mis":
+        report_obj = await service.generate_mis_report(
+            company_code=company_code,
+            period_start=request.period_start,
+            period_end=request.period_end,
+        )
+        title = "Monthly MIS Report"
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown report_type: {request.report_type}. "
+                   f"Valid types: reconciliation_summary, aging_analysis, "
+                   f"exception_report, vendor_status, monthly_mis",
+        )
+
+    # Export to the requested format
+    if export_format == "pdf":
+        content = service.export_to_pdf(report_obj, title=title)
+        extension = "pdf"
+        media_type = "application/pdf"
+    else:
+        content = service.export_to_excel(report_obj, sheet_name=title)
+        extension = "xlsx"
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    filename = f"{request.report_type}_{report_id}.{extension}"
+
+    # Store generated report for download
+    _generated_reports[report_id] = {
+        "content": content,
+        "filename": filename,
+        "media_type": media_type,
+        "report_type": request.report_type,
+        "format": export_format,
+    }
+
+    return GenerateReportResponse(
+        report_id=report_id,
+        report_type=request.report_type,
+        format=export_format,
+        status="generated",
+        download_url=f"/api/v1/vlr/reports/export/{report_id}",
+    )
+
+
+@router.get(
+    "/export/{report_id}",
+    summary="Download a previously generated report",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def download_report(
+    report_id: str,
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """
+    GET /api/v1/vlr/reports/export/{report_id}
+
+    Downloads a previously generated report (PDF or Excel).
+
+    Requirements: 27.3, 28.3, 29.4
+    """
+    stored = _generated_reports.get(report_id)
+    if not stored:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Report {report_id} not found. It may have expired or not been generated.",
+        )
+
+    content = stored["content"]
+    filename = stored["filename"]
+    media_type = stored["media_type"]
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(content)),
+        },
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Legacy Endpoints (kept for backward compatibility)
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -296,8 +587,7 @@ async def get_reconciliation_statement(
     Generates a complete reconciliation statement including entries,
     matches, exceptions summary, and Row_10 balance.
 
-    Requirement 9.1: Statement with entries, matches, exceptions, Row_10.
-    Requirement 9.9: Include pass-level match statistics.
+    Requirement 9.1
     """
     report = await service.generate_reconciliation_statement(case_id)
 
@@ -348,10 +638,10 @@ async def get_reconciliation_statement(
 @router.get(
     "/exception-report/{case_id}",
     response_model=ExceptionReportResponse,
-    summary="Generate exception report for a case",
+    summary="Generate exception report for a case (legacy)",
     dependencies=[Depends(require_permission("vlr.reports.read"))],
 )
-async def get_exception_report(
+async def get_legacy_exception_report(
     case_id: UUID,
     current_user: User = Depends(get_current_active_user),
     service: ReportService = Depends(_get_report_service),
@@ -359,10 +649,8 @@ async def get_exception_report(
     """
     GET /api/v1/vlr/reports/exception-report/{case_id}
 
-    Generates an exception report with ageing analysis, category breakdown,
-    and resolution status.
-
-    Requirement 9.2: Ageing analysis, category breakdown, resolution status.
+    Legacy endpoint - generates exception report with ageing.
+    Requirement 9.2
     """
     report = await service.generate_exception_report(case_id)
 
@@ -397,10 +685,10 @@ async def get_exception_report(
 @router.get(
     "/vendor-status/{request_id}",
     response_model=VendorStatusReportResponse,
-    summary="Generate vendor status tracking report",
+    summary="Generate vendor status report by request (legacy)",
     dependencies=[Depends(require_permission("vlr.reports.read"))],
 )
-async def get_vendor_status_report(
+async def get_vendor_status_by_request(
     request_id: UUID,
     company_code: str = Query(..., min_length=1, description="Company code"),
     current_user: User = Depends(get_current_active_user),
@@ -409,10 +697,8 @@ async def get_vendor_status_report(
     """
     GET /api/v1/vlr/reports/vendor-status/{request_id}
 
-    Generates vendor status tracking report with response rates,
-    upload status, and sign-off progress.
-
-    Requirement 9.3: Response rates, upload status, sign-off tracking.
+    Legacy endpoint - vendor status by request.
+    Requirement 9.3
     """
     report = await service.generate_vendor_status_report(
         request_id=request_id,
@@ -448,7 +734,7 @@ async def get_vendor_status_report(
 @router.get(
     "/monthly-mis",
     response_model=MonthlyMISReportResponse,
-    summary="Generate monthly MIS report",
+    summary="Generate monthly MIS report (legacy)",
     dependencies=[Depends(require_permission("vlr.reports.read"))],
 )
 async def get_monthly_mis_report(
@@ -461,11 +747,8 @@ async def get_monthly_mis_report(
     """
     GET /api/v1/vlr/reports/monthly-mis
 
-    Generates monthly MIS report with volumes, match rates,
-    exception trends, and ageing analysis.
-
-    Requirement 9.4: Monthly MIS with volumes, match rates,
-                     exception trends, ageing analysis.
+    Legacy endpoint - monthly MIS report with required date parameters.
+    Requirement 9.4
     """
     if period_start > period_end:
         raise HTTPException(
@@ -500,173 +783,4 @@ async def get_monthly_mis_report(
         ageing_amounts=report.ageing_amounts,
         average_resolution_days=report.average_resolution_days,
         cases_by_status=report.cases_by_status,
-    )
-
-
-@router.get(
-    "/export/reconciliation-statement/{case_id}",
-    summary="Export reconciliation statement to PDF or Excel",
-    dependencies=[Depends(require_permission("vlr.reports.read"))],
-)
-async def export_reconciliation_statement(
-    case_id: UUID,
-    format: ExportFormat = Query(ExportFormat.EXCEL, description="Export format: pdf or excel"),
-    current_user: User = Depends(get_current_active_user),
-    service: ReportService = Depends(_get_report_service),
-) -> StreamingResponse:
-    """
-    GET /api/v1/vlr/reports/export/reconciliation-statement/{case_id}
-
-    Exports reconciliation statement in the requested format.
-
-    Requirement 9.5: Export to Excel.
-    Requirement 9.6: Export to PDF.
-    """
-    report = await service.generate_reconciliation_statement(case_id)
-    report_data = _dataclass_to_dict(report)
-
-    return _build_export_response(
-        report_data=report_data,
-        format=format,
-        filename_base=f"reconciliation_statement_{case_id}",
-        title="Reconciliation Statement",
-    )
-
-
-@router.get(
-    "/export/exception-report/{case_id}",
-    summary="Export exception report to PDF or Excel",
-    dependencies=[Depends(require_permission("vlr.reports.read"))],
-)
-async def export_exception_report(
-    case_id: UUID,
-    format: ExportFormat = Query(ExportFormat.EXCEL, description="Export format: pdf or excel"),
-    current_user: User = Depends(get_current_active_user),
-    service: ReportService = Depends(_get_report_service),
-) -> StreamingResponse:
-    """
-    GET /api/v1/vlr/reports/export/exception-report/{case_id}
-
-    Exports exception report in the requested format.
-
-    Requirement 9.5: Export to Excel.
-    Requirement 9.6: Export to PDF.
-    """
-    report = await service.generate_exception_report(case_id)
-    report_data = _dataclass_to_dict(report)
-
-    return _build_export_response(
-        report_data=report_data,
-        format=format,
-        filename_base=f"exception_report_{case_id}",
-        title="Exception Report",
-    )
-
-
-@router.get(
-    "/export/vendor-status/{request_id}",
-    summary="Export vendor status report to PDF or Excel",
-    dependencies=[Depends(require_permission("vlr.reports.read"))],
-)
-async def export_vendor_status_report(
-    request_id: UUID,
-    company_code: str = Query(..., min_length=1, description="Company code"),
-    format: ExportFormat = Query(ExportFormat.EXCEL, description="Export format: pdf or excel"),
-    current_user: User = Depends(get_current_active_user),
-    service: ReportService = Depends(_get_report_service),
-) -> StreamingResponse:
-    """
-    GET /api/v1/vlr/reports/export/vendor-status/{request_id}
-
-    Exports vendor status report in the requested format.
-
-    Requirement 9.5: Export to Excel.
-    Requirement 9.6: Export to PDF.
-    """
-    report = await service.generate_vendor_status_report(
-        request_id=request_id,
-        company_code=company_code,
-    )
-    report_data = _dataclass_to_dict(report)
-
-    return _build_export_response(
-        report_data=report_data,
-        format=format,
-        filename_base=f"vendor_status_{request_id}",
-        title="Vendor Status Report",
-    )
-
-
-@router.get(
-    "/export/monthly-mis",
-    summary="Export monthly MIS report to PDF or Excel",
-    dependencies=[Depends(require_permission("vlr.reports.read"))],
-)
-async def export_monthly_mis_report(
-    company_code: str = Query(..., min_length=1, description="Company code"),
-    period_start: date = Query(..., description="Period start date (YYYY-MM-DD)"),
-    period_end: date = Query(..., description="Period end date (YYYY-MM-DD)"),
-    format: ExportFormat = Query(ExportFormat.EXCEL, description="Export format: pdf or excel"),
-    current_user: User = Depends(get_current_active_user),
-    service: ReportService = Depends(_get_report_service),
-) -> StreamingResponse:
-    """
-    GET /api/v1/vlr/reports/export/monthly-mis
-
-    Exports monthly MIS report in the requested format.
-
-    Requirement 9.5: Export to Excel.
-    Requirement 9.6: Export to PDF.
-    """
-    if period_start > period_end:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="period_start must be before or equal to period_end",
-        )
-
-    report = await service.generate_monthly_mis_report(
-        company_code=company_code,
-        period_start=period_start,
-        period_end=period_end,
-    )
-    report_data = _dataclass_to_dict(report)
-
-    return _build_export_response(
-        report_data=report_data,
-        format=format,
-        filename_base=f"monthly_mis_{company_code}_{period_start}_{period_end}",
-        title="Monthly MIS Report",
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Export Helper
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _build_export_response(
-    report_data: dict,
-    format: ExportFormat,
-    filename_base: str,
-    title: str,
-) -> StreamingResponse:
-    """Build a StreamingResponse with the exported file."""
-    if format == ExportFormat.EXCEL:
-        content = _generate_excel_bytes(report_data, sheet_name=title)
-        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        extension = "xlsx"
-    else:
-        content = _generate_pdf_bytes(report_data, title=title)
-        media_type = "application/pdf"
-        extension = "pdf"
-
-    filename = f"{filename_base}.{extension}"
-
-    return StreamingResponse(
-        io.BytesIO(content),
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(content)),
-        },
     )
