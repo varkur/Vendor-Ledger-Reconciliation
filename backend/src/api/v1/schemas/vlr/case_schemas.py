@@ -86,3 +86,31 @@ class CaseListResponse(BaseModel):
     page: int = Field(default=1, description="Current page number")
     page_size: int = Field(default=10, description="Items per page")
     total_pages: int = Field(default=0, description="Total pages available")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Bulk Action Schemas
+# ──────────────────────────────────────────────────────────────────────
+
+
+class BulkActionRequest(BaseModel):
+    """Request schema for bulk case actions."""
+
+    case_ids: list[str] = Field(
+        ..., min_length=1, description="List of case IDs to perform the action on"
+    )
+    company_code: str = Field(..., min_length=1, description="Company code for entity scoping")
+
+
+class BulkActionResultItem(BaseModel):
+    """Result for a single case in a bulk action."""
+
+    case_id: str
+    success: bool
+    message: str | None = None
+
+
+class BulkActionResponse(BaseModel):
+    """Response schema for bulk case actions."""
+
+    results: list[BulkActionResultItem]

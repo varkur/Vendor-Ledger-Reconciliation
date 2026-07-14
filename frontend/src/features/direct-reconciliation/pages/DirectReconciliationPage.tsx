@@ -7,37 +7,74 @@
  *
  * Implements loading, error (with retry), and empty states using PrimeReact components.
  *
- * Requirements: 23.1, 25.1, 25.2
+ * Requirements: 12, 13, 23.1, 25.1, 25.2
  */
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from 'primereact/button';
+import { Calendar } from 'primereact/calendar';
 import { Column } from 'primereact/column';
 import { DataTable } from 'primereact/datatable';
 import { Dialog } from 'primereact/dialog';
+import { Dropdown } from 'primereact/dropdown';
+import { FileUpload, type FileUploadSelectEvent } from 'primereact/fileupload';
 import { InputText } from 'primereact/inputtext';
 import { Message } from 'primereact/message';
 import { Paginator, type PaginatorPageChangeEvent } from 'primereact/paginator';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Skeleton } from 'primereact/skeleton';
+import { useForm, Controller } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
 
 import {
   useReconciliationRequests,
   useCreateReconciliationRequest,
 } from '../hooks/useDirectReconciliation';
 import type { ReconciliationRequestResponse } from '../api/directReconciliationApi';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
+import { useVendors } from '@features/vendor-management/hooks/useVendors';
+import { StatusBadge } from '@shared/components/StatusBadge';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_COMPANY_CODE = '1000';
 const DEFAULT_PAGE_SIZE = 10;
 const PAGE_SIZE_OPTIONS = [10, 25, 50];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Quick Create Form Schema
+// ─────────────────────────────────────────────────────────────────────────────
+
+const quickCreateSchema = z.object({
+  fiscal_year: z.string().min(1, 'Fiscal Year is required'),
+  period_start: z.date({ required_error: 'Period From is required' }),
+  period_end: z.date({ required_error: 'Period To is required' }),
+  vendor_id: z.string().min(1, 'Vendor is required'),
+});
+
+type QuickCreateFormData = z.infer<typeof quickCreateSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Generate fiscal year options based on current date. */
+function generateFiscalYearOptions(): { label: string; value: string }[] {
+  const currentYear = new Date().getFullYear();
+  const currentMonth = new Date().getMonth(); // 0-indexed
+  // Indian fiscal year: April to March
+  // If we're in Jan-Mar, the current FY started last year
+  const startYear = currentMonth >= 3 ? currentYear : currentYear - 1;
+
+  return [
+    { label: `${startYear - 1}-${String(startYear).slice(2)}`, value: `${startYear - 1}-${String(startYear).slice(2)}` },
+    { label: `${startYear}-${String(startYear + 1).slice(2)}`, value: `${startYear}-${String(startYear + 1).slice(2)}` },
+    { label: `${startYear + 1}-${String(startYear + 2).slice(2)}`, value: `${startYear + 1}-${String(startYear + 2).slice(2)}` },
+  ];
+}
 
 /** Format an ISO date string to a readable format (DD-MMM-YY). */
 function formatDate(isoDate: string | null): string {
@@ -54,13 +91,9 @@ function formatDate(isoDate: string | null): string {
   }
 }
 
-/** Get CSS class for status badge styling. */
-function getStatusClass(status: string): string {
-  const normalized = status.toLowerCase();
-  if (normalized.includes('completed') || normalized.includes('closed')) return 'completed';
-  if (normalized.includes('open') || normalized.includes('active')) return 'open';
-  if (normalized.includes('error') || normalized.includes('failed')) return 'error';
-  return 'pending';
+/** Format a Date object to ISO date string (YYYY-MM-DD). */
+function toISODateString(date: Date): string {
+  return date.toISOString().split('T')[0] ?? '';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,12 +101,17 @@ function getStatusClass(status: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const DirectReconciliationPage = () => {
+  const { companyCode } = useSelectedEntity();
+  const navigate = useNavigate();
+
   // ─── State ───────────────────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState('');
   const [activeSearch, setActiveSearch] = useState('');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [showNewDialog, setShowNewDialog] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const fileUploadRef = useRef<FileUpload>(null);
 
   // ─── API Hooks ───────────────────────────────────────────────────────────────
   const {
@@ -83,12 +121,52 @@ export const DirectReconciliationPage = () => {
     error,
     refetch,
   } = useReconciliationRequests({
-    company_code: DEFAULT_COMPANY_CODE,
+    company_code: companyCode,
     page,
     page_size: pageSize,
   });
 
   const createMutation = useCreateReconciliationRequest();
+
+  // Fetch vendors for the dropdown
+  const {
+    data: vendorsData,
+    isLoading: vendorsLoading,
+  } = useVendors(companyCode, { status: 'Active' }, 1, 100);
+
+  // ─── Form Setup ──────────────────────────────────────────────────────────────
+  const fiscalYearOptions = useMemo(() => generateFiscalYearOptions(), []);
+
+  const vendorOptions = useMemo(() => {
+    if (!vendorsData?.items) return [];
+    return vendorsData.items.map((v) => ({
+      label: `${v.vendor_code} - ${v.name}`,
+      value: v.id,
+    }));
+  }, [vendorsData]);
+
+  const {
+    control,
+    handleSubmit,
+    reset,
+    formState: { errors },
+  } = useForm<QuickCreateFormData>({
+    resolver: zodResolver(quickCreateSchema),
+    defaultValues: {
+      fiscal_year: '',
+      period_start: undefined,
+      period_end: undefined,
+      vendor_id: '',
+    },
+  });
+
+  // Reset form when dialog closes
+  useEffect(() => {
+    if (!showNewDialog) {
+      reset();
+      setSelectedFile(null);
+    }
+  }, [showNewDialog, reset]);
 
   // ─── Derived ─────────────────────────────────────────────────────────────────
   const requests = data?.items ?? [];
@@ -130,30 +208,41 @@ export const DirectReconciliationPage = () => {
     setShowNewDialog(true);
   }, []);
 
-  const handleCreateSubmit = useCallback(() => {
-    // Create a minimal request — in a full implementation this would be a form
-    createMutation.mutate(
-      {
-        company_code: DEFAULT_COMPANY_CODE,
-        fiscal_year: '2024-25',
-        period_start: '2024-04-01',
-        period_end: '2025-03-31',
-        vendor_ids: [],
-      },
-      {
-        onSuccess: () => {
-          setShowNewDialog(false);
+  const onFormSubmit = useCallback(
+    (data: QuickCreateFormData) => {
+      createMutation.mutate(
+        {
+          company_code: companyCode,
+          fiscal_year: data.fiscal_year,
+          period_start: toISODateString(data.period_start),
+          period_end: toISODateString(data.period_end),
+          vendor_ids: [data.vendor_id],
         },
-      }
-    );
-  }, [createMutation]);
+        {
+          onSuccess: () => {
+            setShowNewDialog(false);
+          },
+        }
+      );
+    },
+    [createMutation, companyCode]
+  );
+
+  const handleFileSelect = useCallback((e: FileUploadSelectEvent) => {
+    if (e.files && e.files.length > 0) {
+      const file = e.files[0];
+      if (file) setSelectedFile(file as unknown as File);
+    }
+  }, []);
+
+  const handleFileClear = useCallback(() => {
+    setSelectedFile(null);
+  }, []);
 
   // ─── Column Templates ───────────────────────────────────────────────────────
 
   const statusTemplate = (rowData: ReconciliationRequestResponse) => (
-    <span className={`status-badge ${getStatusClass(rowData.status)}`}>
-      {rowData.status}
-    </span>
+    <StatusBadge status={rowData.status} />
   );
 
   const periodTemplate = (rowData: ReconciliationRequestResponse) => (
@@ -166,8 +255,19 @@ export const DirectReconciliationPage = () => {
     <span>{formatDate(rowData.created_date)}</span>
   );
 
-  const actionTemplate = () => (
-    <span className="link-view" style={{ cursor: 'pointer' }}>
+  const actionTemplate = (rowData: ReconciliationRequestResponse) => (
+    <span
+      className="link-view"
+      style={{ cursor: 'pointer' }}
+      onClick={() => navigate(`/track-reconciliation/${rowData.id}`)}
+      role="link"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          navigate(`/track-reconciliation/${rowData.id}`);
+        }
+      }}
+    >
       View
     </span>
   );
@@ -372,46 +472,164 @@ export const DirectReconciliationPage = () => {
   function renderNewReconciliationDialog() {
     return (
       <Dialog
-        header="New Reconciliation"
+        header="Quick Create — New Reconciliation"
         visible={showNewDialog}
         onHide={() => setShowNewDialog(false)}
-        style={{ width: '450px' }}
+        style={{ width: '550px' }}
         modal
         aria-label="Create new reconciliation dialog"
       >
-        <div className="flex flex-column gap-3">
-          <p className="text-color-secondary m-0">
-            Create a new direct reconciliation case. This will initiate the
-            reconciliation workflow for the selected vendors and period.
-          </p>
+        <form onSubmit={handleSubmit(onFormSubmit)} className="p-fluid">
+          <div className="flex flex-column gap-3">
+            <p className="text-color-secondary m-0">
+              Create a new direct reconciliation case. Fill in the required fields
+              below to initiate the reconciliation workflow.
+            </p>
 
-          {createMutation.isError && (
-            <Message
-              severity="error"
-              text={
-                createMutation.error?.message ??
-                'Failed to create reconciliation. Please try again.'
-              }
-              className="w-full"
-            />
-          )}
+            {createMutation.isError && (
+              <Message
+                severity="error"
+                text={
+                  createMutation.error?.message ??
+                  'Failed to create reconciliation. Please try again.'
+                }
+                className="w-full"
+              />
+            )}
 
-          <div className="flex justify-content-end gap-2 mt-3">
-            <Button
-              label="Cancel"
-              severity="secondary"
-              onClick={() => setShowNewDialog(false)}
-              disabled={createMutation.isPending}
-            />
-            <Button
-              label="Create"
-              icon="pi pi-check"
-              onClick={handleCreateSubmit}
-              loading={createMutation.isPending}
-              disabled={createMutation.isPending}
-            />
+            {/* Fiscal Year */}
+            <div className="field">
+              <label htmlFor="fiscal_year">Fiscal Year *</label>
+              <Controller
+                name="fiscal_year"
+                control={control}
+                render={({ field }) => (
+                  <Dropdown
+                    id="fiscal_year"
+                    {...field}
+                    options={fiscalYearOptions}
+                    placeholder="Select Fiscal Year"
+                    className={errors.fiscal_year ? 'p-invalid' : ''}
+                  />
+                )}
+              />
+              {errors.fiscal_year && (
+                <small className="p-error">{errors.fiscal_year.message}</small>
+              )}
+            </div>
+
+            {/* Period From and To */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div className="field">
+                <label htmlFor="period_start">Period From *</label>
+                <Controller
+                  name="period_start"
+                  control={control}
+                  render={({ field }) => (
+                    <Calendar
+                      id="period_start"
+                      value={field.value}
+                      onChange={(e) => field.onChange(e.value)}
+                      dateFormat="dd-M-yy"
+                      placeholder="Select start date"
+                      showIcon
+                      className={errors.period_start ? 'p-invalid' : ''}
+                    />
+                  )}
+                />
+                {errors.period_start && (
+                  <small className="p-error">{errors.period_start.message}</small>
+                )}
+              </div>
+
+              <div className="field">
+                <label htmlFor="period_end">Period To *</label>
+                <Controller
+                  name="period_end"
+                  control={control}
+                  render={({ field }) => (
+                    <Calendar
+                      id="period_end"
+                      value={field.value}
+                      onChange={(e) => field.onChange(e.value)}
+                      dateFormat="dd-M-yy"
+                      placeholder="Select end date"
+                      showIcon
+                      className={errors.period_end ? 'p-invalid' : ''}
+                    />
+                  )}
+                />
+                {errors.period_end && (
+                  <small className="p-error">{errors.period_end.message}</small>
+                )}
+              </div>
+            </div>
+
+            {/* Vendor Selection */}
+            <div className="field">
+              <label htmlFor="vendor_id">Vendor *</label>
+              <Controller
+                name="vendor_id"
+                control={control}
+                render={({ field }) => (
+                  <Dropdown
+                    id="vendor_id"
+                    {...field}
+                    options={vendorOptions}
+                    placeholder={vendorsLoading ? 'Loading vendors...' : 'Select Vendor'}
+                    filter
+                    filterPlaceholder="Search vendors"
+                    loading={vendorsLoading}
+                    disabled={vendorsLoading}
+                    className={errors.vendor_id ? 'p-invalid' : ''}
+                    emptyMessage="No vendors found"
+                  />
+                )}
+              />
+              {errors.vendor_id && (
+                <small className="p-error">{errors.vendor_id.message}</small>
+              )}
+            </div>
+
+            {/* File Upload (Optional) */}
+            <div className="field">
+              <label htmlFor="company_ledger">Company Ledger (optional)</label>
+              <FileUpload
+                ref={fileUploadRef}
+                mode="basic"
+                accept=".xlsx,.xls,.csv"
+                maxFileSize={52428800}
+                chooseLabel={selectedFile ? selectedFile.name : 'Browse File'}
+                auto={false}
+                onSelect={handleFileSelect}
+                onClear={handleFileClear}
+              />
+              {selectedFile && (
+                <small className="text-color-secondary mt-1">
+                  Selected: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
+                </small>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div className="flex justify-content-end gap-2 mt-3">
+              <Button
+                label="Cancel"
+                type="button"
+                severity="secondary"
+                onClick={() => setShowNewDialog(false)}
+                disabled={createMutation.isPending}
+              />
+              <Button
+                label="Create"
+                type="submit"
+                icon="pi pi-check"
+                loading={createMutation.isPending}
+                disabled={createMutation.isPending}
+              />
+            </div>
           </div>
-        </div>
+        </form>
       </Dialog>
     );
   }

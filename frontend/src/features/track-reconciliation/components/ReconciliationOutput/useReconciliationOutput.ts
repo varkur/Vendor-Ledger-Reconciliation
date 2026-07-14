@@ -13,6 +13,7 @@ import {
   getMatchedItems,
   getUnmatchedCompany,
   getUnmatchedVendor,
+  submitForApproval,
   type ConfirmMatchRequest,
   type ConfirmMatchResponse,
   type ConfirmationItem,
@@ -20,6 +21,8 @@ import {
   type ListParams,
   type MatchedItem,
   type PaginatedResponse,
+  type SubmitForApprovalRequest,
+  type SubmitForApprovalResponse,
   type UnmatchedCompanyItem,
   type UnmatchedVendorItem,
 } from './reconciliationOutputApi';
@@ -104,6 +107,25 @@ export function useConfirmMatch(caseId: string) {
     mutationFn: (request: ConfirmMatchRequest) => confirmMatch(caseId, request),
     onSuccess: () => {
       // Invalidate all related queries to refresh data
+      queryClient.invalidateQueries({
+        queryKey: ['vlr', 'reconciliation', caseId],
+      });
+    },
+  });
+}
+
+/**
+ * Mutation hook for submitting a case for approval.
+ * Invalidates reconciliation queries on success to reflect the new status.
+ */
+export function useSubmitForApproval(caseId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation<SubmitForApprovalResponse, Error, { companyCode: string; comments?: string }>({
+    mutationFn: ({ companyCode, comments }) =>
+      submitForApproval({ case_id: caseId, comments }, companyCode),
+    onSuccess: () => {
+      // Invalidate all reconciliation queries to reflect new status
       queryClient.invalidateQueries({
         queryKey: ['vlr', 'reconciliation', caseId],
       });

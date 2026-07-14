@@ -6,13 +6,17 @@
  * Wired to backend APIs:
  * - POST /api/v1/vlr/requests (create reconciliation request with vendor_ids)
  * - GET /api/v1/vlr/vendors (fetch vendor list for selection)
+ * - GET /api/v1/vlr/settings/email-config (fetch email sender configuration)
+ * - GET /api/v1/vlr/vendors/{vendor_id}/contacts (fetch vendor contacts)
+ * - GET /api/v1/vlr/email-templates/{id}/preview (fetch email template preview)
  *
  * Implements loading indicators, error handling, and form validation.
  *
- * Requirements: 23.3, 25.1, 25.2
+ * Requirements: 9, 10, 23.3, 25.1, 25.2
  */
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { RadioButton } from 'primereact/radiobutton';
@@ -22,15 +26,45 @@ import { Button } from 'primereact/button';
 import { MultiSelect } from 'primereact/multiselect';
 import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
+import { ProgressBar } from 'primereact/progressbar';
+import { Dialog } from 'primereact/dialog';
+import { Toast } from 'primereact/toast';
+import { FileUpload, FileUploadHandlerEvent } from 'primereact/fileupload';
 
-import { useVendorSelection, useCreateStatementRequest } from '../hooks/useRequestStatement';
+import { useVendorSelection, useCreateStatementRequest, useUploadCompanyLedger } from '../hooks/useRequestStatement';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
+import { useQuery } from '@tanstack/react-query';
+import { apiClient } from '@shared/services/apiClient';
 
 type Step = 'configure' | 'upload';
 
-const DEFAULT_COMPANY_CODE = '1000';
 const DEFAULT_FISCAL_YEAR = '2024-25';
 
+/** Response from the email-config endpoint */
+interface EmailConfigResponse {
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  sender_email: string;
+  sender_name: string;
+  use_tls: boolean;
+  is_configured: boolean;
+}
+
+/** Vendor contact from the contacts endpoint */
+interface VendorContact {
+  id: string;
+  name: string;
+  email: string;
+  phone?: string;
+  designation?: string;
+  is_primary?: boolean;
+}
+
 export const RequestStatementPage = () => {
+  const { companyCode } = useSelectedEntity();
+  const toast = useRef<Toast>(null);
+  const navigate = useNavigate();
   const [currentStep, setCurrentStep] = useState<Step>('configure');
   const [title, setTitle] = useState('');
   const [requestType, setRequestType] = useState('Ledger');
@@ -64,7 +98,14 @@ export const RequestStatementPage = () => {
   const [emailTemplate, setEmailTemplate] = useState('');
   const [reminderTemplate, setReminderTemplate] = useState('');
   const [contactPerson, setContactPerson] = useState('');
+  const [emailAttachment, setEmailAttachment] = useState('company_ledger');
   const [sendNow, setSendNow] = useState('Now');
+
+  // Preview dialog state
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [previewHtml, setPreviewHtml] = useState('');
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState('');
 
   // Success state
   const [showSuccess, setShowSuccess] = useState(false);
@@ -79,11 +120,107 @@ export const RequestStatementPage = () => {
     isError: isVendorError,
     error: vendorError,
     refetch: refetchVendors,
-  } = useVendorSelection(DEFAULT_COMPANY_CODE, vendorSearch);
+  } = useVendorSelection(companyCode, vendorSearch);
 
   const createMutation = useCreateStatementRequest();
 
+  // Upload hook — enabled once request is created (request_id available)
+  const requestId = createMutation.data?.id || '';
+  const { mutateAsync: uploadFile, uploadProgress, isPending: isUploading } = useUploadCompanyLedger(requestId);
+  const [uploadComplete, setUploadComplete] = useState(false);
+
+  // Fetch email templates for dropdowns
+  const { data: emailTemplatesData } = useQuery<{ items: Array<{ id: string; name: string; subject: string; category: string }> }>({
+    queryKey: ['email-templates', companyCode],
+    queryFn: async () => {
+      const { data } = await apiClient.get('/vlr/email-templates', {
+        params: { company_code: companyCode, page_size: 50 },
+      });
+      return data;
+    },
+    enabled: !!companyCode,
+    staleTime: 60_000,
+  });
+
+  // Fetch email config for "Send Email From" dropdown
+  const {
+    data: emailConfigData,
+    isLoading: isLoadingEmailConfig,
+  } = useQuery<EmailConfigResponse>({
+    queryKey: ['email-config', companyCode],
+    queryFn: async () => {
+      const { data } = await apiClient.get('/vlr/settings/email-config', {
+        params: { company_code: companyCode },
+      });
+      return data;
+    },
+    enabled: !!companyCode,
+    staleTime: 60_000,
+  });
+
+  // Fetch vendor contacts for "Contact Person" dropdown (uses first selected vendor)
+  const firstSelectedVendorId = selectedVendorIds.length > 0 ? selectedVendorIds[0] : '';
+  const {
+    data: vendorContactsData,
+    isLoading: isLoadingContacts,
+  } = useQuery<VendorContact[]>({
+    queryKey: ['vendor-contacts', firstSelectedVendorId, companyCode],
+    queryFn: async () => {
+      const { data } = await apiClient.get(`/vlr/vendors/${firstSelectedVendorId}/contacts`, {
+        params: { company_code: companyCode },
+      });
+      // Backend returns list[VendorContactResponse] directly (flat array)
+      return Array.isArray(data) ? data : data.items ?? [];
+    },
+    enabled: !!firstSelectedVendorId && !!companyCode,
+    staleTime: 30_000,
+  });
+
   // ─── Derived Data ────────────────────────────────────────────────────────────
+  const emailTemplateOptions = useMemo(() => {
+    if (!emailTemplatesData?.items) return [];
+    return emailTemplatesData.items
+      .filter((t) => t.category === 'ledger_request' || t.category === 'general')
+      .map((t) => ({ label: t.name, value: t.id }));
+  }, [emailTemplatesData]);
+
+  const reminderTemplateOptions = useMemo(() => {
+    if (!emailTemplatesData?.items) return [];
+    return emailTemplatesData.items
+      .filter((t) => t.category === 'reminder' || t.category === 'escalation')
+      .map((t) => ({ label: t.name, value: t.id }));
+  }, [emailTemplatesData]);
+
+  // "Send Email From" dropdown options from email config
+  const sendEmailFromOptions = useMemo(() => {
+    if (!emailConfigData || !emailConfigData.is_configured) {
+      return [{ label: 'No email configured', value: '' }];
+    }
+    const label = emailConfigData.sender_name
+      ? `${emailConfigData.sender_name} <${emailConfigData.sender_email}>`
+      : emailConfigData.sender_email;
+    return [{ label, value: emailConfigData.sender_email }];
+  }, [emailConfigData]);
+
+  // "Contact Person" dropdown options from vendor contacts
+  const contactPersonOptions = useMemo(() => {
+    if (!vendorContactsData || vendorContactsData.length === 0) {
+      return [];
+    }
+    return vendorContactsData.map((c) => ({
+      label: c.email ? `${c.name} (${c.email})` : c.name,
+      value: c.id,
+    }));
+  }, [vendorContactsData]);
+
+  // "Email Attachment" dropdown options
+  const emailAttachmentOptions = useMemo(() => {
+    return [
+      { label: 'Company Ledger Extract', value: 'company_ledger' },
+      { label: 'None', value: 'none' },
+    ];
+  }, []);
+
   const vendorOptions = useMemo(() => {
     if (!vendorData?.items) return [];
     return vendorData.items.map((v) => ({
@@ -156,7 +293,7 @@ export const RequestStatementPage = () => {
 
     createMutation.mutate(
       {
-        company_code: DEFAULT_COMPANY_CODE,
+        company_code: companyCode,
         fiscal_year: DEFAULT_FISCAL_YEAR,
         period_start: formatDateToISO(startDate),
         period_end: formatDateToISO(endDate),
@@ -180,6 +317,37 @@ export const RequestStatementPage = () => {
   const handleVendorFilter = useCallback((e: { filter: string }) => {
     setVendorSearch(e.filter);
   }, []);
+
+  // Preview email template handler
+  const handlePreview = useCallback(async () => {
+    if (!emailTemplate) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'No Template Selected',
+        detail: 'Please select an email template before previewing.',
+      });
+      return;
+    }
+
+    setPreviewVisible(true);
+    setPreviewLoading(true);
+    setPreviewError('');
+    setPreviewHtml('');
+
+    try {
+      const { data } = await apiClient.get(`/vlr/email-templates/${emailTemplate}/preview`, {
+        params: { company_code: companyCode },
+      });
+      // The preview endpoint may return { html: string } or a raw HTML string
+      const html = typeof data === 'string' ? data : data.html || data.body || '';
+      setPreviewHtml(html);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to load email preview.';
+      setPreviewError(message);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }, [emailTemplate, companyCode]);
 
   const handleResetSuccess = useCallback(() => {
     setShowSuccess(false);
@@ -545,51 +713,71 @@ export const RequestStatementPage = () => {
                 <label className="block mb-2 font-medium text-sm">Send Email from*</label>
                 <Dropdown
                   value={sendEmailFrom}
-                  options={[{ label: 'Select', value: '' }]}
+                  options={sendEmailFromOptions}
                   onChange={(e) => setSendEmailFrom(e.value)}
                   className="w-full"
                   placeholder="Select"
+                  loading={isLoadingEmailConfig}
+                  disabled={isLoadingEmailConfig || !emailConfigData?.is_configured}
+                  tooltip={!emailConfigData?.is_configured ? 'Email not configured. Go to Settings > Email Configuration.' : undefined}
                 />
+                {isLoadingEmailConfig && (
+                  <small className="text-color-secondary">
+                    <ProgressSpinner style={{ width: '14px', height: '14px' }} /> Loading...
+                  </small>
+                )}
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Email Template*</label>
                 <Dropdown
                   value={emailTemplate}
-                  options={[{ label: 'null', value: '' }]}
+                  options={emailTemplateOptions}
                   onChange={(e) => setEmailTemplate(e.value)}
                   className="w-full"
-                  placeholder="null"
+                  placeholder="Select Email Template"
+                  filter
+                  showClear
                 />
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Reminder Template*</label>
                 <Dropdown
                   value={reminderTemplate}
-                  options={[{ label: 'null', value: '' }]}
+                  options={reminderTemplateOptions}
                   onChange={(e) => setReminderTemplate(e.value)}
                   className="w-full"
-                  placeholder="null"
+                  placeholder="Select Reminder Group"
+                  filter
+                  showClear
                 />
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Email Attachment</label>
                 <Dropdown
-                  value=""
-                  options={[{ label: 'select', value: '' }]}
-                  onChange={() => {}}
+                  value={emailAttachment}
+                  options={emailAttachmentOptions}
+                  onChange={(e) => setEmailAttachment(e.value)}
                   className="w-full"
-                  placeholder="select"
+                  placeholder="Select attachment"
                 />
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Contact Person*</label>
                 <Dropdown
                   value={contactPerson}
-                  options={[{ label: 'Select', value: '' }]}
+                  options={contactPersonOptions}
                   onChange={(e) => setContactPerson(e.value)}
                   className="w-full"
-                  placeholder="Select"
+                  placeholder={selectedVendorIds.length === 0 ? 'Select vendors first' : 'Select contact'}
+                  disabled={selectedVendorIds.length === 0 || isLoadingContacts}
+                  loading={isLoadingContacts}
+                  emptyMessage={selectedVendorIds.length === 0 ? 'Select vendors first' : 'No contacts found'}
                 />
+                {isLoadingContacts && (
+                  <small className="text-color-secondary">
+                    <ProgressSpinner style={{ width: '14px', height: '14px' }} /> Loading contacts...
+                  </small>
+                )}
               </div>
               <div className="col-12 md:col-4">
                 <label className="block mb-2 font-medium text-sm">Send Now?*</label>
@@ -608,7 +796,7 @@ export const RequestStatementPage = () => {
           </div>
 
           <div className="flex justify-content-end gap-3 mt-4">
-            <Button label="Preview" className="p-button-outlined" />
+            <Button label="Preview" className="p-button-outlined" onClick={handlePreview} disabled={!emailTemplate} />
             <Button
               label="Submit"
               onClick={handleSubmit}
@@ -627,25 +815,138 @@ export const RequestStatementPage = () => {
             <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
               From {startDate ? startDate.toLocaleDateString('en-GB') : 'DD-MM-YYYY'} To {endDate ? endDate.toLocaleDateString('en-GB') : 'DD-MM-YYYY'}
             </p>
-            <div className="flex align-items-center justify-content-between mt-4 p-4" style={{ border: '1px dashed var(--color-surface-border)', borderRadius: 'var(--radius-md)' }}>
-              <div>
-                <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                  Acceptable file types: xls, xlsx, xlsb, csv
-                </p>
-                <p className="text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                  Max size: 50mb
-                </p>
+
+            {/* Upload Progress */}
+            {isUploading && uploadProgress > 0 && (
+              <div className="mt-3 mb-3">
+                <div className="flex align-items-center gap-2 mb-2">
+                  <i className="pi pi-cloud-upload" />
+                  <span className="text-sm">Uploading file...</span>
+                </div>
+                <ProgressBar value={uploadProgress} />
               </div>
-              <Button label="Browse File" className="btn-accent" />
+            )}
+
+            {/* File Upload Component */}
+            <div className="mt-4">
+              <FileUpload
+                name="companyLedger"
+                customUpload
+                uploadHandler={async (event: FileUploadHandlerEvent) => {
+                  const file = event.files[0];
+                  if (!file) return;
+
+                  if (!requestId) {
+                    toast.current?.show({
+                      severity: 'error',
+                      summary: 'Upload Error',
+                      detail: 'No request ID available. Please complete Step 1 first.',
+                      life: 5000,
+                    });
+                    return;
+                  }
+
+                  try {
+                    await uploadFile(file);
+                    setUploadComplete(true);
+                    toast.current?.show({
+                      severity: 'success',
+                      summary: 'Upload Complete',
+                      detail: `${file.name} uploaded successfully. You can now track reconciliation.`,
+                      life: 5000,
+                    });
+                  } catch (error: unknown) {
+                    const errorMsg =
+                      (error as { response?: { data?: { detail?: string } } })?.response?.data
+                        ?.detail || 'Upload failed. Please try again.';
+                    toast.current?.show({
+                      severity: 'error',
+                      summary: 'Upload Failed',
+                      detail: errorMsg,
+                      life: 8000,
+                    });
+                  }
+                }}
+                accept=".xlsx,.xls,.csv"
+                maxFileSize={52428800}
+                disabled={isUploading || !requestId}
+                emptyTemplate={
+                  <div className="flex flex-column align-items-center p-4">
+                    <i
+                      className="pi pi-cloud-upload"
+                      style={{ fontSize: '3rem', color: 'var(--color-text-muted)' }}
+                    />
+                    <p style={{ color: 'var(--color-text-muted)', margin: '12px 0 0' }}>
+                      Drag and drop files here, or click to browse
+                    </p>
+                    <p style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+                      Acceptable file types: .xlsx, .xls, .csv | Max size: 50MB
+                    </p>
+                  </div>
+                }
+                chooseLabel="Browse File"
+                uploadLabel="Upload"
+                cancelLabel="Clear"
+              />
             </div>
+
+            {/* Success — View Reconciliation */}
+            {uploadComplete && requestId && (
+              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--green-50, #f0fdf4)', borderRadius: 'var(--radius-md)', border: '1px solid var(--green-200, #bbf7d0)' }}>
+                <i className="pi pi-check-circle" style={{ fontSize: '1.5rem', color: 'var(--green-500)' }} />
+                <div className="flex-1">
+                  <p className="m-0 font-medium">File uploaded successfully</p>
+                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+                    Your company ledger has been uploaded. You can now track the reconciliation progress.
+                  </p>
+                </div>
+                <Button
+                  label="View Reconciliation"
+                  icon="pi pi-arrow-right"
+                  iconPos="right"
+                  onClick={() => navigate(`/track-reconciliation/${requestId}`)}
+                />
+              </div>
+            )}
           </div>
 
           <div className="flex justify-content-end gap-3 mt-4">
             <Button label="Back" className="p-button-outlined" onClick={() => setCurrentStep('configure')} />
-            <Button label="Preview" className="p-button-outlined" />
+            <Button label="Preview" className="p-button-outlined" onClick={handlePreview} disabled={!emailTemplate} />
           </div>
         </div>
       )}
+
+      {/* Email Preview Dialog */}
+      <Dialog
+        header="Email Preview"
+        visible={previewVisible}
+        onHide={() => setPreviewVisible(false)}
+        style={{ width: '70vw', maxWidth: '900px' }}
+        maximizable
+        modal
+      >
+        {previewLoading && (
+          <div className="flex justify-content-center align-items-center" style={{ minHeight: '200px' }}>
+            <ProgressSpinner style={{ width: '40px', height: '40px' }} />
+          </div>
+        )}
+        {previewError && (
+          <Message severity="error" text={previewError} className="w-full" />
+        )}
+        {!previewLoading && !previewError && previewHtml && (
+          <div
+            className="email-preview-content"
+            style={{ border: '1px solid var(--surface-border)', borderRadius: '6px', padding: '1rem', background: '#fff' }}
+            dangerouslySetInnerHTML={{ __html: previewHtml }}
+          />
+        )}
+        {!previewLoading && !previewError && !previewHtml && (
+          <p className="text-color-secondary text-center">No preview content available.</p>
+        )}
+      </Dialog>
+
+      <Toast ref={toast} />
     </div>
   );
 };

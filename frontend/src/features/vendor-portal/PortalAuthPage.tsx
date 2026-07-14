@@ -3,7 +3,7 @@
  * Vendors access this via a unique link sent in their email.
  *
  * Connects to: POST /api/v1/vlr/portal/validate-token
- * Requirements: 24.1, 33.1, 33.2
+ * Requirements: 24.1, 33.1, 33.2, 5
  */
 
 import { useEffect, useState } from 'react';
@@ -11,8 +11,10 @@ import { useSearchParams, useNavigate } from 'react-router-dom';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Button } from 'primereact/button';
 import { Message } from 'primereact/message';
+import { Dialog } from 'primereact/dialog';
+import { InputText } from 'primereact/inputtext';
 
-import { useValidateToken } from './hooks/usePortal';
+import { useValidateToken, useRequestNewLink } from './hooks/usePortal';
 import { usePortalContext } from './context/PortalContext';
 
 type AuthStatus = 'authenticating' | 'success' | 'expired' | 'invalid' | 'error';
@@ -22,9 +24,14 @@ export const PortalAuthPage = () => {
   const navigate = useNavigate();
   const [status, setStatus] = useState<AuthStatus>('authenticating');
   const [errorMessage, setErrorMessage] = useState('');
+  const [showRequestLinkDialog, setShowRequestLinkDialog] = useState(false);
+  const [requestLinkEmail, setRequestLinkEmail] = useState('');
+  const [requestLinkMessage, setRequestLinkMessage] = useState('');
+  const [requestLinkError, setRequestLinkError] = useState('');
 
   const { setAuthenticated } = usePortalContext();
   const validateMutation = useValidateToken();
+  const requestNewLinkMutation = useRequestNewLink();
 
   useEffect(() => {
     const token = searchParams.get('token');
@@ -92,6 +99,35 @@ export const PortalAuthPage = () => {
     });
   };
 
+  const handleRequestNewLink = () => {
+    setRequestLinkEmail('');
+    setRequestLinkMessage('');
+    setRequestLinkError('');
+    setShowRequestLinkDialog(true);
+  };
+
+  const handleSubmitRequestNewLink = () => {
+    if (!requestLinkEmail.trim()) {
+      setRequestLinkError('Please enter your email address.');
+      return;
+    }
+
+    setRequestLinkError('');
+    setRequestLinkMessage('');
+
+    requestNewLinkMutation.mutate(requestLinkEmail.trim(), {
+      onSuccess: (data) => {
+        setRequestLinkMessage(data.message || 'A new link has been sent to your email.');
+        setRequestLinkEmail('');
+      },
+      onError: (error) => {
+        const detail =
+          error.response?.data?.detail || 'Failed to send new link. Please try again.';
+        setRequestLinkError(detail);
+      },
+    });
+  };
+
   return (
     <div
       style={{
@@ -150,6 +186,7 @@ export const PortalAuthPage = () => {
               label="Request New Link"
               icon="pi pi-envelope"
               className="mt-3"
+              onClick={handleRequestNewLink}
             />
           </div>
         )}
@@ -189,6 +226,56 @@ export const PortalAuthPage = () => {
           </div>
         )}
       </div>
+
+      {/* Request New Link Dialog */}
+      <Dialog
+        header="Request New Portal Link"
+        visible={showRequestLinkDialog}
+        onHide={() => setShowRequestLinkDialog(false)}
+        style={{ width: '400px' }}
+        modal
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <p style={{ margin: 0, color: 'var(--color-text-muted)' }}>
+            Enter your email address and we'll send you a new portal access link.
+          </p>
+
+          {requestLinkMessage && (
+            <Message severity="success" text={requestLinkMessage} className="w-full" />
+          )}
+
+          {requestLinkError && (
+            <Message severity="error" text={requestLinkError} className="w-full" />
+          )}
+
+          {!requestLinkMessage && (
+            <>
+              <div className="p-field">
+                <label htmlFor="request-link-email" style={{ display: 'block', marginBottom: 8 }}>
+                  Email Address
+                </label>
+                <InputText
+                  id="request-link-email"
+                  value={requestLinkEmail}
+                  onChange={(e) => setRequestLinkEmail(e.target.value)}
+                  placeholder="vendor@company.com"
+                  className="w-full"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleSubmitRequestNewLink();
+                  }}
+                />
+              </div>
+              <Button
+                label="Send New Link"
+                icon="pi pi-send"
+                onClick={handleSubmitRequestNewLink}
+                loading={requestNewLinkMutation.isPending}
+                disabled={!requestLinkEmail.trim()}
+              />
+            </>
+          )}
+        </div>
+      </Dialog>
     </div>
   );
 };

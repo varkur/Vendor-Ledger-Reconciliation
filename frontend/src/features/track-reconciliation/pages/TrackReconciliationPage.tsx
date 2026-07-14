@@ -17,6 +17,7 @@ import { useNavigate } from 'react-router-dom';
 
 import { useCaseList } from '../hooks/useTrackReconciliation';
 import type { ReconciliationCase } from '../api/trackReconciliationApi';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 /** Available status options for the filter dropdown. */
 const STATUS_OPTIONS = [
@@ -36,11 +37,9 @@ const STATUS_OPTIONS = [
 /** Page size options for the paginator. */
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
 
-/** Default company code — in a real app this would come from user context/session. */
-const DEFAULT_COMPANY_CODE = 'EPL';
-
 export const TrackReconciliationPage = () => {
   const navigate = useNavigate();
+  const { companyCode } = useSelectedEntity();
 
   // Pagination state
   const [page, setPage] = useState(1);
@@ -57,7 +56,7 @@ export const TrackReconciliationPage = () => {
 
   // Query hook — lazy server-side pagination
   const { data, isLoading, isError, error, refetch } = useCaseList({
-    company_code: DEFAULT_COMPANY_CODE,
+    company_code: companyCode,
     page,
     page_size: pageSize,
     status: statusFilter || undefined,

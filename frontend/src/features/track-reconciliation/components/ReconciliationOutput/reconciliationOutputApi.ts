@@ -142,6 +142,20 @@ export interface ConfirmMatchResponse {
   item_id: string;
 }
 
+/** Request body for POST /approvals/submit. */
+export interface SubmitForApprovalRequest {
+  case_id: string;
+  comments?: string;
+}
+
+/** Response from POST /approvals/submit. */
+export interface SubmitForApprovalResponse {
+  approval_id: string;
+  case_id: string;
+  status: string;
+  message: string;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // API Functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +238,22 @@ export async function confirmMatch(
   const response = await apiClient.post<ConfirmMatchResponse>(
     `${BASE}/${caseId}/confirm`,
     request
+  );
+  return response.data;
+}
+
+/**
+ * Submit a reconciliation case for approval.
+ * POST /api/v1/vlr/approvals/submit
+ */
+export async function submitForApproval(
+  request: SubmitForApprovalRequest,
+  companyCode: string
+): Promise<SubmitForApprovalResponse> {
+  const response = await apiClient.post<SubmitForApprovalResponse>(
+    '/vlr/approvals/submit',
+    request,
+    { params: { company_code: companyCode } }
   );
   return response.data;
 }

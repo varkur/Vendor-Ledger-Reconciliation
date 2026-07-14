@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Form, Header, HTTPException, Request, UploadFile, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -31,6 +31,10 @@ from src.api.v1.schemas.vlr.portal_schemas import (
     PortalAuthResponse,
     PortalCaseSignOffRequest,
     PortalCaseSignOffResponse,
+    PortalDisputeResponse,
+    PortalReconciliationStatusResponse,
+    PortalRequestNewLinkRequest,
+    PortalRequestNewLinkResponse,
     PortalSignOffRequest,
     PortalSignOffResponse,
     PortalStatementResponse,
@@ -56,6 +60,7 @@ from src.infrastructure.database.models.vlr.reconciliation_request_model import 
 )
 from src.infrastructure.database.models.vlr.reco_exception_model import RecoExceptionModel
 from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+from src.infrastructure.database.models.vlr.vendor_contact_model import VendorContactModel
 from src.infrastructure.database.repositories.vlr.case_repository_impl import (
     CaseRepositoryImpl,
 )
@@ -641,6 +646,128 @@ async def validate_token(
     )
 
 
+@router.post(
+    "/request-new-link",
+    response_model=PortalRequestNewLinkResponse,
+    summary="Request a new portal access link",
+    responses={
+        404: {"description": "No active cases found for this email address"},
+    },
+)
+async def request_new_link(
+    body: PortalRequestNewLinkRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalRequestNewLinkResponse:
+    """
+    POST /api/v1/vlr/portal/request-new-link
+
+    Allows a vendor to request a new portal access link when their existing link
+    has expired or been lost. Looks up active reconciliation cases by vendor email,
+    generates a new UUID token, invalidates the old one, and dispatches a
+    send_vendor_invite Celery task.
+
+    This endpoint does NOT require authentication (the vendor is unauthenticated).
+
+    Requirement 5: Vendor can request a new portal access link.
+    """
+    email = body.email.strip().lower()
+
+    # Find vendor contacts matching this email
+    contact_stmt = select(VendorContactModel).where(
+        func.lower(VendorContactModel.email) == email
+    )
+    contact_result = await session.execute(contact_stmt)
+    contacts = contact_result.scalars().all()
+
+    if not contacts:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active cases found for this email address. Please check the email or contact the reconciliation team.",
+        )
+
+    # Collect vendor IDs from matching contacts
+    vendor_ids = list({c.vendor_id for c in contacts})
+
+    # Find active (non-closed, non-deleted) reconciliation cases for these vendors
+    cases_stmt = select(ReconciliationCaseModel).where(
+        and_(
+            ReconciliationCaseModel.vendor_id.in_(vendor_ids),
+            ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+            ReconciliationCaseModel.status.notin_(["closed", "signed_off", "approved"]),
+        )
+    )
+    cases_result = await session.execute(cases_stmt)
+    cases = cases_result.scalars().all()
+
+    if not cases:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active cases found for this email address. Please check the email or contact the reconciliation team.",
+        )
+
+    # For each active case, generate a new token and dispatch invite email
+    now = datetime.now(timezone.utc)
+    token_validity_days = 90
+
+    for case in cases:
+        # Generate new token and invalidate old one
+        new_token = str(uuid4())
+        new_expiry = now + timedelta(days=token_validity_days)
+
+        case_repo = CaseRepositoryImpl(session)
+        await case_repo.update(
+            case.id,
+            {
+                "portal_token": new_token,
+                "token_expiry": new_expiry,
+                "modified_by": "vendor_portal",
+                "modified_date": now,
+            },
+        )
+
+        # Get vendor name for the email
+        vendor_stmt = select(VendorModel).where(VendorModel.id == case.vendor_id)
+        vendor_result = await session.execute(vendor_stmt)
+        vendor = vendor_result.scalar_one_or_none()
+        vendor_name = vendor.name if vendor else "Vendor"
+
+        # Dispatch send_vendor_invite via notification service
+        try:
+            from src.domain.services.vlr.notification_service import NotificationService
+            from src.infrastructure.database.repositories.vlr.notification_repository_impl import (
+                NotificationRepositoryImpl,
+            )
+
+            notification_repo = NotificationRepositoryImpl(session)
+            notification_service = NotificationService(notification_repository=notification_repo)
+
+            await notification_service.send_vendor_invite(
+                case_id=case.id,
+                vendor_email=email,
+                vendor_name=vendor_name,
+                portal_token=new_token,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to dispatch invite email for case_id=%s, email=%s: %s",
+                case.id,
+                email,
+                str(exc),
+            )
+
+    await session.flush()
+
+    logger.info(
+        "New portal link(s) requested: email=%s, cases_updated=%d",
+        email,
+        len(cases),
+    )
+
+    return PortalRequestNewLinkResponse(
+        message="A new link has been sent to your email.",
+    )
+
+
 @router.get(
     "/statement/{case_id}",
     response_model=PortalStatementResultResponse,
@@ -860,6 +987,221 @@ async def sign_off_case(
         statement_version=body.statement_version,
         status="signed_off",
         message="Vendor approval recorded successfully.",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reconciliation Status Polling — Requirement 6
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/reconciliation-status/{case_id}",
+    response_model=PortalReconciliationStatusResponse,
+    summary="Get reconciliation processing status for polling",
+    responses={
+        401: {"description": "Invalid or expired portal token"},
+        404: {"description": "Case not found or access denied"},
+    },
+)
+async def get_reconciliation_status(
+    case_id: UUID,
+    x_portal_token: str = Header(..., alias="X-Portal-Token"),
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalReconciliationStatusResponse:
+    """
+    GET /api/v1/vlr/portal/reconciliation-status/{case_id}
+
+    Returns the current reconciliation processing status for a case.
+    Used by the portal upload page to poll for completion after file upload.
+
+    Status mapping:
+    - 'processing': case is in 'data_received' or 'matching' status (reconciliation in progress)
+    - 'completed': case is in 'matched', 'review', or any later status (reconciliation done)
+    - 'error': case has encountered an error during processing
+
+    Requirement 6: Vendor Portal — Upload Processing State.
+    """
+    # Validate portal token
+    case = await _validate_portal_token(x_portal_token, session)
+
+    # Verify the token belongs to this case
+    if str(case.id) != str(case_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found or access denied.",
+        )
+
+    # Map case status to polling status
+    processing_statuses = ("data_received", "matching", "created", "ledger_confirmed", "invited")
+    completed_statuses = ("matched", "review", "pending_approval", "approved", "signed_off", "closed")
+
+    if case.status in completed_statuses:
+        return PortalReconciliationStatusResponse(
+            status="completed",
+            message="Reconciliation completed successfully. You can now view your statement.",
+        )
+    elif case.status in processing_statuses:
+        return PortalReconciliationStatusResponse(
+            status="processing",
+            message="Your statement is being processed. This may take a few minutes.",
+        )
+    else:
+        # Unknown or error status
+        return PortalReconciliationStatusResponse(
+            status="error",
+            message="An error occurred during processing. Please contact support for assistance.",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Raise Dispute — Requirement 8
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/dispute/{case_id}",
+    response_model=PortalDisputeResponse,
+    summary="Raise a dispute on reconciliation results",
+    responses={
+        401: {"description": "Invalid or expired portal token"},
+        404: {"description": "Case not found or access denied"},
+        409: {"description": "Case already disputed or in an invalid state"},
+        422: {"description": "Validation error (missing reason)"},
+    },
+)
+async def raise_dispute(
+    case_id: UUID,
+    request: Request,
+    reason: str = Form("", description="Reason for disputing the reconciliation results"),
+    attachment: UploadFile | None = None,
+    x_portal_token: str = Header(..., alias="X-Portal-Token"),
+    session: AsyncSession = Depends(get_db_session),
+) -> PortalDisputeResponse:
+    """
+    POST /api/v1/vlr/portal/dispute/{case_id}
+
+    Allows a vendor to raise a dispute on reconciliation results they disagree with.
+    Updates the case status to 'disputed', creates an audit event, and notifies the finance team.
+
+    Accepts multipart/form-data with:
+    - reason (required): Text description of the dispute
+    - attachment (optional): Supporting document file
+
+    Requirement 8: Vendor Portal — Raise Dispute.
+    """
+    # Validate portal token
+    case = await _validate_portal_token(x_portal_token, session)
+
+    # Verify the token belongs to this case
+    if str(case.id) != str(case_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found or access denied.",
+        )
+
+    # Validate reason is provided
+    if not reason or not reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Reason is required to raise a dispute.",
+        )
+
+    # Prevent duplicate disputes
+    if case.status == "disputed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A dispute has already been raised for this case.",
+        )
+
+    # Extract client IP address
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+
+    now = datetime.now(timezone.utc)
+
+    # Handle optional file attachment
+    attachment_filename = None
+    if attachment and attachment.filename:
+        attachment_filename = attachment.filename
+        # In production, the file would be stored in object storage.
+        # For now, we log the filename and skip actual file persistence.
+        logger.info(
+            "Dispute attachment received: case_id=%s, filename=%s",
+            case.id,
+            attachment_filename,
+        )
+
+    # Update case status to disputed
+    case_repo = CaseRepositoryImpl(session)
+    await case_repo.update(
+        case.id,
+        {
+            "status": "disputed",
+            "modified_by": "vendor_portal",
+            "modified_date": now,
+        },
+    )
+
+    await session.flush()
+
+    # Emit audit event for the dispute
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username="vendor_portal",
+        event_type=AuditEventType.VENDOR_INTERACTION,
+        case_id=case.id,
+        event_details={
+            "action": "raise_dispute",
+            "reason": reason.strip()[:500],
+            "has_attachment": attachment_filename is not None,
+            "attachment_filename": attachment_filename,
+        },
+        ip_address=client_ip,
+    ))
+
+    # Notify finance team about the dispute
+    try:
+        from src.domain.services.vlr.notification_service import NotificationService
+        from src.infrastructure.database.repositories.vlr.notification_repository_impl import (
+            NotificationRepositoryImpl,
+        )
+
+        notification_repo = NotificationRepositoryImpl(session)
+        notification_service = NotificationService(notification_repository=notification_repo)
+
+        # Fetch vendor name for notification context
+        vendor_stmt = select(VendorModel).where(VendorModel.id == case.vendor_id)
+        vendor_result = await session.execute(vendor_stmt)
+        vendor = vendor_result.scalar_one_or_none()
+        vendor_name = vendor.name if vendor else "Unknown Vendor"
+
+        await notification_service.send_dispute_notification(
+            case_id=case.id,
+            vendor_name=vendor_name,
+            reason=reason.strip(),
+        )
+    except Exception as exc:
+        # Notification failure should not block the dispute submission
+        logger.warning(
+            "Failed to send dispute notification for case_id=%s: %s",
+            case.id,
+            str(exc),
+        )
+
+    logger.info(
+        "Vendor dispute raised: case_id=%s, reason='%s', attachment=%s",
+        case.id,
+        reason.strip()[:100],
+        attachment_filename,
+    )
+
+    return PortalDisputeResponse(
+        case_id=case.id,
+        status="disputed",
+        message="Dispute raised successfully. The reconciliation team will review your concern.",
     )
 
 

@@ -3,6 +3,7 @@ VLR Report API endpoints with export capabilities.
 Thin controller — delegates report generation to ReportService.
 
 Routes:
+- GET  /api/v1/vlr/reports/reconciliation-summary             — Aggregate reconciliation summary (paginated)
 - GET  /api/v1/vlr/reports/reconciliation-summary/{case_id}  — Reconciliation summary (10-row)
 - GET  /api/v1/vlr/reports/reconciliation-statement/{case_id} — Full reconciliation statement
 - GET  /api/v1/vlr/reports/aging-analysis                    — Aging analysis report
@@ -12,7 +13,7 @@ Routes:
 - POST /api/v1/vlr/reports/generate                          — Generate exportable report
 - GET  /api/v1/vlr/reports/export/{report_id}                — Download generated report
 
-Requirements: 27.1, 27.2, 27.3, 28.1, 28.2, 28.3, 29.1, 29.2, 29.3, 29.4
+Requirements: 16, 27.1, 27.2, 27.3, 28.1, 28.2, 28.3, 29.1, 29.2, 29.3, 29.4
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.dependencies import get_current_active_user
 from src.api.v1.schemas.vlr.report_schemas import (
     AgingAnalysisResponse,
+    AggregateReconciliationSummaryResponse,
+    AggregateRecoSummaryRow,
     EnhancedExceptionReportResponse,
     ExceptionReportResponse,
     GenerateReportRequest,
@@ -141,6 +144,63 @@ def _dataclass_to_dict(obj) -> dict:
 # ──────────────────────────────────────────────────────────────────────
 # Endpoints: Reconciliation Summary (Requirement 27.1)
 # ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/reconciliation-summary",
+    response_model=AggregateReconciliationSummaryResponse,
+    summary="Get aggregate reconciliation summary across all cases",
+    dependencies=[Depends(require_permission("vlr.reports.read"))],
+)
+async def get_aggregate_reconciliation_summary(
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Page size"),
+    date_from: date | None = Query(None, description="Filter: start date (created_date >=)"),
+    date_to: date | None = Query(None, description="Filter: end date (created_date <=)"),
+    current_user: User = Depends(get_current_active_user),
+    service: ReportService = Depends(_get_report_service),
+) -> AggregateReconciliationSummaryResponse:
+    """
+    GET /api/v1/vlr/reports/reconciliation-summary
+
+    Returns a paginated aggregate reconciliation summary across all cases
+    for the given company_code, optionally filtered by date range.
+
+    Requirement 16: Reports Page — Reconciliation Summary.
+    """
+    result = await service.generate_aggregate_reconciliation_summary(
+        company_code=company_code,
+        page=page,
+        page_size=page_size,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    items = [
+        AggregateRecoSummaryRow(
+            id=row.id,
+            vendor_name=row.vendor_name,
+            opening_balance=row.opening_balance,
+            invoices=row.invoices,
+            payments=row.payments,
+            adjustments=row.adjustments,
+            closing_balance=row.closing_balance,
+            difference=row.difference,
+            status=row.status,
+        )
+        for row in result.items
+    ]
+
+    total_pages = (result.total + page_size - 1) // page_size if result.total > 0 else 0
+
+    return AggregateReconciliationSummaryResponse(
+        items=items,
+        total=result.total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get(

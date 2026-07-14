@@ -17,6 +17,29 @@ from pydantic import BaseModel, Field
 # ──────────────────────────────────────────────────────────────────────
 
 
+class SubmitForApprovalRequest(BaseModel):
+    """Request body for submitting a reconciliation case for approval."""
+
+    case_id: UUID = Field(
+        ...,
+        description="The reconciliation case ID to submit for approval",
+    )
+    comments: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional comments for the submission",
+    )
+
+
+class SubmitForApprovalResponse(BaseModel):
+    """Response schema for a successful approval submission."""
+
+    approval_id: UUID
+    case_id: UUID
+    status: str = Field(description="New case status after submission")
+    message: str = Field(description="Human-readable success message")
+
+
 class ApproveRequest(BaseModel):
     """Request body for approving a reconciliation case."""
 

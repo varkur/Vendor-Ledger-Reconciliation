@@ -1,23 +1,26 @@
 /**
  * Vendor Portal Upload page — Allows vendors to upload their statement files.
  * Includes file upload with progress indicator connected to backend API.
+ * After upload, polls for reconciliation status and auto-navigates on completion.
  *
  * Connects to: POST /api/v1/vlr/portal/upload (with X-Portal-Token header)
- * Requirements: 24.2
+ *              GET /api/v1/vlr/portal/reconciliation-status/{case_id} (polling)
+ * Requirements: 6, 24.2
  */
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { FileUpload, FileUploadHandlerEvent } from 'primereact/fileupload';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Tag } from 'primereact/tag';
 import { Toast } from 'primereact/toast';
 import { ProgressBar } from 'primereact/progressbar';
+import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
 import { Button } from 'primereact/button';
 import { useNavigate } from 'react-router-dom';
 
-import { usePortalUpload } from './hooks/usePortal';
+import { usePortalUpload, useReconciliationStatus } from './hooks/usePortal';
 import { usePortalContext } from './context/PortalContext';
 
 interface UploadedFile {
@@ -30,15 +33,80 @@ interface UploadedFile {
   errorMessage?: string;
 }
 
+/** Polling timeout duration: 2 minutes */
+const POLLING_TIMEOUT_MS = 2 * 60 * 1000;
+
 export const PortalUploadPage = () => {
   const toast = useRef<Toast>(null);
   const navigate = useNavigate();
   const { portalToken, caseInfo, isAuthenticated } = usePortalContext();
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [isPolling, setIsPolling] = useState(false);
+  const [pollingTimedOut, setPollingTimedOut] = useState(false);
+  const [processingError, setProcessingError] = useState<string | null>(null);
+  const pollingStartTime = useRef<number | null>(null);
 
   const { mutateAsync: uploadFile, uploadProgress, isPending } = usePortalUpload(
     portalToken || ''
   );
+
+  const caseId = caseInfo?.case_id ? String(caseInfo.case_id) : null;
+
+  // Poll for reconciliation status after upload
+  const { data: statusData } = useReconciliationStatus(
+    caseId,
+    portalToken,
+    isPolling && !pollingTimedOut
+  );
+
+  // Handle polling timeout (2 minutes)
+  useEffect(() => {
+    if (!isPolling || pollingTimedOut) return;
+
+    const checkTimeout = setInterval(() => {
+      if (pollingStartTime.current) {
+        const elapsed = Date.now() - pollingStartTime.current;
+        if (elapsed >= POLLING_TIMEOUT_MS) {
+          setPollingTimedOut(true);
+          clearInterval(checkTimeout);
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(checkTimeout);
+  }, [isPolling, pollingTimedOut]);
+
+  // Handle status changes from polling
+  useEffect(() => {
+    if (!statusData || !isPolling) return;
+
+    if (statusData.status === 'completed') {
+      setIsPolling(false);
+      toast.current?.show({
+        severity: 'success',
+        summary: 'Reconciliation Complete',
+        detail: 'Your statement has been processed successfully.',
+        life: 3000,
+      });
+      // Auto-navigate to statement page
+      setTimeout(() => {
+        navigate('/portal/statement');
+      }, 1500);
+    } else if (statusData.status === 'error') {
+      setIsPolling(false);
+      setProcessingError(
+        statusData.message || 'An error occurred during processing. Please contact support.'
+      );
+    }
+  }, [statusData, isPolling, navigate]);
+
+  // Start polling after a successful upload that returns a task_id
+  const startPolling = useCallback(() => {
+    setIsPolling(true);
+    setPollingTimedOut(false);
+    setProcessingError(null);
+    pollingStartTime.current = Date.now();
+  }, []);
 
   // Redirect to auth if not authenticated
   if (!isAuthenticated || !portalToken) {
@@ -104,6 +172,11 @@ export const PortalUploadPage = () => {
           detail: `${file.name} uploaded successfully. ${result.entries_parsed} entries parsed.`,
           life: 5000,
         });
+
+        // If task_id is returned, start polling for reconciliation status
+        if (result.task_id) {
+          startPolling();
+        }
       } catch (error: unknown) {
         const errorMsg =
           (error as { response?: { data?: { detail?: string } } })?.response?.data
@@ -151,6 +224,99 @@ export const PortalUploadPage = () => {
     }
     return <span style={{ color: 'var(--color-text-muted)' }}>—</span>;
   };
+
+  // Processing state UI — shown while polling
+  if (isPolling && !pollingTimedOut && !processingError) {
+    return (
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <Toast ref={toast} />
+        <div className="em-card" style={{ padding: 48 }}>
+          <ProgressSpinner
+            style={{ width: '60px', height: '60px' }}
+            strokeWidth="4"
+            animationDuration="1.5s"
+          />
+          <h3 style={{ marginTop: 24, marginBottom: 8 }}>Processing your statement...</h3>
+          <p style={{ color: 'var(--color-text-muted)', margin: '0 0 24px' }}>
+            Your file has been uploaded and reconciliation is in progress.
+          </p>
+          <div style={{ display: 'flex', justifyContent: 'center', gap: 16, marginBottom: 24 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <i className="pi pi-check-circle" style={{ color: 'var(--color-success, #22c55e)' }} />
+              <span style={{ fontSize: '0.85rem' }}>File uploaded</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <ProgressSpinner style={{ width: '16px', height: '16px' }} strokeWidth="5" />
+              <span style={{ fontSize: '0.85rem' }}>Reconciling entries</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <i className="pi pi-circle" style={{ color: 'var(--color-text-muted)' }} />
+              <span style={{ fontSize: '0.85rem', color: 'var(--color-text-muted)' }}>Complete</span>
+            </div>
+          </div>
+          <p style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+            This usually takes a few minutes. Please do not close this page.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Polling timeout state — "Taking longer than expected"
+  if (pollingTimedOut && isPolling) {
+    return (
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <Toast ref={toast} />
+        <div className="em-card" style={{ padding: 48 }}>
+          <i className="pi pi-clock" style={{ fontSize: '3rem', color: 'var(--color-warning, #f59e0b)' }} />
+          <h3 style={{ marginTop: 16, marginBottom: 8 }}>Taking longer than expected</h3>
+          <p style={{ color: 'var(--color-text-muted)', margin: '0 0 24px' }}>
+            Your statement is still being processed. This may take a bit more time.
+            You can check back later or wait here.
+          </p>
+          <div className="flex justify-content-center gap-3">
+            <Button
+              label="Check Back Later"
+              icon="pi pi-arrow-left"
+              severity="secondary"
+              outlined
+              onClick={() => { setIsPolling(false); setPollingTimedOut(false); }}
+            />
+            <Button
+              label="Keep Waiting"
+              icon="pi pi-refresh"
+              onClick={() => { setPollingTimedOut(false); pollingStartTime.current = Date.now(); }}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Processing error state
+  if (processingError) {
+    return (
+      <div style={{ maxWidth: 600, margin: '0 auto', padding: '60px 24px', textAlign: 'center' }}>
+        <Toast ref={toast} />
+        <div className="em-card" style={{ padding: 48 }}>
+          <i className="pi pi-exclamation-triangle" style={{ fontSize: '3rem', color: 'var(--color-error, #ef4444)' }} />
+          <h3 style={{ marginTop: 16, marginBottom: 8 }}>Processing Error</h3>
+          <p style={{ color: 'var(--color-text-muted)', margin: '0 0 16px' }}>{processingError}</p>
+          <Message
+            severity="info"
+            text="Please contact the reconciliation team for assistance. Email: support@company.com"
+            className="mb-3 w-full"
+          />
+          <Button
+            label="Try Again"
+            icon="pi pi-refresh"
+            severity="secondary"
+            onClick={() => { setProcessingError(null); }}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '24px' }}>

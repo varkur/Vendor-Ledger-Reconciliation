@@ -133,3 +133,26 @@ class SendReminderRequest(BaseModel):
         default=None,
         description="Company code for settings lookup (optional)",
     )
+
+
+class SendReminderByCasesRequest(BaseModel):
+    """Request schema for sending reminders to multiple cases by case ID."""
+
+    case_ids: list[str] = Field(
+        ..., min_length=1, description="List of case IDs to send reminders for"
+    )
+    company_code: str = Field(..., min_length=1, description="Company code for entity scoping")
+
+
+class SendReminderByCasesResultItem(BaseModel):
+    """Result for a single case in a bulk send reminder action."""
+
+    case_id: str
+    success: bool
+    message: str | None = None
+
+
+class SendReminderByCasesResponse(BaseModel):
+    """Response schema for bulk send reminder by case IDs."""
+
+    results: list[SendReminderByCasesResultItem]

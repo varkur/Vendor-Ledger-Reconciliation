@@ -5,7 +5,7 @@
  * Requirements: 23.4, 25.3, 25.4
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { DataTable, DataTablePageEvent } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
@@ -14,9 +14,11 @@ import { Tag } from 'primereact/tag';
 import { Dropdown } from 'primereact/dropdown';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
+import { Toast } from 'primereact/toast';
 import { ResolutionDialog } from './ResolutionDialog';
 import { useExceptionList, useResolveException } from './hooks/useExceptions';
 import type { ExceptionItem } from './api/exceptionsApi';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 /** Available severity filter options. */
 const SEVERITY_OPTIONS = [
@@ -49,9 +51,6 @@ const STATUS_OPTIONS = [
 /** Page size options for the paginator. */
 const PAGE_SIZE_OPTIONS = [10, 25, 50];
 
-/** Default company code — in a real app this comes from user context/session. */
-const DEFAULT_COMPANY_CODE = 'EPL';
-
 /** Map backend resolution action codes to the format expected by the API. */
 const RESOLUTION_ACTION_MAP: Record<string, string> = {
   ACM: 'accept_company_match',
@@ -63,6 +62,9 @@ const RESOLUTION_ACTION_MAP: Record<string, string> = {
 };
 
 export const ExceptionListPage = () => {
+  const { companyCode } = useSelectedEntity();
+  const toast = useRef<Toast>(null);
+
   // Pagination state
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
@@ -79,7 +81,7 @@ export const ExceptionListPage = () => {
 
   // Query hook — lazy server-side pagination
   const { data, isLoading, isError, error, refetch } = useExceptionList({
-    company_code: DEFAULT_COMPANY_CODE,
+    company_code: companyCode,
     page,
     page_size: pageSize,
     severity: severityFilter || undefined,
@@ -88,7 +90,7 @@ export const ExceptionListPage = () => {
   });
 
   // Mutation hook for resolving exceptions
-  const resolveExceptionMutation = useResolveException(DEFAULT_COMPANY_CODE);
+  const resolveExceptionMutation = useResolveException(companyCode);
 
   // Handlers
   const handlePageChange = useCallback((event: DataTablePageEvent) => {
@@ -116,6 +118,7 @@ export const ExceptionListPage = () => {
       if (!selectedExceptionForResolution) return;
 
       const backendAction = RESOLUTION_ACTION_MAP[action] || action;
+      const caseId = selectedExceptionForResolution.case_id;
 
       resolveExceptionMutation.mutate(
         {
@@ -126,9 +129,42 @@ export const ExceptionListPage = () => {
           },
         },
         {
-          onSettled: () => {
+          onSuccess: () => {
             setResolutionDialogVisible(false);
             setSelectedExceptionForResolution(null);
+            toast.current?.show({
+              severity: 'success',
+              summary: 'Exception Resolved',
+              detail: caseId
+                ? undefined
+                : 'Exception resolved successfully.',
+              life: 5000,
+              content: caseId
+                ? (
+                  <div className="flex flex-column gap-1">
+                    <span className="font-bold">Exception Resolved</span>
+                    <span>
+                      Exception resolved successfully.{' '}
+                      <a
+                        href={`/track-reconciliation/${caseId}`}
+                        style={{ color: 'var(--color-primary)', textDecoration: 'underline' }}
+                      >
+                        View Case
+                      </a>
+                    </span>
+                  </div>
+                )
+                : undefined,
+            });
+          },
+          onError: (err) => {
+            // Keep dialog open and selection intact on error so user can retry
+            toast.current?.show({
+              severity: 'error',
+              summary: 'Resolution Failed',
+              detail: err.message || 'Failed to resolve exception. Please try again.',
+              life: 5000,
+            });
           },
         }
       );
@@ -255,6 +291,7 @@ export const ExceptionListPage = () => {
 
   return (
     <div>
+      <Toast ref={toast} />
       {/* Page Header */}
       <div className="em-page-header">
         <h2>Exception Management</h2>

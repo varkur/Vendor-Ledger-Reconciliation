@@ -9,8 +9,7 @@ import { Message } from 'primereact/message';
 import { ProgressBar } from 'primereact/progressbar';
 import { useBulkImportVendors } from '../hooks/useVendors';
 import { BulkImportResponse } from '../api/vendorApi';
-
-const DEFAULT_COMPANY_CODE = '1000';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 interface ImportDialogProps {
   visible: boolean;
@@ -18,6 +17,7 @@ interface ImportDialogProps {
 }
 
 export const ImportDialog = ({ visible, onHide }: ImportDialogProps) => {
+  const { companyCode } = useSelectedEntity();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [importResult, setImportResult] = useState<BulkImportResponse | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -58,7 +58,7 @@ export const ImportDialog = ({ visible, onHide }: ImportDialogProps) => {
     if (!selectedFile) return;
 
     bulkImport.mutate(
-      { file: selectedFile, companyCode: DEFAULT_COMPANY_CODE },
+      { file: selectedFile, companyCode: companyCode },
       {
         onSuccess: (data) => {
           setImportResult(data);

@@ -140,6 +140,34 @@ class PortalCaseSignOffResponse(BaseModel):
     message: str = Field(description="Human-readable sign-off result")
 
 
+class PortalRequestNewLinkRequest(BaseModel):
+    """Request body for POST /request-new-link — vendor requests a new portal access link."""
+
+    email: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Vendor email address to send the new link to",
+    )
+
+
+class PortalRequestNewLinkResponse(BaseModel):
+    """Response for POST /request-new-link."""
+
+    message: str = Field(description="Human-readable result message")
+
+
+class PortalReconciliationStatusResponse(BaseModel):
+    """Response for GET /reconciliation-status/{case_id} — polling endpoint for processing state."""
+
+    status: str = Field(
+        description="Reconciliation processing status: 'processing', 'completed', or 'error'"
+    )
+    message: str | None = Field(
+        default=None, description="Optional human-readable message about the status"
+    )
+
+
 class PortalStatementResultResponse(BaseModel):
     """
     Response for GET /statement/{case_id} — vendor-facing reconciliation results.
@@ -169,3 +197,16 @@ class PortalStatementResultResponse(BaseModel):
         description="Summary of match results (match type, count, total amount)",
     )
     statement_version: str = Field(description="Statement version identifier for sign-off")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dispute — Requirement 8
+# ──────────────────────────────────────────────────────────────────────
+
+
+class PortalDisputeResponse(BaseModel):
+    """Response for POST /dispute/{case_id} — dispute submission result."""
+
+    case_id: UUID
+    status: str = Field(description="Case status after dispute (disputed)")
+    message: str = Field(description="Human-readable result message")

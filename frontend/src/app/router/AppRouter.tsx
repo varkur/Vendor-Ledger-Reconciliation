@@ -12,18 +12,29 @@ import { RequestStatementPage } from '@features/request-statement/pages/RequestS
 import { DirectReconciliationPage } from '@features/direct-reconciliation/pages/DirectReconciliationPage';
 import { TrackReconciliationPage } from '@features/track-reconciliation/pages/TrackReconciliationPage';
 import { ReconciliationDetailPage } from '@features/track-reconciliation/pages/ReconciliationDetailPage';
+import { ReconciliationOutputPage } from '@features/track-reconciliation/pages/ReconciliationOutputPage';
 import { RolesPage } from '@features/rbac-admin/pages/RolesPage';
 import { AuditLogsPage } from '@features/rbac-admin/pages/AuditLogsPage';
 import { ExceptionListPage } from '@features/exceptions/ExceptionListPage';
+import { ApprovalsPage } from '@features/approvals/pages/ApprovalsPage';
 import { ReportsPage } from '@features/reports/pages/ReportsPage';
 import { NotificationHistoryPage } from '@features/notifications/pages/NotificationHistoryPage';
 import { SettingsPage } from '@features/vlr-settings/SettingsPage';
+import { CompanyProfilePage } from '@features/vlr-settings/pages/CompanyProfilePage';
+import { AddEntityPage } from '@features/vlr-settings/pages/AddEntityPage';
+import { EmailConfigPage } from '@features/vlr-settings/pages/EmailConfigPage';
+import { RemindersPage } from '@features/vlr-settings/pages/RemindersPage';
+import { EmailTemplatesPage } from '@features/vlr-settings/pages/EmailTemplatesPage';
+import { DocumentTypesPage } from '@features/vlr-settings/pages/DocumentTypesPage';
 import { PortalAuthPage } from '@features/vendor-portal/PortalAuthPage';
 import { PortalUploadPage } from '@features/vendor-portal/PortalUploadPage';
 import { PortalStatementPage } from '@features/vendor-portal/PortalStatementPage';
 import { PortalSignOffPage } from '@features/vendor-portal/PortalSignOffPage';
 import { PortalProvider } from '@features/vendor-portal/context/PortalContext';
 import { DashboardPage } from '@features/dashboard/pages/DashboardPage';
+import { WorkflowDefinitionsPage } from '@features/workflow-admin/pages/WorkflowDefinitionsPage';
+import { ApprovalMatrixPage } from '@features/workflow-admin/pages/ApprovalMatrixPage';
+import { WorkflowBuilderPage } from '@features/workflow-admin/pages/WorkflowBuilderPage';
 import { MainLayout } from '@app/layouts/MainLayout';
 import { PrivateRoute } from './PrivateRoute';
 
@@ -60,9 +71,13 @@ export const AppRouter = () => {
           <Route path="direct-reconciliation" element={<DirectReconciliationPage />} />
           <Route path="track-reconciliation" element={<TrackReconciliationPage />} />
           <Route path="track-reconciliation/:requestId" element={<ReconciliationDetailPage />} />
+          <Route path="track-reconciliation/:requestId/case/:caseId" element={<ReconciliationOutputPage />} />
 
           {/* Exception Management */}
           <Route path="exceptions" element={<ExceptionListPage />} />
+
+          {/* Approvals */}
+          <Route path="approvals" element={<ApprovalsPage />} />
 
           {/* Reports & MIS */}
           <Route path="reports" element={<ReportsPage />} />
@@ -77,6 +92,17 @@ export const AppRouter = () => {
 
           {/* Settings */}
           <Route path="settings" element={<SettingsPage />} />
+          <Route path="settings/company-profile" element={<CompanyProfilePage />} />
+          <Route path="settings/add-entity" element={<AddEntityPage />} />
+          <Route path="settings/email-config" element={<EmailConfigPage />} />
+          <Route path="settings/reminders" element={<RemindersPage />} />
+          <Route path="settings/email-templates" element={<EmailTemplatesPage />} />
+          <Route path="settings/document-types" element={<DocumentTypesPage />} />
+          <Route path="settings/workflow-definitions" element={<WorkflowDefinitionsPage />} />
+          <Route path="settings/approval-matrix" element={<ApprovalMatrixPage />} />
+
+          {/* Workflow Builder (accessed from Workflow Definitions) */}
+          <Route path="workflow-builder/:definitionId" element={<WorkflowBuilderPage />} />
 
           {/* Automation */}
           <Route

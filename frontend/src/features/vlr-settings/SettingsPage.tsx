@@ -1,7 +1,7 @@
 /**
  * Settings & Configuration page — VLR system configuration.
  * Wired to backend GET/PUT /api/v1/vlr/settings with loading/error states.
- * Sections: Tolerance Config, Matching Preferences, Notification Intervals,
+ * Sections: Tolerance Config, Matching Preferences,
  *           Approval Thresholds, TDS/GST Defaults, SAP Connection
  *
  * Requirements: 23.7, 25.1, 25.2
@@ -50,9 +50,6 @@ export const SettingsPage = () => {
   const [matchingMethod, setMatchingMethod] = useState('auto');
   const [autoMatchThreshold, setAutoMatchThreshold] = useState<number | null>(95);
   const [enableFuzzyMatch, setEnableFuzzyMatch] = useState(true);
-  const [reminderInterval, setReminderInterval] = useState<number | null>(7);
-  const [maxReminders, setMaxReminders] = useState<number | null>(3);
-  const [escalationDays, setEscalationDays] = useState<number | null>(15);
   const [autoApproveLimit, setAutoApproveLimit] = useState<number | null>(10000);
   const [managerApproveLimit, setManagerApproveLimit] = useState<number | null>(500000);
   const [requireDualApproval, setRequireDualApproval] = useState(true);
@@ -74,9 +71,6 @@ export const SettingsPage = () => {
       setMatchingMethod(settings.matching.matching_method);
       setAutoMatchThreshold(settings.matching.auto_match_threshold);
       setEnableFuzzyMatch(settings.matching.enable_fuzzy_match);
-      setReminderInterval(settings.notifications.reminder_interval_days);
-      setMaxReminders(settings.notifications.max_reminders);
-      setEscalationDays(settings.notifications.escalation_days);
       setAutoApproveLimit(settings.approvals.auto_approve_limit);
       setManagerApproveLimit(settings.approvals.manager_approve_limit);
       setRequireDualApproval(settings.approvals.require_dual_approval);
@@ -102,11 +96,6 @@ export const SettingsPage = () => {
       matching_method: matchingMethod as 'auto' | 'rules' | 'manual',
       auto_match_threshold: autoMatchThreshold ?? 0,
       enable_fuzzy_match: enableFuzzyMatch,
-    },
-    notifications: {
-      reminder_interval_days: reminderInterval ?? 7,
-      max_reminders: maxReminders ?? 3,
-      escalation_days: escalationDays ?? 15,
     },
     approvals: {
       auto_approve_limit: autoApproveLimit ?? 0,
@@ -312,58 +301,6 @@ export const SettingsPage = () => {
               <div className="flex align-items-center gap-2">
                 <InputSwitch checked={enableFuzzyMatch} onChange={(e) => setEnableFuzzyMatch(e.value)} />
                 <label>Enable Fuzzy Matching</label>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Notification Intervals */}
-        <div className="col-12 md:col-6">
-          <div className="em-card">
-            <h3 style={{ marginTop: 0, marginBottom: 16 }}>
-              <i className="pi pi-bell mr-2" />Notification Intervals
-            </h3>
-            <div className="flex flex-column gap-3">
-              <div>
-                <label htmlFor="reminder-interval" style={{ display: 'block', fontWeight: 500, marginBottom: 6 }}>
-                  Reminder Interval (days)
-                </label>
-                <InputNumber
-                  id="reminder-interval"
-                  value={reminderInterval}
-                  onValueChange={(e) => setReminderInterval(e.value ?? null)}
-                  suffix=" days"
-                  min={1}
-                  max={30}
-                  className="w-full"
-                />
-              </div>
-              <div>
-                <label htmlFor="max-reminders" style={{ display: 'block', fontWeight: 500, marginBottom: 6 }}>
-                  Maximum Reminders
-                </label>
-                <InputNumber
-                  id="max-reminders"
-                  value={maxReminders}
-                  onValueChange={(e) => setMaxReminders(e.value ?? null)}
-                  min={1}
-                  max={10}
-                  className="w-full"
-                />
-              </div>
-              <div>
-                <label htmlFor="escalation-days" style={{ display: 'block', fontWeight: 500, marginBottom: 6 }}>
-                  Auto-Escalation After (days)
-                </label>
-                <InputNumber
-                  id="escalation-days"
-                  value={escalationDays}
-                  onValueChange={(e) => setEscalationDays(e.value ?? null)}
-                  suffix=" days"
-                  min={1}
-                  max={60}
-                  className="w-full"
-                />
               </div>
             </div>
           </div>

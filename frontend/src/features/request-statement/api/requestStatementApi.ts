@@ -6,10 +6,11 @@
  * but focuses on the vendor statement request workflow — selecting vendors and configuring
  * reconciliation parameters for sending statement requests.
  *
- * Requirements: 23.3, 25.1, 25.2
+ * Requirements: 11, 23.3, 25.1, 25.2
  */
 
 import { apiClient } from '@shared/services/apiClient';
+import { AxiosProgressEvent } from 'axios';
 
 const REQUESTS_BASE = '/vlr/requests';
 const VENDORS_BASE = '/vlr/vendors';
@@ -108,5 +109,51 @@ export async function fetchVendorsForSelection(
       page_size: pageSize,
     },
   });
+  return response.data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Company Ledger Upload
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Response from POST /reconciliation-requests/{request_id}/upload-company-ledger */
+export interface UploadCompanyLedgerResponse {
+  id: string;
+  request_id: string;
+  file_name: string;
+  file_size: number;
+  status: string;
+  entries_parsed?: number;
+  message: string;
+}
+
+/**
+ * Upload a company ledger file for a reconciliation request.
+ * Supports progress tracking via onProgress callback.
+ */
+export async function uploadCompanyLedger(
+  requestId: string,
+  file: File,
+  onProgress?: (progress: number) => void
+): Promise<UploadCompanyLedgerResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const response = await apiClient.post<UploadCompanyLedgerResponse>(
+    `/vlr/reconciliation-requests/${requestId}/upload-company-ledger`,
+    formData,
+    {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+      timeout: 120000, // 2 minutes for large file uploads
+      onUploadProgress: (event: AxiosProgressEvent) => {
+        if (onProgress && event.total) {
+          const percent = Math.round((event.loaded * 100) / event.total);
+          onProgress(percent);
+        }
+      },
+    }
+  );
   return response.data;
 }

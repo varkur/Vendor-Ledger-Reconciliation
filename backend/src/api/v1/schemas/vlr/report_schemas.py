@@ -265,6 +265,35 @@ class MonthlyMISReportResponse(BaseModel):
 # ──────────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Aggregate Reconciliation Summary Schemas (Requirement 16)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class AggregateRecoSummaryRow(BaseModel):
+    """A single row in the aggregate reconciliation summary report."""
+
+    id: str = ""
+    vendor_name: str = ""
+    opening_balance: Decimal = Decimal("0.00")
+    invoices: Decimal = Decimal("0.00")
+    payments: Decimal = Decimal("0.00")
+    adjustments: Decimal = Decimal("0.00")
+    closing_balance: Decimal = Decimal("0.00")
+    difference: Decimal = Decimal("0.00")
+    status: str = ""
+
+
+class AggregateReconciliationSummaryResponse(BaseModel):
+    """Paginated aggregate reconciliation summary across all cases."""
+
+    items: list[AggregateRecoSummaryRow] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+    total_pages: int = 0
+
+
 class GenerateReportRequest(BaseModel):
     """Request to generate and store a report for later download."""
 

@@ -78,6 +78,12 @@ export interface MatchSummaryItem {
   total_amount: string;
 }
 
+/** Response from GET /reconciliation-status/{case_id} */
+export interface PortalReconciliationStatusResponse {
+  status: 'processing' | 'completed' | 'error';
+  message?: string;
+}
+
 /** Request body for POST /sign-off/{case_id} */
 export interface PortalSignOffRequest {
   confirmation_text: string;
@@ -99,6 +105,29 @@ export interface PortalCaseSignOffResponse {
 export interface PortalApiError {
   detail: string;
   status_code?: number;
+}
+
+/** Request body for POST /request-new-link */
+export interface RequestNewLinkRequest {
+  email: string;
+}
+
+/** Response from POST /request-new-link */
+export interface RequestNewLinkResponse {
+  message: string;
+}
+
+/** Request body for POST /dispute/{case_id} */
+export interface PortalDisputeRequest {
+  reason: string;
+  attachment?: File;
+}
+
+/** Response from POST /dispute/{case_id} */
+export interface PortalDisputeResponse {
+  case_id: string;
+  status: string;
+  message: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +212,70 @@ export async function signOffCase(
     data,
     {
       headers: {
+        'X-Portal-Token': portalToken,
+      },
+    }
+  );
+  return response.data;
+}
+
+/**
+ * Poll reconciliation processing status for a case.
+ * Used after upload to check when reconciliation is complete.
+ * Uses X-Portal-Token header for authentication.
+ */
+export async function getReconciliationStatus(
+  caseId: string,
+  portalToken: string
+): Promise<PortalReconciliationStatusResponse> {
+  const response = await portalClient.get<PortalReconciliationStatusResponse>(
+    `/reconciliation-status/${caseId}`,
+    {
+      headers: {
+        'X-Portal-Token': portalToken,
+      },
+    }
+  );
+  return response.data;
+}
+
+
+/**
+ * Request a new portal access link. Does NOT require auth (vendor is unauthenticated).
+ * Calls POST /api/v1/vlr/portal/request-new-link with the vendor's email.
+ */
+export async function requestNewLink(
+  data: RequestNewLinkRequest
+): Promise<RequestNewLinkResponse> {
+  const response = await portalClient.post<RequestNewLinkResponse>(
+    '/request-new-link',
+    data
+  );
+  return response.data;
+}
+
+/**
+ * Raise a dispute on reconciliation results for a specific case.
+ * Uses X-Portal-Token header for authentication.
+ * Sends multipart/form-data if an attachment is included.
+ */
+export async function raiseDispute(
+  caseId: string,
+  data: PortalDisputeRequest,
+  portalToken: string
+): Promise<PortalDisputeResponse> {
+  const formData = new FormData();
+  formData.append('reason', data.reason);
+  if (data.attachment) {
+    formData.append('attachment', data.attachment);
+  }
+
+  const response = await portalClient.post<PortalDisputeResponse>(
+    `/dispute/${caseId}`,
+    formData,
+    {
+      headers: {
+        'Content-Type': 'multipart/form-data',
         'X-Portal-Token': portalToken,
       },
     }

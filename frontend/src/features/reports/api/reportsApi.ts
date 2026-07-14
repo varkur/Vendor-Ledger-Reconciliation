@@ -85,6 +85,7 @@ export interface PaginatedReportResponse<T> {
 
 /** Parameters for fetching report data. */
 export interface ReportParams {
+  company_code?: string;
   page?: number;
   page_size?: number;
   case_id?: string;

@@ -4,17 +4,22 @@
  * Provides data fetching with loading/error/retry patterns for:
  * - Creating statement requests (mutation)
  * - Fetching vendor list for selection (query)
+ * - Uploading company ledger with progress tracking (mutation)
  *
- * Requirements: 23.3, 25.1, 25.2
+ * Requirements: 11, 23.3, 25.1, 25.2
  */
 
+import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { AxiosError } from 'axios';
 
 import {
   createStatementRequest,
   fetchVendorsForSelection,
+  uploadCompanyLedger,
   type CreateStatementRequest,
   type StatementRequestResponse,
+  type UploadCompanyLedgerResponse,
   type VendorListResponse,
 } from '../api/requestStatementApi';
 
@@ -55,4 +60,36 @@ export function useCreateStatementRequest() {
       queryClient.invalidateQueries({ queryKey: [REQUEST_STATEMENT_QUERY_KEY] });
     },
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Company Ledger Upload
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Hook for uploading a company ledger file with progress tracking.
+ * Returns upload mutation + progress state.
+ */
+export function useUploadCompanyLedger(requestId: string) {
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+
+  const mutation = useMutation<
+    UploadCompanyLedgerResponse,
+    AxiosError<{ detail?: string }>,
+    File
+  >({
+    mutationFn: (file: File) =>
+      uploadCompanyLedger(requestId, file, (progress) => {
+        setUploadProgress(progress);
+      }),
+    onSettled: () => {
+      // Reset progress after a short delay so user sees 100%
+      setTimeout(() => setUploadProgress(0), 1500);
+    },
+  });
+
+  return {
+    ...mutation,
+    uploadProgress,
+  };
 }

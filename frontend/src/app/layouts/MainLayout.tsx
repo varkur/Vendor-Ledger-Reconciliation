@@ -9,9 +9,11 @@
  * - Utilities
  */
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { useAppSelector } from '@app/store';
+import { useAppSelector, useAppDispatch } from '@app/store';
+import { fetchEntities, selectEntity, type CompanyEntity } from '@app/store/entitySlice';
+import { useQueryClient } from '@tanstack/react-query';
 
 interface SubNavItem {
   label: string;
@@ -33,14 +35,6 @@ const navItems: NavItem[] = [
     path: '/dashboard',
   },
   {
-    label: 'Confirmation',
-    icon: 'pi pi-check-square',
-    children: [
-      { label: 'Pending Confirmations', path: '/track-reconciliation' },
-      { label: 'Exceptions', path: '/exceptions' },
-    ],
-  },
-  {
     label: 'Account Reco',
     icon: 'pi pi-sync',
     children: [
@@ -48,15 +42,10 @@ const navItems: NavItem[] = [
       { label: 'Request Statement', path: '/request-statement' },
       { label: 'Direct Reconciliation', path: '/direct-reconciliation' },
       { label: 'Track Reconciliation', path: '/track-reconciliation' },
+      { label: 'Exceptions', path: '/exceptions' },
+      { label: 'Approvals', path: '/approvals' },
       { label: 'Reports', path: '/reports' },
       { label: 'Notifications', path: '/notifications' },
-    ],
-  },
-  {
-    label: 'Data Management',
-    icon: 'pi pi-database',
-    children: [
-      { label: 'Recovery & Follow-up', path: '/recovery' },
     ],
   },
   {
@@ -64,14 +53,12 @@ const navItems: NavItem[] = [
     icon: 'pi pi-cog',
     children: [
       { label: 'Manage Users', path: '/access-management/roles' },
-      { label: 'Company Profile', path: '/settings' },
-      { label: 'Email Attachments', path: '/settings' },
-      { label: 'Document Types', path: '/settings' },
-      { label: 'Reminders', path: '/settings' },
-      { label: 'Email Config', path: '/settings' },
-      { label: 'Domain Config', path: '/settings' },
-      { label: 'Notification', path: '/settings' },
-      { label: 'Global Settings', path: '/settings' },
+      { label: 'Company Profile', path: '/settings/company-profile' },
+      { label: 'Email Templates', path: '/settings/email-templates' },
+      { label: 'Document Types', path: '/settings/document-types' },
+      { label: 'Reminders', path: '/settings/reminders' },
+      { label: 'Email Config', path: '/settings/email-config' },
+      { label: 'Workflow Config', path: '/settings/workflow-definitions' },
     ],
   },
   {
@@ -88,8 +75,36 @@ const navItems: NavItem[] = [
 export const MainLayout = () => {
   const navigate = useNavigate();
   const location = useLocation();
+  const dispatch = useAppDispatch();
+  const queryClient = useQueryClient();
   const { user } = useAppSelector((state) => state.auth);
+  const { entities, selectedEntity } = useAppSelector((state) => state.entity);
   const [expandedMenus, setExpandedMenus] = useState<string[]>(['Account Reco']);
+  const [entityDropdownOpen, setEntityDropdownOpen] = useState(false);
+  const entityDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Load entities on mount
+  useEffect(() => {
+    dispatch(fetchEntities());
+  }, [dispatch]);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (entityDropdownRef.current && !entityDropdownRef.current.contains(event.target as Node)) {
+        setEntityDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const handleEntityChange = (entity: CompanyEntity) => {
+    dispatch(selectEntity(entity));
+    setEntityDropdownOpen(false);
+    // Invalidate all queries so data refetches for the new entity
+    queryClient.invalidateQueries();
+  };
 
   const isActive = (path: string) => location.pathname === path || location.pathname.startsWith(path + '/');
 
@@ -181,9 +196,67 @@ export const MainLayout = () => {
         <header className="em-topbar" aria-label="Top bar">
           <div className="em-topbar-left">
             <i className="pi pi-question-circle" style={{ fontSize: 18, color: 'var(--color-text-muted)' }} />
-            <div className="em-company-selector">
-              <span>Emcure Pharmaceuticals Limited</span>
-              <i className="pi pi-chevron-down" style={{ fontSize: 10 }} />
+            <div className="em-company-selector" ref={entityDropdownRef} style={{ position: 'relative' }}>
+              <button
+                onClick={() => setEntityDropdownOpen(!entityDropdownOpen)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '6px 10px',
+                  borderRadius: 4,
+                  fontSize: 14,
+                  color: 'inherit',
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={entityDropdownOpen}
+              >
+                <span>{selectedEntity?.name || 'Select Entity'}</span>
+                <i className={`pi ${entityDropdownOpen ? 'pi-chevron-up' : 'pi-chevron-down'}`} style={{ fontSize: 10 }} />
+              </button>
+              {entityDropdownOpen && entities.length > 0 && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '100%',
+                    left: 0,
+                    minWidth: 280,
+                    background: '#fff',
+                    border: '1px solid var(--color-border)',
+                    borderRadius: 6,
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+                    zIndex: 1000,
+                    marginTop: 4,
+                  }}
+                  role="listbox"
+                  aria-label="Select company entity"
+                >
+                  {entities.map((entity) => (
+                    <button
+                      key={entity.id}
+                      role="option"
+                      aria-selected={entity.id === selectedEntity?.id}
+                      onClick={() => handleEntityChange(entity)}
+                      style={{
+                        display: 'block',
+                        width: '100%',
+                        textAlign: 'left',
+                        padding: '10px 16px',
+                        border: 'none',
+                        background: entity.id === selectedEntity?.id ? 'var(--color-primary-50, #f0f0f0)' : 'transparent',
+                        cursor: 'pointer',
+                        fontSize: 14,
+                        fontWeight: entity.id === selectedEntity?.id ? 600 : 400,
+                      }}
+                    >
+                      {entity.name}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 

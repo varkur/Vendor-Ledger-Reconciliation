@@ -25,6 +25,7 @@ import {
   useDownloadReport,
 } from '../hooks/useReports';
 import type { ExportFormat, ReportType } from '../api/reportsApi';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -52,6 +53,7 @@ export const ReportsPage = () => {
   const toast = useRef<Toast>(null);
   const [activeTab, setActiveTab] = useState(0);
   const [exportFormat, setExportFormat] = useState<ExportFormat>('excel');
+  const { companyCode } = useSelectedEntity();
 
   // Page state per tab
   const [recoPage, setRecoPage] = useState(1);
@@ -61,20 +63,20 @@ export const ReportsPage = () => {
 
   // Data hooks
   const recoQuery = useReconciliationSummary(
-    { page: recoPage, page_size: DEFAULT_PAGE_SIZE },
-    activeTab === 0
+    { company_code: companyCode, page: recoPage, page_size: DEFAULT_PAGE_SIZE },
+    activeTab === 0 && !!companyCode
   );
   const exceptionQuery = useExceptionReport(
-    { page: exceptionPage, page_size: DEFAULT_PAGE_SIZE },
-    activeTab === 1
+    { company_code: companyCode, page: exceptionPage, page_size: DEFAULT_PAGE_SIZE },
+    activeTab === 1 && !!companyCode
   );
   const vendorQuery = useVendorStatusReport(
-    { page: vendorPage, page_size: DEFAULT_PAGE_SIZE },
-    activeTab === 2
+    { company_code: companyCode, page: vendorPage, page_size: DEFAULT_PAGE_SIZE },
+    activeTab === 2 && !!companyCode
   );
   const misQuery = useMonthlyMISReport(
-    { page: misPage, page_size: DEFAULT_PAGE_SIZE },
-    activeTab === 3
+    { company_code: companyCode, page: misPage, page_size: DEFAULT_PAGE_SIZE },
+    activeTab === 3 && !!companyCode
   );
 
   // Export mutations

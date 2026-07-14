@@ -17,10 +17,12 @@ from src.api.v1.endpoints.vlr.sap_settings_controller import router as vlr_sap_s
 from src.api.v1.endpoints.vlr.settings_controller import router as vlr_settings_router
 from src.api.v1.endpoints.vlr.sap_pull_controller import router as vlr_sap_pull_router
 from src.api.v1.endpoints.vlr.request_controller import router as vlr_request_router
+from src.api.v1.endpoints.vlr.request_controller import reconciliation_requests_router as vlr_reconciliation_requests_router
 from src.api.v1.endpoints.vlr.case_controller import router as vlr_case_router
 from src.api.v1.endpoints.vlr.exception_controller import router as vlr_exception_router
 from src.api.v1.endpoints.vlr.approval_controller import router as vlr_approval_router
 from src.api.v1.endpoints.vlr.notification_controller import router as vlr_notification_router
+from src.api.v1.endpoints.vlr.notification_controller import reminders_router as vlr_reminders_router
 from src.api.v1.endpoints.vlr.portal_controller import router as vlr_portal_router
 from src.api.v1.endpoints.vlr.report_controller import router as vlr_report_router
 from src.api.v1.endpoints.vlr.transformation_controller import router as vlr_transformation_router
@@ -30,6 +32,11 @@ from src.api.v1.endpoints.vlr.reconciliation_output_controller import router as 
 from src.api.v1.endpoints.vlr.dashboard_controller import router as vlr_dashboard_router
 from src.api.v1.endpoints.vlr.recovery_controller import router as vlr_recovery_router
 from src.api.v1.endpoints.vlr.audit_controller import router as vlr_audit_router
+from src.api.v1.endpoints.vlr.company_profile_controller import router as vlr_company_profile_router
+from src.api.v1.endpoints.vlr.email_config_controller import router as vlr_email_config_router
+from src.api.v1.endpoints.vlr.reminder_config_controller import router as vlr_reminder_config_router
+from src.api.v1.endpoints.vlr.email_template_controller import router as vlr_email_template_router
+from src.api.v1.endpoints.vlr.document_type_controller import router as vlr_document_type_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -46,10 +53,12 @@ api_v1_router.include_router(vlr_sap_settings_router)
 api_v1_router.include_router(vlr_settings_router)
 api_v1_router.include_router(vlr_sap_pull_router)
 api_v1_router.include_router(vlr_request_router)
+api_v1_router.include_router(vlr_reconciliation_requests_router)
 api_v1_router.include_router(vlr_case_router)
 api_v1_router.include_router(vlr_exception_router)
 api_v1_router.include_router(vlr_approval_router)
 api_v1_router.include_router(vlr_notification_router)
+api_v1_router.include_router(vlr_reminders_router)
 api_v1_router.include_router(vlr_portal_router)
 api_v1_router.include_router(vlr_report_router)
 api_v1_router.include_router(vlr_transformation_router)
@@ -59,3 +68,8 @@ api_v1_router.include_router(vlr_reconciliation_output_router)
 api_v1_router.include_router(vlr_dashboard_router)
 api_v1_router.include_router(vlr_recovery_router)
 api_v1_router.include_router(vlr_audit_router)
+api_v1_router.include_router(vlr_company_profile_router)
+api_v1_router.include_router(vlr_email_config_router)
+api_v1_router.include_router(vlr_reminder_config_router)
+api_v1_router.include_router(vlr_email_template_router)
+api_v1_router.include_router(vlr_document_type_router)

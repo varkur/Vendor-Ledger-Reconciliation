@@ -17,8 +17,8 @@ import { useVendors, useExportVendors } from '../hooks/useVendors';
 import { VendorResponse } from '../api/vendorApi';
 import { AddPartyDialog } from '../components/AddPartyDialog';
 import { ImportDialog } from '../components/ImportDialog';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
-const DEFAULT_COMPANY_CODE = '1000';
 const DEFAULT_PAGE_SIZE = 10;
 
 /**
@@ -48,6 +48,7 @@ const downloadTemplate = async () => {
 
 export const ManagePartyPage = () => {
   const navigate = useNavigate();
+  const { companyCode } = useSelectedEntity();
   const [searchQuery, setSearchQuery] = useState('');
   const [appliedSearch, setAppliedSearch] = useState('');
   const [page, setPage] = useState(1);
@@ -63,7 +64,7 @@ export const ManagePartyPage = () => {
     isLoading,
     isError,
     error,
-  } = useVendors(DEFAULT_COMPANY_CODE, filters, page, pageSize);
+  } = useVendors(companyCode, filters, page, pageSize);
 
   const { triggerExport } = useExportVendors();
 
@@ -87,7 +88,7 @@ export const ManagePartyPage = () => {
   };
 
   const handleExport = () => {
-    triggerExport(DEFAULT_COMPANY_CODE, 'excel');
+    triggerExport(companyCode, 'excel');
   };
 
   const moreActionsItems = [

@@ -10,6 +10,7 @@ import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
 import { useForm, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import { z } from 'zod';
 import { useCreateVendor } from '../hooks/useVendors';
 
@@ -38,8 +39,6 @@ const STATUS_OPTIONS = [
   { label: 'Inactive', value: 'Inactive' },
 ];
 
-const DEFAULT_COMPANY_CODE = '1000';
-
 interface AddPartyDialogProps {
   visible: boolean;
   onHide: () => void;
@@ -47,6 +46,7 @@ interface AddPartyDialogProps {
 
 export const AddPartyDialog = ({ visible, onHide }: AddPartyDialogProps) => {
   const createVendor = useCreateVendor();
+  const { companyCode } = useSelectedEntity();
 
   const {
     control,
@@ -79,7 +79,7 @@ export const AddPartyDialog = ({ visible, onHide }: AddPartyDialogProps) => {
     createVendor.mutate(
       {
         vendor_code: data.partyCode,
-        company_code: DEFAULT_COMPANY_CODE,
+        company_code: companyCode,
         name: data.partyName,
         pan: data.pan || undefined,
         gstin: data.gstin || undefined,

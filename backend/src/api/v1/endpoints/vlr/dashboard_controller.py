@@ -231,7 +231,6 @@ async def get_recent_confirmations(
             PortalSignOffModel.case_id,
             PortalSignOffModel.signed_at,
             PortalSignOffModel.statement_version,
-            PortalSignOffModel.confirmation_text,
             VendorModel.name.label("vendor_name"),
         )
         .join(
@@ -275,7 +274,7 @@ async def get_recent_confirmations(
             vendor_name=row.vendor_name,
             signed_at=row.signed_at,
             statement_version=row.statement_version,
-            confirmation_text=row.confirmation_text,
+            confirmation_text="",
         )
         for row in rows
     ]

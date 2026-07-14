@@ -13,6 +13,7 @@ Requirements: 7.3, 7.4, 7.9, 11.3
 
 from datetime import timedelta
 from uuid import UUID
+import logging
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,8 @@ from src.api.v1.schemas.vlr.approval_schemas import (
     PendingApprovalCaseResponse,
     PendingApprovalsListResponse,
     RejectRequest,
+    SubmitForApprovalRequest,
+    SubmitForApprovalResponse,
 )
 from src.domain.entities.user import User
 from src.domain.services.vlr.approval_engine_service import ApprovalEngineService
@@ -60,6 +63,8 @@ from src.infrastructure.database.repositories.vlr.audit_trail_repository_impl im
 )
 
 router = APIRouter(prefix="/vlr/approvals", tags=["VLR - Approval Workflow"])
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -98,6 +103,55 @@ def _get_approval_service(
 # ──────────────────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/submit",
+    response_model=SubmitForApprovalResponse,
+    summary="Submit a reconciliation case for approval",
+    dependencies=[Depends(require_permission("vlr.cases.submit"))],
+)
+async def submit_for_approval(
+    request: SubmitForApprovalRequest,
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    current_user: User = Depends(get_current_active_user),
+    service: ApprovalEngineService = Depends(_get_approval_service),
+    session: AsyncSession = Depends(get_db_session),
+) -> SubmitForApprovalResponse:
+    """
+    POST /api/v1/vlr/approvals/submit
+
+    Submit a reconciliation case for manager approval. The case must be in
+    'review' status and have a zero Row_10 balance (net difference).
+
+    Requirement 21: End-to-End Flow — Submit for Approval.
+    """
+    result = await service.submit_for_approval(
+        case_id=request.case_id,
+        submitted_by=current_user.id,
+        company_code=company_code,
+    )
+
+    # Emit audit event for submission
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username=current_user.username or str(current_user.id),
+        actor_id=current_user.id,
+        event_type=AuditEventType.APPROVAL,
+        case_id=request.case_id,
+        event_details={
+            "decision": "submitted",
+            "comments": request.comments,
+            "approval_level": result.approval_level,
+        },
+    ))
+
+    return SubmitForApprovalResponse(
+        approval_id=result.approval_id,
+        case_id=result.case_id,
+        status="pending_approval",
+        message="Case successfully submitted for approval.",
+    )
 
 
 @router.get(
@@ -154,11 +208,13 @@ async def approve_case(
     POST /api/v1/vlr/approvals/{id}/approve
 
     Approves a reconciliation case pending approval.
+    After approval, auto-triggers the portal sign-off email to the vendor.
 
     Requirement 7.4: Manager can approve a submitted case.
     Requirement 7.6: Transition to Sign Off stage.
     Requirement 7.7: Require senior approval if write-off exceeds threshold.
     Requirement 7.8: Record decision in audit log.
+    Requirement 22: Auto-trigger sign-off request after approval.
     """
     result = await service.approve(
         case_id=case_id,
@@ -180,6 +236,37 @@ async def approve_case(
             "approval_level": result.approval_level,
         },
     ))
+
+    # Auto-trigger portal sign-off email after approval (Requirement 22)
+    # Dispatches as a non-blocking Celery task so the response is not delayed.
+    try:
+        from src.infrastructure.tasks.vlr.notification_tasks import (
+            send_notification_task,
+        )
+
+        send_notification_task.delay(
+            case_id=str(case_id),
+            notification_type="sign_off_request",
+            recipient_email="",  # Resolved by the task from case vendor contact
+            triggered_by=current_user.username or str(current_user.id),
+            company_code=company_code,
+            context_data={
+                "case_id": str(case_id),
+                "approved_by": current_user.username or str(current_user.id),
+            },
+        )
+        logger.info(
+            "Auto-triggered portal sign-off email after approval: case_id=%s",
+            str(case_id),
+        )
+    except Exception as e:
+        # Log the failure but don't block the approval response.
+        # The sign-off can be triggered manually if the async dispatch fails.
+        logger.warning(
+            "Failed to auto-trigger portal sign-off email: case_id=%s, error=%s",
+            str(case_id),
+            str(e),
+        )
 
     return ApprovalResponse(
         approval_id=result.approval_id,

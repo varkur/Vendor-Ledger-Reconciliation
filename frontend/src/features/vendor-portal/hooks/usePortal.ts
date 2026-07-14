@@ -16,14 +16,21 @@ import { useState } from 'react';
 
 import {
   getStatement,
+  getReconciliationStatus,
+  raiseDispute,
+  requestNewLink,
   signOffCase,
   uploadStatement,
   validateToken,
   type PortalApiError,
   type PortalCaseSignOffResponse,
+  type PortalDisputeRequest,
+  type PortalDisputeResponse,
+  type PortalReconciliationStatusResponse,
   type PortalSignOffRequest,
   type PortalStatementResultResponse,
   type PortalUploadResponse,
+  type RequestNewLinkResponse,
   type ValidateTokenResponse,
 } from '../api/portalApi';
 
@@ -82,6 +89,39 @@ export function usePortalUpload(portalToken: string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Reconciliation Status Polling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Query hook to poll reconciliation processing status after upload.
+ * Polls every 5 seconds while enabled. Stops when status is 'completed' or 'error'.
+ */
+export function useReconciliationStatus(
+  caseId: string | null,
+  portalToken: string | null,
+  enabled: boolean
+) {
+  return useQuery<
+    PortalReconciliationStatusResponse,
+    AxiosError<PortalApiError>
+  >({
+    queryKey: [PORTAL_QUERY_KEY, 'reconciliation-status', caseId],
+    queryFn: () => getReconciliationStatus(caseId!, portalToken!),
+    enabled: !!caseId && !!portalToken && enabled,
+    refetchInterval: (query) => {
+      // Stop polling once completed or error
+      const status = query.state.data?.status;
+      if (status === 'completed' || status === 'error') {
+        return false;
+      }
+      return 5000; // Poll every 5 seconds
+    },
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 5000),
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Statement Retrieval
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -123,5 +163,47 @@ export function usePortalSignOff(
   >({
     mutationFn: (data: PortalSignOffRequest) =>
       signOffCase(caseId!, data, portalToken!),
+  });
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request New Link
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Mutation hook to request a new portal access link.
+ * Used on the auth page when the vendor's link is expired.
+ */
+export function useRequestNewLink() {
+  return useMutation<
+    RequestNewLinkResponse,
+    AxiosError<PortalApiError>,
+    string
+  >({
+    mutationFn: (email: string) => requestNewLink({ email }),
+    retry: false,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Raise Dispute
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Mutation hook to raise a dispute on reconciliation results.
+ * Used on the statement page when the vendor disagrees with results.
+ */
+export function useRaiseDispute(
+  caseId: string | null,
+  portalToken: string | null
+) {
+  return useMutation<
+    PortalDisputeResponse,
+    AxiosError<PortalApiError>,
+    PortalDisputeRequest
+  >({
+    mutationFn: (data: PortalDisputeRequest) =>
+      raiseDispute(caseId!, data, portalToken!),
   });
 }

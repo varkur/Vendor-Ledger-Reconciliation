@@ -13,8 +13,7 @@ import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { useVendor, useUpdateVendor } from '../hooks/useVendors';
 import { VendorContactResponse } from '../api/vendorApi';
-
-const DEFAULT_COMPANY_CODE = '1000';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 const PARTY_TYPE_OPTIONS = [
   { label: 'Vendor', value: 'vendor' },
@@ -69,7 +68,8 @@ interface ErpCodeRow {
 export const EditPartyPage = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { data: vendor, isLoading } = useVendor(id, DEFAULT_COMPANY_CODE);
+  const { companyCode } = useSelectedEntity();
+  const { data: vendor, isLoading } = useVendor(id, companyCode);
   const updateVendorMutation = useUpdateVendor();
 
   // Top section form state
@@ -157,7 +157,7 @@ export const EditPartyPage = () => {
             phone: c.phone || undefined,
           })),
         },
-        companyCode: DEFAULT_COMPANY_CODE,
+        companyCode: companyCode,
       },
       {
         onSuccess: () => {

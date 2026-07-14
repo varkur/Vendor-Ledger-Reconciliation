@@ -3,30 +3,48 @@
  * Loads data from the backend API instead of using mock data.
  *
  * Connects to: GET /api/v1/vlr/portal/statement/{case_id} (with X-Portal-Token header)
- * Requirements: 24.3
+ * Requirements: 24.3, 8
  */
 
+import { useRef, useState } from 'react';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Tag } from 'primereact/tag';
 import { Button } from 'primereact/button';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
+import { Dialog } from 'primereact/dialog';
+import { InputTextarea } from 'primereact/inputtextarea';
+import { FileUpload, type FileUploadSelectEvent } from 'primereact/fileupload';
+import { Toast } from 'primereact/toast';
+import { Tooltip } from 'primereact/tooltip';
 import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 
-import { usePortalStatement } from './hooks/usePortal';
+import { usePortalStatement, useRaiseDispute, PORTAL_QUERY_KEY } from './hooks/usePortal';
 import { usePortalContext } from './context/PortalContext';
 import type { MatchSummaryItem } from './api/portalApi';
 
 export const PortalStatementPage = () => {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const toast = useRef<Toast>(null);
   const { portalToken, caseInfo, isAuthenticated } = usePortalContext();
+
+  // Dispute dialog state
+  const [disputeDialogVisible, setDisputeDialogVisible] = useState(false);
+  const [disputeReason, setDisputeReason] = useState('');
+  const [disputeAttachment, setDisputeAttachment] = useState<File | null>(null);
+  const [reasonError, setReasonError] = useState('');
+  const [isDisputed, setIsDisputed] = useState(false);
 
   const caseId = caseInfo?.case_id || null;
   const { data: statement, isLoading, error, refetch } = usePortalStatement(
     caseId,
     portalToken
   );
+
+  const disputeMutation = useRaiseDispute(caseId, portalToken);
 
   // Redirect to auth if not authenticated
   if (!isAuthenticated || !portalToken) {
@@ -133,10 +151,104 @@ export const PortalStatementPage = () => {
     pending_approval: 'warning',
     data_received: 'info',
     initiated: 'info',
+    disputed: 'danger',
   };
+
+  // Determine if disputed (from API status or local state after successful submission)
+  const caseIsDisputed = isDisputed || statement.status === 'disputed';
+
+  // Determine displayed status
+  const displayStatus = caseIsDisputed ? 'disputed' : statement.status;
+
+  // Sign-off is only allowed when the case is in certain statuses
+  const SIGN_OFF_ALLOWED_STATUSES = ['matched', 'review_complete', 'awaiting_signoff'];
+  const canProceedToSignOff = !caseIsDisputed && SIGN_OFF_ALLOWED_STATUSES.includes(statement.status);
+
+  const getSignOffDisabledReason = (): string => {
+    if (caseIsDisputed) {
+      return 'Sign-off is not available because a dispute has been raised on this reconciliation.';
+    }
+    return 'Sign-off is not available yet. The reconciliation must be in "Matched" or "Review Complete" state before you can proceed.';
+  };
+
+  const handleOpenDisputeDialog = () => {
+    setDisputeReason('');
+    setDisputeAttachment(null);
+    setReasonError('');
+    setDisputeDialogVisible(true);
+  };
+
+  const handleSubmitDispute = () => {
+    // Validate reason
+    if (!disputeReason.trim()) {
+      setReasonError('Reason is required');
+      return;
+    }
+    setReasonError('');
+
+    disputeMutation.mutate(
+      { reason: disputeReason.trim(), attachment: disputeAttachment || undefined },
+      {
+        onSuccess: () => {
+          setDisputeDialogVisible(false);
+          setIsDisputed(true);
+          toast.current?.show({
+            severity: 'success',
+            summary: 'Dispute Raised',
+            detail: 'Your dispute has been submitted successfully. The reconciliation team will review it.',
+            life: 5000,
+          });
+          // Invalidate statement query to refresh status
+          queryClient.invalidateQueries({ queryKey: [PORTAL_QUERY_KEY, 'statement', caseId] });
+        },
+        onError: (err) => {
+          const detail = err.response?.data?.detail || 'Failed to submit dispute. Please try again.';
+          toast.current?.show({
+            severity: 'error',
+            summary: 'Error',
+            detail,
+            life: 5000,
+          });
+        },
+      }
+    );
+  };
+
+  const handleFileSelect = (e: FileUploadSelectEvent) => {
+    const file = e.files?.[0];
+    if (file) {
+      setDisputeAttachment(file);
+    }
+  };
+
+  const handleFileClear = () => {
+    setDisputeAttachment(null);
+  };
+
+  const disputeDialogFooter = (
+    <div className="flex justify-content-end gap-2">
+      <Button
+        label="Cancel"
+        icon="pi pi-times"
+        severity="secondary"
+        outlined
+        onClick={() => setDisputeDialogVisible(false)}
+        disabled={disputeMutation.isPending}
+      />
+      <Button
+        label="Submit Dispute"
+        icon="pi pi-send"
+        severity="danger"
+        onClick={handleSubmitDispute}
+        loading={disputeMutation.isPending}
+      />
+    </div>
+  );
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px' }}>
+      <Toast ref={toast} />
+
       {/* Header */}
       <div className="flex align-items-center justify-content-between mb-3">
         <div>
@@ -147,14 +259,35 @@ export const PortalStatementPage = () => {
         </div>
         <div className="flex gap-2 align-items-center">
           <Tag
-            value={statement.status.replace(/_/g, ' ').toUpperCase()}
-            severity={statusSeverity[statement.status] || 'info'}
+            value={displayStatus.replace(/_/g, ' ').toUpperCase()}
+            severity={statusSeverity[displayStatus] || 'info'}
           />
           <Button
-            label="Proceed to Sign-Off"
-            icon="pi pi-check"
-            onClick={() => navigate('/portal/sign-off')}
+            label="Raise Dispute"
+            icon="pi pi-exclamation-circle"
+            severity="danger"
+            outlined
+            onClick={handleOpenDisputeDialog}
+            disabled={caseIsDisputed}
           />
+          <span
+            id="sign-off-btn-wrapper"
+            className="inline-block"
+          >
+            <Button
+              label="Proceed to Sign-Off"
+              icon="pi pi-check"
+              onClick={() => navigate('/portal/sign-off')}
+              disabled={!canProceedToSignOff}
+            />
+          </span>
+          {!canProceedToSignOff && (
+            <Tooltip
+              target="#sign-off-btn-wrapper"
+              content={getSignOffDisabledReason()}
+              position="left"
+            />
+          )}
         </div>
       </div>
 
@@ -260,6 +393,57 @@ export const PortalStatementPage = () => {
           </p>
         </div>
       )}
+
+      {/* Raise Dispute Dialog */}
+      <Dialog
+        header="Raise Dispute"
+        visible={disputeDialogVisible}
+        onHide={() => setDisputeDialogVisible(false)}
+        style={{ width: '500px' }}
+        footer={disputeDialogFooter}
+        closable={!disputeMutation.isPending}
+      >
+        <div className="flex flex-column gap-3">
+          <div>
+            <label htmlFor="dispute-reason" className="block mb-2 font-semibold">
+              Reason for Dispute <span style={{ color: 'var(--color-error)' }}>*</span>
+            </label>
+            <InputTextarea
+              id="dispute-reason"
+              value={disputeReason}
+              onChange={(e) => {
+                setDisputeReason(e.target.value);
+                if (reasonError) setReasonError('');
+              }}
+              rows={5}
+              placeholder="Please describe why you are disputing the reconciliation results..."
+              className={`w-full ${reasonError ? 'p-invalid' : ''}`}
+              disabled={disputeMutation.isPending}
+            />
+            {reasonError && (
+              <small className="p-error">{reasonError}</small>
+            )}
+          </div>
+          <div>
+            <label className="block mb-2 font-semibold">
+              Supporting Document (Optional)
+            </label>
+            <FileUpload
+              mode="basic"
+              accept=".pdf,.xlsx,.xls,.csv,.doc,.docx,.png,.jpg,.jpeg"
+              maxFileSize={10 * 1024 * 1024}
+              chooseLabel={disputeAttachment ? disputeAttachment.name : 'Choose File'}
+              onSelect={handleFileSelect}
+              onClear={handleFileClear}
+              auto={false}
+              disabled={disputeMutation.isPending}
+            />
+            <small style={{ color: 'var(--color-text-muted)', display: 'block', marginTop: 4 }}>
+              Max 10MB. Accepted formats: PDF, Excel, CSV, Word, Images
+            </small>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 };

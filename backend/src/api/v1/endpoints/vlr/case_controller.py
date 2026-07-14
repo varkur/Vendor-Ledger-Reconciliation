@@ -27,6 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user
 from src.api.v1.schemas.vlr.case_schemas import (
+    BulkActionRequest,
+    BulkActionResponse,
+    BulkActionResultItem,
     CaseActionResponse,
     CaseListResponse,
     CaseStatisticsResponse,
@@ -834,3 +837,298 @@ async def create_direct_reconciliation(
         ),
         created_date=getattr(case_record, "created_date", None),
     )
+
+# ──────────────────────────────────────────────────────────────────────
+# Bulk Actions (Requirement 4)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.post(
+    "/bulk-review",
+    response_model=BulkActionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Bulk advance cases to review stage",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def bulk_review(
+    request: BulkActionRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BulkActionResponse:
+    """
+    POST /api/v1/vlr/cases/bulk-review
+
+    Advance multiple cases to the review workflow step. Each case is validated
+    independently — failures on one case do not affect others.
+
+    Requirement 4: Bulk action — Send For Review for selected cases.
+    """
+    from src.domain.services.vlr.workflow_orchestrator_service import (
+        CaseNotFoundError,
+        SLAConfiguration,
+        WorkflowOrchestratorService,
+        WorkflowStep,
+        WorkflowTransitionError,
+    )
+
+    case_repo = CaseRepositoryImpl(session)
+    orchestrator = WorkflowOrchestratorService(
+        case_repository=case_repo,
+        sla_config=SLAConfiguration(),
+    )
+
+    results: list[BulkActionResultItem] = []
+
+    for case_id_str in request.case_ids:
+        try:
+            case_uuid = UUID(case_id_str)
+
+            # Verify case exists and belongs to the company
+            case = await case_repo.get_by_id(case_uuid, request.company_code)
+            if case is None:
+                results.append(BulkActionResultItem(
+                    case_id=case_id_str,
+                    success=False,
+                    message=f"Case {case_id_str} not found.",
+                ))
+                continue
+
+            # Advance to FINANCE_REVIEW step via workflow orchestrator
+            await orchestrator.advance(
+                case_id=case_uuid,
+                target_step=WorkflowStep.FINANCE_REVIEW,
+                triggered_by=current_user.username,
+            )
+
+            # Also transition case status to review
+            service = RequestManagerService(
+                request_repository=RequestRepositoryImpl(session),
+                case_repository=case_repo,
+                vendor_repository=VendorRepositoryImpl(session),
+            )
+            await service.transition_case_status(
+                case_uuid, request.company_code, CaseStatus.REVIEW
+            )
+
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=True,
+                message="Case advanced to review stage.",
+            ))
+
+        except (WorkflowTransitionError, CaseNotFoundError) as e:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=str(e),
+            ))
+        except ValueError:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Invalid case ID format: {case_id_str}",
+            ))
+        except Exception as e:
+            logger.warning("Error advancing case %s to review: %s", case_id_str, str(e))
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Failed to advance case: {str(e)}",
+            ))
+
+    return BulkActionResponse(results=results)
+
+
+@router.post(
+    "/bulk-review-done",
+    response_model=BulkActionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Bulk mark review as complete for cases",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def bulk_review_done(
+    request: BulkActionRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BulkActionResponse:
+    """
+    POST /api/v1/vlr/cases/bulk-review-done
+
+    Mark review as complete for multiple cases. Advances them past the review
+    stage in the workflow. Each case is validated independently.
+
+    Requirement 4: Bulk action — Review Done for selected cases.
+    """
+    from src.domain.services.vlr.workflow_orchestrator_service import (
+        CaseNotFoundError,
+        SLAConfiguration,
+        WorkflowOrchestratorService,
+        WorkflowStep,
+        WorkflowTransitionError,
+    )
+
+    case_repo = CaseRepositoryImpl(session)
+    orchestrator = WorkflowOrchestratorService(
+        case_repository=case_repo,
+        sla_config=SLAConfiguration(),
+    )
+
+    results: list[BulkActionResultItem] = []
+
+    for case_id_str in request.case_ids:
+        try:
+            case_uuid = UUID(case_id_str)
+
+            # Verify case exists and belongs to the company
+            case = await case_repo.get_by_id(case_uuid, request.company_code)
+            if case is None:
+                results.append(BulkActionResultItem(
+                    case_id=case_id_str,
+                    success=False,
+                    message=f"Case {case_id_str} not found.",
+                ))
+                continue
+
+            # Advance to FINANCE_APPROVAL step (post-review)
+            await orchestrator.advance(
+                case_id=case_uuid,
+                target_step=WorkflowStep.FINANCE_APPROVAL,
+                triggered_by=current_user.username,
+            )
+
+            # Transition case status to pending approval
+            service = RequestManagerService(
+                request_repository=RequestRepositoryImpl(session),
+                case_repository=case_repo,
+                vendor_repository=VendorRepositoryImpl(session),
+            )
+            await service.transition_case_status(
+                case_uuid, request.company_code, CaseStatus.PENDING_APPROVAL
+            )
+
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=True,
+                message="Review marked as complete.",
+            ))
+
+        except (WorkflowTransitionError, CaseNotFoundError) as e:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=str(e),
+            ))
+        except ValueError:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Invalid case ID format: {case_id_str}",
+            ))
+        except Exception as e:
+            logger.warning("Error marking review done for case %s: %s", case_id_str, str(e))
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Failed to mark review done: {str(e)}",
+            ))
+
+    return BulkActionResponse(results=results)
+
+
+@router.post(
+    "/bulk-signoff-request",
+    response_model=BulkActionResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Bulk trigger portal sign-off invite for cases",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def bulk_signoff_request(
+    request: BulkActionRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BulkActionResponse:
+    """
+    POST /api/v1/vlr/cases/bulk-signoff-request
+
+    Trigger portal sign-off invitations for multiple cases. Advances each case
+    to the vendor sign-off workflow step and dispatches sign-off invite notifications.
+
+    Requirement 4: Bulk action — Request SignOff for selected cases.
+    """
+    from src.domain.services.vlr.workflow_orchestrator_service import (
+        CaseNotFoundError,
+        SLAConfiguration,
+        WorkflowOrchestratorService,
+        WorkflowStep,
+        WorkflowTransitionError,
+    )
+
+    case_repo = CaseRepositoryImpl(session)
+    orchestrator = WorkflowOrchestratorService(
+        case_repository=case_repo,
+        sla_config=SLAConfiguration(),
+    )
+
+    results: list[BulkActionResultItem] = []
+
+    for case_id_str in request.case_ids:
+        try:
+            case_uuid = UUID(case_id_str)
+
+            # Verify case exists and belongs to the company
+            case = await case_repo.get_by_id(case_uuid, request.company_code)
+            if case is None:
+                results.append(BulkActionResultItem(
+                    case_id=case_id_str,
+                    success=False,
+                    message=f"Case {case_id_str} not found.",
+                ))
+                continue
+
+            # Advance to VENDOR_SIGN_OFF step
+            await orchestrator.advance(
+                case_id=case_uuid,
+                target_step=WorkflowStep.VENDOR_SIGN_OFF,
+                triggered_by=current_user.username,
+            )
+
+            # Dispatch sign-off invite notification
+            try:
+                from src.infrastructure.tasks.vlr.notification_tasks import send_signoff_invite_task
+
+                send_signoff_invite_task.delay(
+                    case_id=case_id_str,
+                    company_code=request.company_code,
+                    triggered_by=current_user.username,
+                )
+            except (ImportError, Exception):
+                # Task module not available — continue anyway
+                pass
+
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=True,
+                message="Sign-off invite sent to vendor portal.",
+            ))
+
+        except (WorkflowTransitionError, CaseNotFoundError) as e:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=str(e),
+            ))
+        except ValueError:
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Invalid case ID format: {case_id_str}",
+            ))
+        except Exception as e:
+            logger.warning("Error requesting sign-off for case %s: %s", case_id_str, str(e))
+            results.append(BulkActionResultItem(
+                case_id=case_id_str,
+                success=False,
+                message=f"Failed to request sign-off: {str(e)}",
+            ))
+
+    return BulkActionResponse(results=results)

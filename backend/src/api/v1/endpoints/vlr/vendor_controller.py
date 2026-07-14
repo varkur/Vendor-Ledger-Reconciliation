@@ -27,6 +27,7 @@ from src.api.v1.schemas.vlr.vendor_schemas import (
     BulkImportRowErrorResponse,
     CreateVendorRequest,
     UpdateVendorRequest,
+    VendorContactResponse,
     VendorListResponse,
     VendorResponse,
 )
@@ -231,6 +232,31 @@ async def export_vendors(
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=vendors.csv"},
         )
+
+
+@router.get(
+    "/{vendor_id}/contacts",
+    response_model=list[VendorContactResponse],
+    summary="Get contacts for a vendor",
+    dependencies=[Depends(require_permission("vlr.vendors.read"))],
+)
+async def get_vendor_contacts(
+    vendor_id: UUID,
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    service: VendorService = Depends(_get_vendor_service),
+) -> list[VendorContactResponse]:
+    """
+    GET /api/v1/vlr/vendors/{vendor_id}/contacts
+
+    Returns a list of contacts associated with the given vendor.
+    Used to populate the Contact Person dropdown on the Request Statement page.
+
+    Requirements: 10
+    """
+    # Verify vendor exists (this will raise 404 if not found)
+    vendor = await service.get_vendor(vendor_id, company_code)
+    contacts = getattr(vendor, "contacts", [])
+    return [VendorContactResponse.model_validate(c) for c in contacts]
 
 
 @router.get(

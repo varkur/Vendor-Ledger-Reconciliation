@@ -359,6 +359,34 @@ class EnhancedExceptionReport:
     total_amount: Decimal = Decimal("0.00")
 
 
+# ─── Aggregate Reconciliation Summary ────────────────────────────────────────
+
+
+@dataclass
+class AggregateRecoSummaryRow:
+    """A single row in the aggregate reconciliation summary across all cases."""
+
+    id: str = ""
+    vendor_name: str = ""
+    opening_balance: Decimal = Decimal("0.00")
+    invoices: Decimal = Decimal("0.00")
+    payments: Decimal = Decimal("0.00")
+    adjustments: Decimal = Decimal("0.00")
+    closing_balance: Decimal = Decimal("0.00")
+    difference: Decimal = Decimal("0.00")
+    status: str = ""
+
+
+@dataclass
+class AggregateReconciliationSummaryResult:
+    """Paginated aggregate reconciliation summary result."""
+
+    items: list[AggregateRecoSummaryRow] = field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
 # ─── Export Report Record ─────────────────────────────────────────────────────
 
 
@@ -437,6 +465,121 @@ class ReportService:
         for key in keys_to_remove:
             del self._cache[key]
 
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Aggregate Reconciliation Summary (Requirement 16)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def generate_aggregate_reconciliation_summary(
+        self,
+        company_code: str,
+        page: int = 1,
+        page_size: int = 20,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> AggregateReconciliationSummaryResult:
+        """
+        Generate an aggregate reconciliation summary across all cases
+        for the specified company_code.
+
+        Returns paginated rows with vendor_name, opening_balance, invoices,
+        payments, adjustments, closing_balance, difference, and status.
+
+        Requirement 16: Reports Page — Reconciliation Summary.
+        """
+        from src.infrastructure.database.models.vlr.reconciliation_case_model import (
+            ReconciliationCaseModel,
+        )
+        from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+        from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+            ReconciliationRequestModel,
+        )
+
+        # Use the case repository's underlying session for the custom query
+        session = self._case_repo._session  # type: ignore[attr-defined]
+
+        from sqlalchemy import select, func, and_
+
+        # Build base query joining cases with vendors and requests
+        base_conditions = [
+            ReconciliationRequestModel.company_code == company_code,
+            ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+        ]
+
+        if date_from:
+            base_conditions.append(
+                func.date(ReconciliationCaseModel.created_date) >= date_from
+            )
+        if date_to:
+            base_conditions.append(
+                func.date(ReconciliationCaseModel.created_date) <= date_to
+            )
+
+        base_stmt = (
+            select(ReconciliationCaseModel, VendorModel.name.label("vendor_name"))
+            .join(
+                ReconciliationRequestModel,
+                ReconciliationCaseModel.request_id == ReconciliationRequestModel.id,
+            )
+            .join(
+                VendorModel,
+                ReconciliationCaseModel.vendor_id == VendorModel.id,
+            )
+            .where(and_(*base_conditions))
+        )
+
+        # Count total
+        count_stmt = select(func.count()).select_from(base_stmt.subquery())
+        total = (await session.execute(count_stmt)).scalar_one()
+
+        # Paginated data query
+        offset = (page - 1) * page_size
+        data_stmt = (
+            base_stmt.order_by(ReconciliationCaseModel.created_date.desc())
+            .offset(offset)
+            .limit(page_size)
+        )
+        result = await session.execute(data_stmt)
+        rows = result.all()
+
+        items: list[AggregateRecoSummaryRow] = []
+        for row in rows:
+            case = row[0]  # ReconciliationCaseModel
+            vendor_name = row[1]  # vendor_name from join
+
+            # Compute balances from the case model fields
+            opening_balance = Decimal(str(case.company_opening_balance or 0))
+            closing_balance = Decimal(str(case.company_closing_balance or 0))
+            difference = Decimal(str(case.net_difference or 0))
+
+            # Invoices, payments, adjustments are derived from the balance difference
+            # (opening → closing). Without separate tracked columns, approximate from
+            # closing - opening. In production, these would come from ledger aggregates.
+            balance_change = closing_balance - opening_balance
+            invoices = balance_change if balance_change > 0 else Decimal("0.00")
+            payments = abs(balance_change) if balance_change < 0 else Decimal("0.00")
+            adjustments = Decimal("0.00")  # Adjustments tracked separately if available
+
+            items.append(
+                AggregateRecoSummaryRow(
+                    id=str(case.id),
+                    vendor_name=vendor_name,
+                    opening_balance=opening_balance,
+                    invoices=invoices,
+                    payments=payments,
+                    adjustments=adjustments,
+                    closing_balance=closing_balance,
+                    difference=difference,
+                    status=case.status or "",
+                )
+            )
+
+        return AggregateReconciliationSummaryResult(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Reconciliation Summary Report (Requirements 27.1, 27.2)
