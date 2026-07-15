@@ -179,20 +179,34 @@ class VendorRepositoryImpl(IVendorRepository):
     @staticmethod
     def _build_filter_conditions(filters: VendorFilters | None) -> list:
         """Build SQLAlchemy filter conditions from VendorFilters."""
+        from sqlalchemy import or_
+
         conditions = []
         if filters is None:
             return conditions
 
-        if filters.vendor_code:
-            conditions.append(VendorModel.vendor_code.ilike(f"%{filters.vendor_code}%"))
-        if filters.name:
-            conditions.append(VendorModel.name.ilike(f"%{filters.name}%"))
+        # If generic search is provided, use OR across vendor_code and name
+        if filters.search:
+            search_term = f"%{filters.search}%"
+            conditions.append(
+                or_(
+                    VendorModel.vendor_code.ilike(search_term),
+                    VendorModel.name.ilike(search_term),
+                    VendorModel.pan.ilike(search_term),
+                )
+            )
+        else:
+            if filters.vendor_code:
+                conditions.append(VendorModel.vendor_code.ilike(f"%{filters.vendor_code}%"))
+            if filters.name:
+                conditions.append(VendorModel.name.ilike(f"%{filters.name}%"))
+            if filters.pan:
+                conditions.append(VendorModel.pan.ilike(f"%{filters.pan}%"))
+
         if filters.status:
-            conditions.append(VendorModel.status == filters.status)
+            conditions.append(VendorModel.status.ilike(filters.status))
         if filters.city:
             conditions.append(VendorModel.city.ilike(f"%{filters.city}%"))
-        if filters.pan:
-            conditions.append(VendorModel.pan.ilike(f"%{filters.pan}%"))
 
         return conditions
 
@@ -221,6 +235,16 @@ class VendorRepositoryImpl(IVendorRepository):
         await self._session.execute(stmt)
         await self._session.flush()
 
+    async def remove_all_contacts(self, vendor_id: UUID) -> None:
+        """Remove ALL contacts for a vendor regardless of source."""
+        from sqlalchemy import delete
+
+        stmt = delete(VendorContactModel).where(
+            VendorContactModel.vendor_id == vendor_id
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+
     async def get_contacts(self, vendor_id: UUID) -> list[VendorContactModel]:
         """Get all contacts for a vendor."""
         stmt = select(VendorContactModel).where(
@@ -228,3 +252,17 @@ class VendorRepositoryImpl(IVendorRepository):
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def update_contact(self, contact_id: UUID, update_data: dict) -> VendorContactModel:
+        """Update a single contact record by ID."""
+        stmt = select(VendorContactModel).where(VendorContactModel.id == contact_id)
+        result = await self._session.execute(stmt)
+        model = result.scalar_one_or_none()
+        if model is None:
+            raise ValueError(f"Contact with id {contact_id} not found")
+
+        for key, value in update_data.items():
+            setattr(model, key, value)
+
+        await self._session.flush()
+        return model

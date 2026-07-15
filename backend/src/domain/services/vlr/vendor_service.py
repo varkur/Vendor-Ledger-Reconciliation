@@ -223,8 +223,8 @@ class VendorService:
 
         # Handle contact updates if provided
         if data.contacts is not None:
-            # Replace manual contacts with the new set
-            await self._vendor_repo.remove_contacts_by_source(vendor_id, "manual")
+            # Replace ALL contacts with the new set (user explicitly provided the full list)
+            await self._vendor_repo.remove_all_contacts(vendor_id)
             contact_dicts = [
                 {
                     "name": c.name,
@@ -232,7 +232,7 @@ class VendorService:
                     "phone": c.phone,
                     "designation": c.designation,
                     "is_primary": c.is_primary,
-                    "source": c.source,
+                    "source": "manual",
                 }
                 for c in data.contacts
             ]
@@ -399,35 +399,85 @@ class VendorService:
                 seen_codes.add(code)
                 deduplicated_rows.append(row_data)
 
-        # Check for existing vendor codes in database
-        final_rows: list[dict] = []
+        # Separate rows into new vendors and existing vendors (for upsert)
+        new_rows: list[dict] = []
+        update_rows: list[dict] = []
         for row_data in deduplicated_rows:
-            exists = await self._vendor_repo.exists_by_vendor_code(
+            existing_vendor = await self._vendor_repo.get_by_vendor_code(
                 row_data["vendor_code"], company_code
             )
-            if exists:
-                # Find row number for error reporting
-                for idx, original_row in enumerate(rows, start=1):
-                    if str(original_row.get("vendor_code", "")).strip() == row_data["vendor_code"]:
-                        errors.append(
-                            BulkImportRowError(
-                                row_number=idx,
-                                vendor_code=row_data["vendor_code"],
-                                errors=[
-                                    f"Vendor code '{row_data['vendor_code']}' already exists"
-                                ],
-                            )
-                        )
-                        break
+            if existing_vendor:
+                row_data["_existing_vendor"] = existing_vendor
+                update_rows.append(row_data)
             else:
-                final_rows.append(row_data)
+                new_rows.append(row_data)
 
-        # Bulk create valid rows
-        if final_rows:
+        # Update existing vendors (upsert)
+        for row_data in update_rows:
+            existing_vendor = row_data.pop("_existing_vendor")
+            contacts_list = row_data.pop("_contacts", [])
+            vendor_id = getattr(existing_vendor, "id")
+
+            # Update vendor fields
+            update_data: dict = {}
+            if row_data.get("name"):
+                update_data["name"] = row_data["name"]
+            if row_data.get("status"):
+                update_data["status"] = row_data["status"]
+            if row_data.get("pan"):
+                update_data["pan"] = row_data["pan"]
+            if row_data.get("gstin"):
+                update_data["gstin"] = row_data["gstin"]
+            if row_data.get("city"):
+                update_data["city"] = row_data["city"]
+
+            if update_data:
+                await self._vendor_repo.update(vendor_id, company_code, update_data)
+
+            # Upsert contacts: match on email within the vendor
+            if contacts_list:
+                existing_contacts = await self._vendor_repo.get_contacts(vendor_id)
+                existing_email_map = {
+                    c.email.lower().strip(): c for c in existing_contacts
+                }
+
+                for contact_data in contacts_list:
+                    email = (contact_data.get("email") or "").lower().strip()
+                    if not email:
+                        continue
+
+                    if email in existing_email_map:
+                        # Update existing contact
+                        existing_contact = existing_email_map[email]
+                        await self._vendor_repo.update_contact(
+                            getattr(existing_contact, "id"),
+                            {
+                                "name": contact_data.get("name") or getattr(existing_contact, "name"),
+                                "phone": contact_data.get("phone") or getattr(existing_contact, "phone", None),
+                                "is_primary": contact_data.get("is_primary", getattr(existing_contact, "is_primary", False)),
+                            },
+                        )
+                    else:
+                        # Add new contact
+                        await self._vendor_repo.add_contacts(
+                            vendor_id,
+                            [
+                                {
+                                    "name": contact_data.get("name", "") or "Contact",
+                                    "email": contact_data.get("email", ""),
+                                    "phone": contact_data.get("phone") or None,
+                                    "is_primary": contact_data.get("is_primary", False),
+                                    "source": "import",
+                                }
+                            ],
+                        )
+
+        # Bulk create new vendors
+        if new_rows:
             # Separate contacts from vendor data before bulk_create
             contacts_by_code: dict[str, list[dict]] = {}
             vendor_data_rows = []
-            for row_data in final_rows:
+            for row_data in new_rows:
                 contacts_list = row_data.pop("_contacts", [])
                 if contacts_list:
                     contacts_by_code[row_data["vendor_code"]] = contacts_list
@@ -454,10 +504,11 @@ class VendorService:
                     if contact_dicts:
                         await self._vendor_repo.add_contacts(v_id, contact_dicts)
 
+        total_successful = len(new_rows) + len(update_rows)
         return BulkImportResult(
             total_rows=len(rows),
-            successful=len(final_rows),
-            failed=len(rows) - len(final_rows),
+            successful=total_successful,
+            failed=len(rows) - total_successful,
             errors=errors,
         )
 

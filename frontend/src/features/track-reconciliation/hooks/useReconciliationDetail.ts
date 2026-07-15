@@ -15,6 +15,7 @@ import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 import {
   getBatchCases,
+  getRequestStatistics,
   sendReminder,
   bulkReview,
   bulkReviewDone,
@@ -26,6 +27,7 @@ import {
   type BulkReviewRequest,
   type BulkReviewDoneRequest,
   type BulkSignoffRequestBody,
+  type RequestStatisticsResponse,
 } from '../api/reconciliationDetailApi';
 
 /** Query key prefix for reconciliation detail (batch cases). */
@@ -134,5 +136,26 @@ export function useBulkSignoffRequest(requestId: string) {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [RECO_DETAIL_QUERY_KEY, companyCode, requestId] });
     },
+  });
+}
+
+
+/** Query key prefix for request statistics. */
+export const RECO_STATISTICS_QUERY_KEY = 'vlr-request-statistics';
+
+/**
+ * Hook to fetch enriched statistics for a reconciliation request.
+ * Uses TanStack Query with automatic refetch and retry.
+ */
+export function useRequestStatistics(requestId: string) {
+  const { companyCode } = useSelectedEntity();
+
+  return useQuery<RequestStatisticsResponse, Error>({
+    queryKey: [RECO_STATISTICS_QUERY_KEY, companyCode, requestId],
+    queryFn: () => getRequestStatistics(requestId, companyCode),
+    enabled: !!companyCode && !!requestId,
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+    staleTime: 30_000, // 30 seconds
   });
 }

@@ -21,6 +21,7 @@ Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 5.10, 5.11, 5.12, 5.1
 import difflib
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from enum import IntEnum
 from uuid import UUID, uuid4
@@ -321,7 +322,7 @@ class ReconciliationEngineService:
         )
 
         # Persist results
-        await self._persist_results(case_id, result)
+        await self._persist_results(case_id, result, company_entries, vendor_entries)
 
         duration_ms = (time.perf_counter() - start) * 1000
         _structured_logger.log_success(
@@ -881,7 +882,11 @@ class ReconciliationEngineService:
     # ──────────────────────────────────────────────────────────────────────
 
     async def _persist_results(
-        self, case_id: UUID, result: ReconciliationResult
+        self,
+        case_id: UUID,
+        result: ReconciliationResult,
+        company_entries: list["LedgerEntryData"] | None = None,
+        vendor_entries: list["LedgerEntryData"] | None = None,
     ) -> None:
         """Persist match results and update ledger entries with match metadata."""
         # Persist match pairs (passes 1, 2, 3, 6)
@@ -942,6 +947,16 @@ class ReconciliationEngineService:
         # Persist unmatched entries as exceptions (Pass 7)
         all_unmatched = result.unmatched_company_ids + result.unmatched_vendor_ids
         if all_unmatched:
+            # Build amount lookup from entries
+            amount_lookup: dict[UUID, Decimal] = {}
+            if company_entries:
+                for e in company_entries:
+                    amount_lookup[e.id] = e.amount
+            if vendor_entries:
+                for e in vendor_entries:
+                    amount_lookup[e.id] = e.amount
+
+            today = date.today()
             exceptions_data = []
             for entry_id in all_unmatched:
                 exceptions_data.append({
@@ -949,6 +964,8 @@ class ReconciliationEngineService:
                     "ledger_entry_id": entry_id,
                     "category": "unmatched",
                     "severity": "medium",  # Default; categorization happens later
+                    "amount": float(amount_lookup.get(entry_id, Decimal("0"))),
+                    "first_flagged_date": today,
                     "status": "open",
                 })
             await self._exception_repo.bulk_create(exceptions_data)

@@ -13,7 +13,7 @@ from src.config.settings import settings
 celery_app = Celery(
     "vlr_worker",
     broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_BROKER_URL,
+    backend=getattr(settings, 'CELERY_RESULT_BACKEND', settings.CELERY_BROKER_URL),
 )
 
 celery_app.conf.update(

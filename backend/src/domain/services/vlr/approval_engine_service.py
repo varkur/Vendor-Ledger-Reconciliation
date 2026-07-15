@@ -52,11 +52,10 @@ class ApprovalLevel(str, Enum):
 class CaseStatus(str, Enum):
     """Reconciliation case status values (subset relevant to approval)."""
 
-    REVIEW = "review"
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED = "approved"
-    SIGNED_OFF = "signed_off"
-    CLOSED = "closed"
+    REVIEWED = "reviewed"
+    SIGNOFF_REQUESTED = "signoff_requested"
+    SIGNOFF_COMPLETED = "signoff_completed"
+    RECO_REJECTED = "reco_rejected"
 
 
 class RequestStatus(str, Enum):

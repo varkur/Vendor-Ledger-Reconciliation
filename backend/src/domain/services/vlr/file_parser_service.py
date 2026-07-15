@@ -34,22 +34,52 @@ MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 # Mandatory columns that must exist in uploaded files
 MANDATORY_COLUMNS = frozenset(
-    ["document_number", "amount", "posting_date", "reference_number"]
+    ["posting_date"]
 )
 
 # Default field mapping: maps internal field names to expected CSV/Excel column headers
 # Keys are internal LedgerEntry field names, values are lists of acceptable header names
 DEFAULT_FIELD_MAPPING: dict[str, list[str]] = {
-    "document_number": ["document_number", "doc_number", "doc_no", "belnr"],
-    "amount": ["amount", "amt", "dmbtr", "value"],
-    "posting_date": ["posting_date", "post_date", "budat", "date"],
-    "reference_number": ["reference_number", "ref_number", "ref_no", "zuonr"],
-    "document_type": ["document_type", "doc_type", "blart", "type"],
-    "clearing_date": ["clearing_date", "clear_date", "augdt"],
-    "clearing_document": ["clearing_document", "clear_doc", "augbl"],
-    "assignment_number": ["assignment_number", "assignment", "zuonr_assign"],
-    "currency": ["currency", "curr", "waers"],
-    "description": ["description", "desc", "text", "narration"],
+    "document_number": [
+        "document_number", "doc_number", "doc_no", "belnr",
+        "document number", "vch no.", "vch no", "voucher no",
+        "supplier",
+    ],
+    "amount": [
+        "amount", "amt", "dmbtr", "value",
+        "amount in doc. curr.", "amount in doc curr", "amount in local currency",
+        "amount in doc. curr",
+    ],
+    "posting_date": [
+        "posting_date", "post_date", "budat", "date",
+        "posting date", "post date", "document date",
+    ],
+    "reference_number": [
+        "reference_number", "ref_number", "ref_no", "zuonr",
+        "reference", "invoice no", "invoice no.", "assignment",
+        "vch no.", "vch no", "particulars",
+    ],
+    "document_type": [
+        "document_type", "doc_type", "blart", "type",
+        "document type", "vch type",
+    ],
+    "clearing_date": ["clearing_date", "clear_date", "augdt", "payment date"],
+    "clearing_document": [
+        "clearing_document", "clear_doc", "augbl",
+        "clearing document",
+    ],
+    "assignment_number": [
+        "assignment_number", "assignment", "zuonr_assign",
+        "assignment number",
+    ],
+    "currency": [
+        "currency", "curr", "waers",
+        "document currency", "local currency",
+    ],
+    "description": [
+        "description", "desc", "text", "narration",
+        "document header text", "particulars",
+    ],
 }
 
 
@@ -246,6 +276,8 @@ class FileParserService:
                 }
 
                 entry_or_error = self._parse_row(normalized_row, column_mapping, row_idx)
+                if entry_or_error is None:
+                    continue  # Skip row
                 if isinstance(entry_or_error, str):
                     row_errors.append(entry_or_error)
                 else:
@@ -289,7 +321,7 @@ class FileParserService:
 
         try:
             workbook = openpyxl.load_workbook(
-                io.BytesIO(file_content), read_only=True, data_only=True
+                io.BytesIO(file_content), read_only=False, data_only=True
             )
             sheet = workbook.active
 
@@ -309,11 +341,28 @@ class FileParserService:
                     file_type=file_type,
                 )
 
-            # First row is the header
+            # First row is the header — but sometimes Excel files have a title row
+            # Check if first row looks like a header (has multiple non-empty cells)
+            # If the first row has very few cells or looks like a title, try row 2
+            header_row_idx = 0
             raw_headers = [
                 str(h).strip().lower() if h is not None else ""
                 for h in rows[0]
             ]
+
+            # If first row has mostly empty cells or only 1 meaningful cell,
+            # it's likely a title row — try the next row
+            non_empty_count = sum(1 for h in raw_headers if h and h != "none")
+            if non_empty_count <= 2 and len(rows) > 1:
+                header_row_idx = 1
+                raw_headers = [
+                    str(h).strip().lower() if h is not None else ""
+                    for h in rows[1]
+                ]
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("File headers detected (row %d): %s", header_row_idx + 1, raw_headers[:10])
 
             # Validate mandatory columns
             column_mapping = self._resolve_column_mapping(raw_headers)
@@ -328,11 +377,12 @@ class FileParserService:
                     file_type=file_type,
                 )
 
-            # Parse data rows
+            # Parse data rows (skip header row(s))
+            data_start_idx = header_row_idx + 1
             entries: list[ParsedLedgerEntry] = []
             row_errors: list[str] = []
 
-            for row_idx, row_data in enumerate(rows[1:], start=2):
+            for row_idx, row_data in enumerate(rows[data_start_idx:], start=data_start_idx + 1):
                 # Build a dict from header -> value
                 row_dict: dict[str, str] = {}
                 for col_idx, header in enumerate(raw_headers):
@@ -347,6 +397,8 @@ class FileParserService:
                     continue
 
                 entry_or_error = self._parse_row(row_dict, column_mapping, row_idx)
+                if entry_or_error is None:
+                    continue  # Skip row
                 if isinstance(entry_or_error, str):
                     row_errors.append(entry_or_error)
                 else:
@@ -398,8 +450,17 @@ class FileParserService:
         for internal_field, acceptable_names in self.field_mapping.items():
             matched_header: str | None = None
             for name in acceptable_names:
-                if name.lower() in headers:
-                    matched_header = name.lower()
+                name_lower = name.lower()
+                # First try exact match
+                if name_lower in headers:
+                    matched_header = name_lower
+                    break
+                # Then try: does any header contain this name or does this name contain any header?
+                for h in headers:
+                    if h and (name_lower == h or name_lower in h or h in name_lower):
+                        matched_header = h
+                        break
+                if matched_header:
                     break
             mapping[internal_field] = matched_header
 
@@ -450,23 +511,51 @@ class FileParserService:
         posting_date_str = get_value("posting_date")
         reference_number = get_value("reference_number")
 
-        # Validate mandatory field values
-        errors: list[str] = []
-
+        # If document_number is empty but there's an amount, use a placeholder
         if not document_number:
-            errors.append("document_number is empty")
+            # Check if there's any amount in this row at all
+            has_any_amount = bool(amount_str)
+            if not has_any_amount:
+                # Check debit/credit columns directly
+                for key in row:
+                    if key and ("debit" in key or "credit" in key):
+                        val = row[key].strip() if row[key] else ""
+                        if val and val not in ("None", "0", ""):
+                            has_any_amount = True
+                            break
+            if has_any_amount:
+                document_number = f"BAL_ROW_{row_number}"
+            else:
+                return None  # Truly empty row
 
-        if not amount_str:
-            errors.append("amount is empty")
+        # Resolve amount: direct amount field OR debit/credit columns
+        if not amount_str or amount_str == "None":
+            # Scan for debit/credit columns
+            debit_val = ""
+            credit_val = ""
+            for key in row:
+                if not key:
+                    continue
+                cell_val = row[key].strip() if row[key] else ""
+                if cell_val and cell_val != "None":
+                    if "debit" in key:
+                        debit_val = cell_val
+                    elif "credit" in key:
+                        credit_val = cell_val
 
-        if not posting_date_str:
-            errors.append("posting_date is empty")
+            if debit_val:
+                amount_str = debit_val
+            elif credit_val:
+                amount_str = f"-{credit_val}"
 
-        if not reference_number:
-            errors.append("reference_number is empty")
+        if not amount_str or amount_str == "None":
+            return None  # No amount — skip
 
-        if errors:
-            return f"Row {row_number}: {'; '.join(errors)}"
+        if not posting_date_str or posting_date_str == "None":
+            return None  # No date — skip
+
+        if not reference_number or reference_number == "None":
+            reference_number = document_number
 
         # Parse amount
         try:
@@ -505,21 +594,25 @@ class FileParserService:
 
     def _parse_date(self, date_str: str) -> date | None:
         """
-        Parse a date string, supporting multiple common formats.
-
-        Supported formats:
-        - YYYY-MM-DD (ISO)
-        - DD/MM/YYYY
-        - DD-MM-YYYY
-        - MM/DD/YYYY
-        - DD.MM.YYYY
-
-        Returns:
-            date object on success, None on failure.
+        Parse a date string, supporting multiple common formats and Excel serial numbers.
         """
         date_str = date_str.strip()
         if not date_str:
             return None
+
+        # Strip time portion if present (e.g., "2025-04-01 00:00:00")
+        if " " in date_str:
+            date_str = date_str.split(" ")[0]
+
+        # Handle Excel serial numbers (integers like 45743)
+        try:
+            serial = int(float(date_str))
+            if 30000 < serial < 60000:
+                from datetime import timedelta
+                excel_epoch = date(1899, 12, 30)
+                return excel_epoch + timedelta(days=serial)
+        except (ValueError, OverflowError):
+            pass
 
         formats = [
             "%Y-%m-%d",
@@ -528,6 +621,9 @@ class FileParserService:
             "%m/%d/%Y",
             "%d.%m.%Y",
             "%Y/%m/%d",
+            "%d-%b-%Y",
+            "%d-%b-%y",
+            "%b %d, %Y",
         ]
 
         for fmt in formats:

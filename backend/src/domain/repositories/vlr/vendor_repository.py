@@ -18,6 +18,7 @@ class VendorFilters:
     status: str | None = None
     city: str | None = None
     pan: str | None = None
+    search: str | None = None
 
 
 @dataclass
@@ -117,6 +118,16 @@ class IVendorRepository(ABC):
         ...
 
     @abstractmethod
+    async def remove_all_contacts(self, vendor_id: UUID) -> None:
+        """Remove ALL contacts for a vendor regardless of source."""
+        ...
+
+    @abstractmethod
     async def get_contacts(self, vendor_id: UUID) -> list[object]:
         """Get all contacts for a vendor."""
+        ...
+
+    @abstractmethod
+    async def update_contact(self, contact_id: UUID, update_data: dict) -> object:
+        """Update a single contact record by ID."""
         ...

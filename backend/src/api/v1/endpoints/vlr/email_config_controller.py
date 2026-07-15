@@ -82,9 +82,7 @@ def _get_setting_repository(
 
 
 def _prefix(company_code: str) -> str:
-    """Build key prefix scoped to an entity."""
-    if company_code:
-        return f"email.{company_code}."
+    """Build key prefix — always global (email config is shared across all entities)."""
     return "email.__global__."
 
 

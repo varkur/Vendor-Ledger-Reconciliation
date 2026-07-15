@@ -36,7 +36,7 @@ export function useVendorSelection(
   companyCode: string,
   search?: string,
   page = 1,
-  pageSize = 50
+  pageSize = 200
 ) {
   return useQuery<VendorListResponse, Error>({
     queryKey: [VENDOR_SELECTION_QUERY_KEY, companyCode, search, page, pageSize],
@@ -70,7 +70,7 @@ export function useCreateStatementRequest() {
  * Hook for uploading a company ledger file with progress tracking.
  * Returns upload mutation + progress state.
  */
-export function useUploadCompanyLedger(requestId: string) {
+export function useUploadCompanyLedger(requestId: string, companyCode: string) {
   const [uploadProgress, setUploadProgress] = useState<number>(0);
 
   const mutation = useMutation<
@@ -79,7 +79,7 @@ export function useUploadCompanyLedger(requestId: string) {
     File
   >({
     mutationFn: (file: File) =>
-      uploadCompanyLedger(requestId, file, (progress) => {
+      uploadCompanyLedger(requestId, file, companyCode, (progress) => {
         setUploadProgress(progress);
       }),
     onSettled: () => {

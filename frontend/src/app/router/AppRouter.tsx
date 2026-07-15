@@ -47,6 +47,7 @@ export const AppRouter = () => {
         <Route path="/auth/microsoft/callback" element={<MicrosoftCallbackPage />} />
 
         {/* Vendor Portal — public routes (token-based auth, wrapped in PortalProvider) */}
+        <Route path="/portal/access/:token" element={<PortalProvider><PortalAuthPage /></PortalProvider>} />
         <Route path="/portal/auth" element={<PortalProvider><PortalAuthPage /></PortalProvider>} />
         <Route path="/portal/upload" element={<PortalProvider><PortalUploadPage /></PortalProvider>} />
         <Route path="/portal/statement" element={<PortalProvider><PortalStatementPage /></PortalProvider>} />

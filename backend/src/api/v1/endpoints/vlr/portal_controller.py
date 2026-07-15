@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/vlr/portal", tags=["VLR - Vendor Portal"])
 
 # Maximum upload attempts allowed per case
-MAX_UPLOAD_ATTEMPTS = 5
+MAX_UPLOAD_ATTEMPTS = 1
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -193,14 +193,11 @@ async def upload_vendor_statement(
     # Validate token
     case = await _validate_portal_token(x_portal_token, session)
 
-    # Enforce 5-upload limit (Requirement 4.4)
-    if case.upload_count >= MAX_UPLOAD_ATTEMPTS:
+    # Block upload if a file has already been submitted for this case
+    if case.upload_count >= 1:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Upload limit reached ({MAX_UPLOAD_ATTEMPTS} attempts). "
-                "Please contact the reconciliation team."
-            ),
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A statement has already been submitted for this request. No further uploads are allowed.",
         )
 
     # Read file content
@@ -286,28 +283,69 @@ async def upload_vendor_statement(
         },
     )
 
-    # Trigger re-reconciliation if this is a subsequent upload (Requirement 4.5)
-    task_id = None
-    if is_reupload:
-        try:
-            from src.infrastructure.tasks.vlr.reconciliation_tasks import reconciliation_task
+    # ─── Run reconciliation engine directly ───────────────────────────────
+    reco_status = "awaiting_reconciliation"
+    reco_stats = None
+    try:
+        from src.infrastructure.database.repositories.vlr.ledger_entry_repository_impl import (
+            LedgerEntryRepositoryImpl as LedgerRepoForReco,
+        )
+        from src.infrastructure.database.repositories.vlr.match_result_repository_impl import (
+            MatchResultRepositoryImpl,
+        )
+        from src.infrastructure.database.repositories.vlr.exception_repository_impl import (
+            ExceptionRepositoryImpl,
+        )
+        from src.domain.services.vlr.reconciliation_engine_service import (
+            ReconciliationEngineService,
+        )
+        from decimal import Decimal as RDecimal
 
-            idempotency_key = hashlib.sha256(
-                f"{case.id}:{new_upload_count}:{datetime.now(timezone.utc).isoformat()}".encode()
-            ).hexdigest()[:32]
+        ledger_repo_reco = LedgerRepoForReco(session)
+        match_repo = MatchResultRepositoryImpl(session)
+        exception_repo = ExceptionRepositoryImpl(session)
 
-            task = reconciliation_task.delay(
-                case_id=str(case.id),
-                idempotency_key=idempotency_key,
-                triggered_by="vendor_portal",
-            )
-            task_id = task.id
-        except (ImportError, Exception) as exc:
-            logger.warning(
-                "Failed to trigger re-reconciliation after re-upload: case_id=%s, error=%s",
-                case.id,
-                str(exc),
-            )
+        engine = ReconciliationEngineService(
+            ledger_entry_repository=ledger_repo_reco,
+            match_result_repository=match_repo,
+            case_repository=case_repo,
+            exception_repository=exception_repo,
+        )
+
+        # Update status to matching
+        await case_repo.update(case.id, {"status": "matching", "modified_by": "vendor_portal"})
+
+        # Execute the 7-pass reconciliation engine
+        reco_result = await engine.execute(
+            case_id=case.id,
+            tolerance=RDecimal("0"),
+            fuzzy_threshold=0.8,
+            date_tolerance_days=3,
+        )
+
+        # Update status to matched
+        await case_repo.update(case.id, {"status": "matched", "modified_by": "vendor_portal"})
+        reco_status = "reconciliation_complete"
+        reco_stats = {
+            "total_matched_company": reco_result.statistics.total_matched_company,
+            "total_matched_vendor": reco_result.statistics.total_matched_vendor,
+            "total_company_entries": reco_result.statistics.total_company_entries,
+            "total_vendor_entries": reco_result.statistics.total_vendor_entries,
+            "match_pairs": len(reco_result.match_pairs),
+            "match_groups": len(reco_result.match_groups),
+            "unmatched_company": len(reco_result.unmatched_company_ids),
+            "unmatched_vendor": len(reco_result.unmatched_vendor_ids),
+        }
+        logger.info(
+            "Reconciliation completed after vendor upload: case_id=%s, matched_company=%d/%d",
+            case.id, reco_result.statistics.total_matched_company, reco_result.statistics.total_company_entries,
+        )
+    except Exception as reco_exc:
+        logger.error(
+            "Reconciliation engine failed after vendor upload: case_id=%s, error=%s",
+            case.id, str(reco_exc),
+        )
+        reco_status = "reconciliation_failed"
 
     logger.info(
         "Portal upload successful: case_id=%s, upload_count=%d, entries=%d, is_reupload=%s",
@@ -335,14 +373,14 @@ async def upload_vendor_statement(
 
     return PortalUploadResponse(
         case_id=case.id,
-        status="data_received",
+        status=reco_status if reco_status == "reconciliation_complete" else "data_received",
         upload_count=new_upload_count,
         entries_parsed=len(result.entries),
         message=(
             f"Successfully uploaded {len(result.entries)} entries. "
-            + ("Re-reconciliation triggered." if is_reupload else "Awaiting reconciliation.")
+            + (f"Reconciliation complete: {reco_stats['total_matched_company']}/{reco_stats['total_company_entries']} company entries matched."
+               if reco_stats else "Reconciliation engine is processing.")
         ),
-        task_id=task_id,
     )
 
 

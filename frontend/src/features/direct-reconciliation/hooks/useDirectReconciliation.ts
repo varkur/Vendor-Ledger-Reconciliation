@@ -9,6 +9,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { apiClient } from '@shared/services/apiClient';
 
 import {
   createReconciliationRequest,
@@ -43,9 +44,14 @@ export function useReconciliationRequests(params: ListRequestsParams) {
 export function useCreateReconciliationRequest() {
   const queryClient = useQueryClient();
 
-  return useMutation<ReconciliationRequestResponse, Error, CreateReconciliationRequest>({
-    mutationFn: (data: CreateReconciliationRequest) =>
-      createReconciliationRequest(data),
+  return useMutation<any, Error, FormData>({
+    mutationFn: async (formData: FormData) => {
+      const { data } = await apiClient.post('/vlr/cases/direct', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000, // 2 minutes — file parsing + DB inserts + reconciliation trigger
+      });
+      return data;
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [DIRECT_RECO_QUERY_KEY] });
     },

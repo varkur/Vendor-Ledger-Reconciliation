@@ -80,17 +80,26 @@ async def list_vendors(
     vendor_status: str | None = Query(default=None, alias="status", description="Filter by status"),
     city: str | None = Query(default=None, description="Filter by city (partial)"),
     pan: str | None = Query(default=None, description="Filter by PAN (partial)"),
+    search: str | None = Query(default=None, description="Search across vendor code and name"),
     page: int = Query(default=1, ge=1, description="Page number"),
-    page_size: int = Query(default=50, ge=1, le=200, description="Items per page"),
+    page_size: int = Query(default=50, ge=1, le=10000, description="Items per page"),
     service: VendorService = Depends(_get_vendor_service),
 ) -> VendorListResponse:
     """GET /api/v1/vlr/vendors — List vendors with filtering and pagination."""
+    # If generic search is provided, apply it to both vendor_code and name
+    effective_vendor_code = vendor_code
+    effective_name = name
+    if search and not vendor_code and not name:
+        effective_vendor_code = search
+        effective_name = search
+
     filters = VendorFilters(
-        vendor_code=vendor_code,
-        name=name,
+        vendor_code=effective_vendor_code,
+        name=effective_name,
         status=vendor_status,
         city=city,
         pan=pan,
+        search=search,
     )
     pagination = PaginationParams(page=page, page_size=page_size)
 

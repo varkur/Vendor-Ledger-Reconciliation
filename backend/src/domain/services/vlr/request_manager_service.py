@@ -40,17 +40,16 @@ class RequestStatus(str, Enum):
 class CaseStatus(str, Enum):
     """Reconciliation case status values."""
 
-    CREATED = "created"
-    LEDGER_CONFIRMED = "ledger_confirmed"
-    INVITED = "invited"
-    DATA_RECEIVED = "data_received"
-    MATCHING = "matching"
-    MATCHED = "matched"
-    REVIEW = "review"
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED = "approved"
-    SIGNED_OFF = "signed_off"
-    CLOSED = "closed"
+    IN_PROGRESS = "in_progress"
+    STATEMENT_RECEIVED = "statement_received"
+    MAPPING_PENDING = "mapping_pending"
+    STATEMENT_MAPPED = "statement_mapped"
+    AUTO_COMPLETED = "auto_completed"
+    REVIEW_PENDING = "review_pending"
+    REVIEWED = "reviewed"
+    SIGNOFF_REQUESTED = "signoff_requested"
+    SIGNOFF_COMPLETED = "signoff_completed"
+    RECO_REJECTED = "reco_rejected"
 
 
 # ─── Valid Status Transitions (State Machine) ─────────────────────────────────
@@ -66,19 +65,30 @@ VALID_REQUEST_TRANSITIONS: dict[RequestStatus, set[RequestStatus]] = {
     RequestStatus.CLOSED: set(),
 }
 
-# Case status transitions
+# Case status transitions:
+# in_progress → statement_received (vendor provides ledger)
+# statement_received → mapping_pending (system can't auto-map)
+# statement_received → auto_completed (system auto-maps successfully)
+# mapping_pending → statement_mapped (manual mapping done)
+# statement_mapped → review_pending (after manual mapping, go to review)
+# auto_completed → review_pending (after auto mapping, go to review)
+# review_pending → reviewed (review completed)
+# review_pending → reco_rejected (rejected during review)
+# reviewed → signoff_requested (request signoff)
+# reviewed → reco_rejected (rejected after review)
+# signoff_requested → signoff_completed (signoff approved)
+# signoff_requested → reco_rejected (signoff rejected)
 VALID_CASE_TRANSITIONS: dict[CaseStatus, set[CaseStatus]] = {
-    CaseStatus.CREATED: {CaseStatus.LEDGER_CONFIRMED},
-    CaseStatus.LEDGER_CONFIRMED: {CaseStatus.INVITED},
-    CaseStatus.INVITED: {CaseStatus.DATA_RECEIVED},
-    CaseStatus.DATA_RECEIVED: {CaseStatus.MATCHING},
-    CaseStatus.MATCHING: {CaseStatus.MATCHED},
-    CaseStatus.MATCHED: {CaseStatus.REVIEW},
-    CaseStatus.REVIEW: {CaseStatus.PENDING_APPROVAL},
-    CaseStatus.PENDING_APPROVAL: {CaseStatus.APPROVED, CaseStatus.REVIEW},
-    CaseStatus.APPROVED: {CaseStatus.SIGNED_OFF},
-    CaseStatus.SIGNED_OFF: {CaseStatus.CLOSED},
-    CaseStatus.CLOSED: set(),
+    CaseStatus.IN_PROGRESS: {CaseStatus.STATEMENT_RECEIVED},
+    CaseStatus.STATEMENT_RECEIVED: {CaseStatus.MAPPING_PENDING, CaseStatus.AUTO_COMPLETED},
+    CaseStatus.MAPPING_PENDING: {CaseStatus.STATEMENT_MAPPED},
+    CaseStatus.STATEMENT_MAPPED: {CaseStatus.REVIEW_PENDING},
+    CaseStatus.AUTO_COMPLETED: {CaseStatus.REVIEW_PENDING},
+    CaseStatus.REVIEW_PENDING: {CaseStatus.REVIEWED, CaseStatus.RECO_REJECTED},
+    CaseStatus.REVIEWED: {CaseStatus.SIGNOFF_REQUESTED, CaseStatus.RECO_REJECTED},
+    CaseStatus.SIGNOFF_REQUESTED: {CaseStatus.SIGNOFF_COMPLETED, CaseStatus.RECO_REJECTED},
+    CaseStatus.SIGNOFF_COMPLETED: set(),
+    CaseStatus.RECO_REJECTED: set(),
 }
 
 
@@ -219,7 +229,7 @@ class RequestManagerService:
             "tds_percentage": data.tds_percentage,
             "gst_percentage": data.gst_percentage,
             "matching_preferences": matching_prefs,
-            "assigned_manager": data.assigned_manager_id,
+            "assigned_manager_id": data.assigned_manager_id,
             "created_by": data.created_by,
         }
 
@@ -233,7 +243,8 @@ class RequestManagerService:
                 "request_id": request_id,
                 "vendor_id": vendor_id,
                 "case_type": "batch",
-                "status": CaseStatus.CREATED.value,
+                "status": "created",
+                "current_workflow_step": CaseStatus.IN_PROGRESS.value,
                 "upload_count": 0,
                 "edit_count": 0,
                 "portal_token": str(uuid4()),
@@ -334,11 +345,11 @@ class RequestManagerService:
 
         # Validate current status allows this transition
         current_status = CaseStatus(getattr(case, "status"))
-        self._validate_case_transition(current_status, CaseStatus.LEDGER_CONFIRMED)
+        self._validate_case_transition(current_status, CaseStatus.STATEMENT_RECEIVED)
 
         # Update case status
         updated_case = await self._case_repo.update(
-            case_id, {"status": CaseStatus.LEDGER_CONFIRMED.value}
+            case_id, {"status": CaseStatus.STATEMENT_RECEIVED.value}
         )
 
         return updated_case
@@ -349,30 +360,30 @@ class RequestManagerService:
 
     async def invite_vendor(self, case_id: UUID, company_code: str) -> object:
         """
-        Invite a vendor for reconciliation (transition case to Invited).
+        Invite a vendor for reconciliation.
+
+        In the new status model, this triggers a notification to the vendor
+        but the case remains in 'in_progress' until the vendor provides
+        their statement (at which point it moves to 'statement_received').
 
         Requirement 3.5: Company ledger must be confirmed before invitation.
         Requirement 3.8: Block edits on closed cases.
         """
         case = await self._get_case_or_raise(case_id, company_code)
 
-        # Block edits on closed cases
+        # Block edits on terminal cases
         self._assert_case_not_closed(case)
 
-        # Enforce company ledger confirmation before invitation (Requirement 3.5)
-        current_status = CaseStatus(getattr(case, "status"))
-        if current_status != CaseStatus.LEDGER_CONFIRMED:
-            raise CompanyLedgerNotConfirmedException()
+        # Case must be in 'in_progress' to invite vendor
+        current_status = getattr(case, "status")
+        if current_status != CaseStatus.IN_PROGRESS.value:
+            raise InvalidStatusTransitionException(
+                current_status=current_status,
+                target_status="in_progress (invite vendor)",
+            )
 
-        # Validate the transition
-        self._validate_case_transition(current_status, CaseStatus.INVITED)
-
-        # Update case status to Invited
-        updated_case = await self._case_repo.update(
-            case_id, {"status": CaseStatus.INVITED.value}
-        )
-
-        return updated_case
+        # No status change — case stays in_progress until vendor provides statement
+        return case
 
     # ──────────────────────────────────────────────────────────────────────
     # Status Transitions
@@ -505,7 +516,7 @@ class RequestManagerService:
         return case
 
     def _assert_case_not_closed(self, case: object) -> None:
-        """Raise CaseClosedException if the case is in Closed status."""
+        """Raise CaseClosedException if the case is in a terminal status."""
         status = getattr(case, "status", None)
-        if status == CaseStatus.CLOSED.value:
+        if status in (CaseStatus.SIGNOFF_COMPLETED.value, CaseStatus.RECO_REJECTED.value):
             raise CaseClosedException()

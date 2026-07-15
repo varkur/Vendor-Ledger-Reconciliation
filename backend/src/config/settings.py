@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = Field(
         default="redis://localhost:6379/1", description="Celery broker URL"
     )
+    CELERY_RESULT_BACKEND: str = Field(
+        default="", description="Celery result backend URL"
+    )
 
     # OpenTelemetry
     OTEL_EXPORTER_ENDPOINT: str = Field(

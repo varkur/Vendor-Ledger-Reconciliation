@@ -109,6 +109,8 @@ export const RequestStatementPage = () => {
 
   // Success state
   const [showSuccess, setShowSuccess] = useState(false);
+  const [inviteSent, setInviteSent] = useState(false);
+  const [isSendingInvites, setIsSendingInvites] = useState(false);
 
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -126,7 +128,7 @@ export const RequestStatementPage = () => {
 
   // Upload hook — enabled once request is created (request_id available)
   const requestId = createMutation.data?.id || '';
-  const { mutateAsync: uploadFile, uploadProgress, isPending: isUploading } = useUploadCompanyLedger(requestId);
+  const { mutateAsync: uploadFile, uploadProgress, isPending: isUploading } = useUploadCompanyLedger(requestId, companyCode);
   const [uploadComplete, setUploadComplete] = useState(false);
 
   // Fetch email templates for dropdowns
@@ -304,7 +306,6 @@ export const RequestStatementPage = () => {
       },
       {
         onSuccess: () => {
-          setShowSuccess(true);
           setCurrentStep('upload');
         },
       }
@@ -317,6 +318,14 @@ export const RequestStatementPage = () => {
   const handleVendorFilter = useCallback((e: { filter: string }) => {
     setVendorSearch(e.filter);
   }, []);
+
+  const handleSelectAllVendors = useCallback(() => {
+    if (selectedVendorIds.length > 0) {
+      setSelectedVendorIds([]);
+    } else {
+      setSelectedVendorIds(vendorOptions.map((v) => v.value));
+    }
+  }, [vendorOptions, selectedVendorIds]);
 
   // Preview email template handler
   const handlePreview = useCallback(async () => {
@@ -357,39 +366,50 @@ export const RequestStatementPage = () => {
     setEndDate(null);
     setRemarks('');
     setCurrentStep('configure');
+    setInviteSent(false);
     createMutation.reset();
   }, [createMutation]);
 
-  // ─── Success State ──────────────────────────────────────────────────────────
-  if (showSuccess && createMutation.isSuccess) {
-    return (
-      <div>
-        <h2>New Party Request</h2>
-        <div className="em-form-section">
-          <div className="flex flex-column align-items-center justify-content-center p-5">
-            <i
-              className="pi pi-check-circle"
-              style={{ fontSize: '3rem', color: 'var(--green-500)' }}
-            />
-            <h3 className="mt-3 mb-1">Statement Request Created Successfully</h3>
-            <p className="text-color-secondary text-center" style={{ maxWidth: '500px' }}>
-              Your request has been submitted for {selectedVendorIds.length} vendor(s).
-              The reconciliation workflow will begin processing shortly.
-            </p>
-            <p className="text-sm text-color-secondary">
-              Request ID: {createMutation.data?.id}
-            </p>
-            <Button
-              label="Create Another Request"
-              icon="pi pi-plus"
-              className="mt-3"
-              onClick={handleResetSuccess}
-            />
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const handleSendInvites = useCallback(async () => {
+    if (!requestId) return;
+    setIsSendingInvites(true);
+    try {
+      const { data } = await apiClient.post(
+        `/vlr/reconciliation-requests/${requestId}/send-vendor-invites`,
+        null,
+        { params: { company_code: companyCode } }
+      );
+      setInviteSent(true);
+      const sent = data.emails_sent || 0;
+      const failed = data.emails_failed || 0;
+      if (sent > 0) {
+        setInviteSent(true);
+        toast.current?.show({
+          severity: 'success',
+          summary: 'Invites Sent',
+          detail: `${sent} vendor invite email(s) sent successfully.${failed > 0 ? ` ${failed} failed.` : ''}`,
+          life: 5000,
+        });
+      } else {
+        toast.current?.show({
+          severity: 'warn',
+          summary: 'No Emails Sent',
+          detail: data.details?.[0]?.reason || 'No vendor contacts found. Please add contacts to your vendors first.',
+          life: 8000,
+        });
+      }
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || 'Failed to send vendor invites.';
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Send Failed',
+        detail,
+        life: 8000,
+      });
+    } finally {
+      setIsSendingInvites(false);
+    }
+  }, [requestId, companyCode]);
 
   // ─── Main Render ────────────────────────────────────────────────────────────
   return (
@@ -478,12 +498,14 @@ export const RequestStatementPage = () => {
                   onChange={(e) => setSelectedVendorIds(e.value)}
                   onFilter={handleVendorFilter}
                   filter
+                  filterBy="label"
                   filterPlaceholder="Search vendors..."
                   placeholder="Select vendors"
                   className={`w-full ${validationErrors.vendors ? 'p-invalid' : ''}`}
                   display="chip"
                   maxSelectedLabels={5}
                   loading={isLoadingVendors}
+                  virtualScrollerOptions={{ itemSize: 38 }}
                   emptyFilterMessage={isLoadingVendors ? 'Loading...' : 'No vendors found'}
                   aria-label="Select vendors for statement request"
                 />
@@ -891,13 +913,31 @@ export const RequestStatementPage = () => {
             </div>
 
             {/* Success — View Reconciliation */}
-            {uploadComplete && requestId && (
+            {uploadComplete && requestId && !inviteSent && (
+              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--blue-50, #eff6ff)', borderRadius: 'var(--radius-md)', border: '1px solid var(--blue-200, #bfdbfe)' }}>
+                <i className="pi pi-envelope" style={{ fontSize: '1.5rem', color: 'var(--blue-500)' }} />
+                <div className="flex-1">
+                  <p className="m-0 font-medium">Company ledger uploaded</p>
+                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+                    Click "Send Vendor Invite" to email the vendor(s) a link to upload their statement.
+                  </p>
+                </div>
+                <Button
+                  label="Send Vendor Invite"
+                  icon="pi pi-send"
+                  loading={isSendingInvites}
+                  onClick={handleSendInvites}
+                />
+              </div>
+            )}
+
+            {inviteSent && requestId && (
               <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--green-50, #f0fdf4)', borderRadius: 'var(--radius-md)', border: '1px solid var(--green-200, #bbf7d0)' }}>
                 <i className="pi pi-check-circle" style={{ fontSize: '1.5rem', color: 'var(--green-500)' }} />
                 <div className="flex-1">
-                  <p className="m-0 font-medium">File uploaded successfully</p>
+                  <p className="m-0 font-medium">Vendor invite sent successfully</p>
                   <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                    Your company ledger has been uploaded. You can now track the reconciliation progress.
+                    The vendor(s) have been emailed a unique link to upload their statement. You can track progress in Track Reconciliation.
                   </p>
                 </div>
                 <Button

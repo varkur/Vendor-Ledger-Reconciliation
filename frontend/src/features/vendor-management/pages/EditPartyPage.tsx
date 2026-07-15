@@ -142,6 +142,25 @@ export const EditPartyPage = () => {
   const handleSave = () => {
     if (!id) return;
 
+    // Sync top-section contact fields into contacts array
+    const updatedContacts = [...contacts];
+    if (updatedContacts.length > 0) {
+      updatedContacts[0] = {
+        ...updatedContacts[0],
+        name: contactName,
+        email: contactEmail,
+        phone: contactMobile,
+        workPhone: contactWorkPhone,
+      };
+    } else if (contactName || contactEmail) {
+      updatedContacts.push({
+        name: contactName,
+        email: contactEmail,
+        phone: contactMobile,
+        workPhone: contactWorkPhone,
+      });
+    }
+
     updateVendorMutation.mutate(
       {
         id,
@@ -151,7 +170,7 @@ export const EditPartyPage = () => {
           pan: pan || null,
           gstin: gstin || null,
           city: null,
-          contacts: contacts.map((c) => ({
+          contacts: updatedContacts.map((c) => ({
             name: c.name,
             email: c.email,
             phone: c.phone || undefined,
@@ -368,10 +387,70 @@ export const EditPartyPage = () => {
                 />
               </div>
               <DataTable value={contacts} emptyMessage="No contacts added.">
-                <Column field="name" header="Name" />
-                <Column field="email" header="Email" />
-                <Column field="phone" header="Mobile" />
-                <Column field="workPhone" header="Work Phone" />
+                <Column
+                  field="name"
+                  header="Name"
+                  body={(rowData, { rowIndex }) => (
+                    <InputText
+                      value={rowData.name}
+                      onChange={(e) => {
+                        const updated = [...contacts];
+                        updated[rowIndex] = { ...updated[rowIndex], name: e.target.value };
+                        setContacts(updated);
+                      }}
+                      style={{ width: '100%', border: 'none', background: 'transparent' }}
+                      placeholder="Enter name"
+                    />
+                  )}
+                />
+                <Column
+                  field="email"
+                  header="Email"
+                  body={(rowData, { rowIndex }) => (
+                    <InputText
+                      value={rowData.email}
+                      onChange={(e) => {
+                        const updated = [...contacts];
+                        updated[rowIndex] = { ...updated[rowIndex], email: e.target.value };
+                        setContacts(updated);
+                      }}
+                      style={{ width: '100%', border: 'none', background: 'transparent' }}
+                      placeholder="Enter email"
+                    />
+                  )}
+                />
+                <Column
+                  field="phone"
+                  header="Mobile"
+                  body={(rowData, { rowIndex }) => (
+                    <InputText
+                      value={rowData.phone}
+                      onChange={(e) => {
+                        const updated = [...contacts];
+                        updated[rowIndex] = { ...updated[rowIndex], phone: e.target.value };
+                        setContacts(updated);
+                      }}
+                      style={{ width: '100%', border: 'none', background: 'transparent' }}
+                      placeholder="Enter mobile"
+                    />
+                  )}
+                />
+                <Column
+                  field="workPhone"
+                  header="Work Phone"
+                  body={(rowData, { rowIndex }) => (
+                    <InputText
+                      value={rowData.workPhone}
+                      onChange={(e) => {
+                        const updated = [...contacts];
+                        updated[rowIndex] = { ...updated[rowIndex], workPhone: e.target.value };
+                        setContacts(updated);
+                      }}
+                      style={{ width: '100%', border: 'none', background: 'transparent' }}
+                      placeholder="Enter work phone"
+                    />
+                  )}
+                />
                 <Column
                   header="Action"
                   body={(_, { rowIndex }) => (

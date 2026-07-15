@@ -105,11 +105,71 @@ class RequestListResponse(BaseModel):
     total_pages: int = Field(default=0, description="Total pages available")
 
 
+class AmountEntry(BaseModel):
+    """Amount and entry count for a difference or action row."""
+
+    amount: float = Field(default=0.0, description="Aggregated amount")
+    entry_count: int = Field(default=0, description="Number of entries")
+
+
+class AmountCategoryRow(BaseModel):
+    """Amount statistics row for a specific category (e.g., Vendor Payable)."""
+
+    category: str = Field(..., description="Category name")
+    total_company_amount: float = Field(default=0.0)
+    company_amount_responded: float = Field(default=0.0)
+    party_amount_responded: float = Field(default=0.0)
+    net_difference: float = Field(default=0.0)
+
+
+class ReminderInfo(BaseModel):
+    """Reminder summary for the request."""
+
+    reminders_sent: int = Field(default=0, description="Total reminders sent for this request")
+    max_reminders: int = Field(default=5, description="Maximum reminders allowed")
+    last_reminder_date: str | None = Field(default=None, description="Last reminder date (ISO)")
+
+
+class StatementStatusCounts(BaseModel):
+    """Statement status counts."""
+
+    total: int = Field(default=0)
+    responded: int = Field(default=0)
+    not_responded: int = Field(default=0)
+    rejected: int = Field(default=0)
+    failed: int = Field(default=0)
+
+
+class ReconciliationStatusCounts(BaseModel):
+    """Reconciliation status counts per sub-status."""
+
+    in_progress: int = Field(default=0)
+    statement_received: int = Field(default=0)
+    mapping_pending: int = Field(default=0)
+    statement_mapped: int = Field(default=0)
+    auto_completed: int = Field(default=0)
+    review_pending: int = Field(default=0)
+    reviewed: int = Field(default=0)
+    signoff_requested: int = Field(default=0)
+    signoff_completed: int = Field(default=0)
+    reco_rejected: int = Field(default=0)
+
+
 class RequestStatisticsResponse(BaseModel):
-    """Statistics for a reconciliation request (case counts by status)."""
+    """Enriched statistics for a reconciliation request."""
 
     request_id: UUID
     total_cases: int = Field(default=0, description="Total number of cases")
     cases_by_status: dict[str, int] = Field(
-        default_factory=dict, description="Case count per status"
+        default_factory=dict, description="Case count per status (raw)"
     )
+
+    # Structured sections
+    statement_status: StatementStatusCounts = Field(default_factory=StatementStatusCounts)
+    reconciliation_status: ReconciliationStatusCounts = Field(
+        default_factory=ReconciliationStatusCounts
+    )
+    amount_statistics: list[AmountCategoryRow] = Field(default_factory=list)
+    reason_for_difference: dict[str, AmountEntry] = Field(default_factory=dict)
+    action_summary: dict[str, AmountEntry] = Field(default_factory=dict)
+    reminder_info: ReminderInfo = Field(default_factory=ReminderInfo)

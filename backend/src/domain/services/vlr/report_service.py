@@ -1103,20 +1103,21 @@ class ReportService:
         Determine if a vendor has responded based on case status.
 
         A vendor is considered to have responded if the case has moved
-        beyond the 'invited' stage (i.e., data has been received).
+        beyond the 'in_progress' stage (i.e., statement has been received).
         """
         responded_statuses = {
-            "data_received", "matching", "matched", "review",
-            "pending_approval", "approved", "signed_off", "closed",
+            "statement_received", "mapping_pending", "statement_mapped",
+            "auto_completed", "review_pending", "reviewed",
+            "signoff_requested", "signoff_completed", "reco_rejected",
         }
         return case_status in responded_statuses
 
     @staticmethod
     def _get_sign_off_status(case_status: str) -> str:
         """Determine sign-off status from case status."""
-        if case_status in ("signed_off", "closed"):
+        if case_status == "signoff_completed":
             return "completed"
-        elif case_status in ("approved", "pending_approval"):
+        elif case_status == "signoff_requested":
             return "in_progress"
         else:
             return "pending"

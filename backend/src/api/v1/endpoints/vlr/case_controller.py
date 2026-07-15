@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user
@@ -60,6 +61,12 @@ from src.infrastructure.database.repositories.vlr.case_repository_impl import (
 )
 from src.infrastructure.database.repositories.vlr.ledger_entry_repository_impl import (
     LedgerEntryRepositoryImpl,
+)
+from src.infrastructure.database.repositories.vlr.match_result_repository_impl import (
+    MatchResultRepositoryImpl,
+)
+from src.infrastructure.database.repositories.vlr.exception_repository_impl import (
+    ExceptionRepositoryImpl,
 )
 from src.infrastructure.database.repositories.vlr.request_repository_impl import (
     RequestRepositoryImpl,
@@ -250,10 +257,10 @@ async def trigger_reconciliation(
             detail=f"Reconciliation case {case_id} not found.",
         )
 
-    # Case must be in data_received or matched (re-reconciliation) status
+    # Case must be in statement_received or mapping_pending (re-reconciliation) status
     allowed_statuses = (
-        CaseStatus.DATA_RECEIVED.value,
-        CaseStatus.MATCHED.value,
+        CaseStatus.STATEMENT_RECEIVED.value,
+        CaseStatus.MAPPING_PENDING.value,
     )
     if case.status not in allowed_statuses:
         raise HTTPException(
@@ -264,8 +271,8 @@ async def trigger_reconciliation(
             ),
         )
 
-    # Transition case to Matching status
-    await service.transition_case_status(case_id, company_code, CaseStatus.MATCHING)
+    # Reconciliation will determine if auto_completed or mapping_pending
+    # No explicit status transition here — the engine handles it
 
     # Dispatch reconciliation Celery task (if available)
     task_id = None
@@ -309,9 +316,9 @@ async def submit_for_approval(
     Submits the case for manager approval. The case must be in Review status.
     Requirement 7.1: Validates Row_10 = 0 before submission (via ApprovalEngine).
     """
-    # Transition from Review → PendingApproval
+    # Transition from Reviewed → Signoff Requested
     updated_case = await service.transition_case_status(
-        case_id, company_code, CaseStatus.PENDING_APPROVAL
+        case_id, company_code, CaseStatus.SIGNOFF_REQUESTED
     )
     return CaseActionResponse(
         id=case_id,
@@ -713,7 +720,7 @@ async def create_direct_reconciliation(
         "request_id": request_id,
         "vendor_id": recon_config.vendor_id,
         "case_type": "direct",
-        "status": CaseStatus.DATA_RECEIVED.value,
+        "status": "statement_received",
         "upload_count": 1,
         "edit_count": 0,
         "portal_token": str(uuid4()),
@@ -783,28 +790,48 @@ async def create_direct_reconciliation(
     task_id = None
     reconciliation_triggered = False
 
+    # Run reconciliation synchronously (no Celery/Redis dependency)
     try:
-        from src.infrastructure.tasks.vlr.reconciliation_tasks import reconciliation_task
+        from src.domain.services.vlr.reconciliation_engine_service import ReconciliationEngineService
 
-        idempotency_key = hashlib.sha256(
-            f"direct:{case_id}:{datetime.now(timezone.utc).isoformat()}".encode()
-        ).hexdigest()[:32]
-
-        task = reconciliation_task.delay(
-            case_id=str(case_id),
-            idempotency_key=idempotency_key,
-            triggered_by=current_user.username,
-            tolerance=float(recon_config.tolerance_amount),
+        engine = ReconciliationEngineService(
+            ledger_entry_repository=LedgerEntryRepositoryImpl(session),
+            match_result_repository=MatchResultRepositoryImpl(session),
+            case_repository=CaseRepositoryImpl(session),
+            exception_repository=ExceptionRepositoryImpl(session),
+        )
+        await engine.execute(
+            case_id=case_id,
+            tolerance=__import__('decimal').Decimal(str(recon_config.tolerance_amount)),
             fuzzy_threshold=recon_config.fuzzy_threshold,
         )
-        task_id = task.id
+        # Update case status based on reconciliation result
+        # If all entries matched → auto_completed; otherwise → mapping_pending
+        case_repo_update = CaseRepositoryImpl(session)
+        case_obj = await case_repo_update.get_by_id(case_id)
+        match_stats = getattr(case_obj, "match_statistics", None) or {}
+        total_company = match_stats.get("total_company_entries", 0)
+        total_vendor = match_stats.get("total_vendor_entries", 0)
+        matched_company = match_stats.get("total_matched_company", 0)
+        matched_vendor = match_stats.get("total_matched_vendor", 0)
+        all_matched = (matched_company >= total_company and matched_vendor >= total_vendor)
+        new_status = "auto_completed" if all_matched else "mapping_pending"
+        await case_repo_update.update(case_id, {
+            "status": new_status,
+            "current_workflow_step": new_status,
+        })
+        await session.commit()
         reconciliation_triggered = True
-    except (ImportError, Exception) as exc:
+        task_id = "sync-inline"
+    except Exception as exc:
         logger.warning(
-            "Failed to trigger reconciliation for direct case: case_id=%s, error=%s",
+            "Failed to run reconciliation for direct case: case_id=%s, error=%s",
             case_id,
             str(exc),
+            exc_info=True,
         )
+        # Still return success — case is created, reconciliation can be retried
+        reconciliation_triggered = False
 
     logger.info(
         "Direct reconciliation case created: case_id=%s, vendor_id=%s, "
@@ -821,7 +848,7 @@ async def create_direct_reconciliation(
         request_id=request_id,
         vendor_id=recon_config.vendor_id,
         case_type="direct",
-        status=CaseStatus.DATA_RECEIVED.value,
+        status="auto_completed" if reconciliation_triggered else "statement_received",
         company_entries_count=len(company_result.entries),
         vendor_entries_count=len(vendor_result.entries),
         reconciliation_triggered=reconciliation_triggered,
@@ -837,6 +864,107 @@ async def create_direct_reconciliation(
         ),
         created_date=getattr(case_record, "created_date", None),
     )
+
+# ──────────────────────────────────────────────────────────────────────
+# Manual Mapping (when reco engine can't auto-map)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class ManualMatchEntry(BaseModel):
+    """A single manual match pair/group."""
+    company_entry_ids: list[UUID] = Field(..., description="Company ledger entry IDs to match")
+    vendor_entry_ids: list[UUID] = Field(..., description="Vendor ledger entry IDs to match")
+
+
+class ManualMappingRequest(BaseModel):
+    """Request body for manual mapping of ledger entries."""
+    matches: list[ManualMatchEntry] = Field(..., min_length=1, description="List of manual match pairs/groups")
+
+
+class ManualMappingResponse(BaseModel):
+    """Response for manual mapping operation."""
+    case_id: UUID
+    matches_created: int
+    status: str
+    message: str
+
+
+@router.post(
+    "/{case_id}/manual-mapping",
+    response_model=ManualMappingResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Manually map unmatched ledger entries",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def manual_mapping(
+    case_id: UUID,
+    body: ManualMappingRequest,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Manually map company and vendor ledger entries when the reconciliation
+    engine cannot auto-map them.
+
+    This endpoint creates match records for user-specified entry pairs/groups
+    and transitions the case from mapping_pending to statement_mapped.
+    """
+    case_repo = CaseRepositoryImpl(session)
+    case_obj = await case_repo.get_by_id(case_id)
+    if not case_obj:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    match_repo = MatchResultRepositoryImpl(session)
+    ledger_repo = LedgerEntryRepositoryImpl(session)
+
+    matches_created = 0
+    for match_entry in body.matches:
+        match_id = uuid4()
+        is_group = (
+            len(match_entry.company_entry_ids) > 1
+            or len(match_entry.vendor_entry_ids) > 1
+        )
+        match_data = {
+            "id": match_id,
+            "case_id": case_id,
+            "pass_number": 0,  # Manual match
+            "match_type": "group" if is_group else "pair",
+            "confidence_score": 1.0,  # Manual = full confidence
+            "is_confirmed": True,
+            "company_entry_ids": [str(eid) for eid in match_entry.company_entry_ids],
+            "vendor_entry_ids": [str(eid) for eid in match_entry.vendor_entry_ids],
+            "matched_amount": 0,  # Will be calculated
+            "difference_amount": 0,
+        }
+        await match_repo.create(match_data)
+
+        # Update ledger entries with match metadata
+        all_ids = list(match_entry.company_entry_ids) + list(match_entry.vendor_entry_ids)
+        await ledger_repo.bulk_update_match(
+            entry_ids=all_ids,
+            match_id=match_id,
+            pass_number=0,
+            confidence_score=1.0,
+        )
+        matches_created += 1
+
+    # Transition case status to statement_mapped
+    current_status = getattr(case_obj, "status", "")
+    if current_status == "mapping_pending":
+        await case_repo.update(case_id, {
+            "status": "statement_mapped",
+            "current_workflow_step": "statement_mapped",
+        })
+
+    await session.commit()
+
+    return ManualMappingResponse(
+        case_id=case_id,
+        matches_created=matches_created,
+        status="statement_mapped",
+        message=f"Successfully created {matches_created} manual match(es). Case moved to statement_mapped.",
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Bulk Actions (Requirement 4)
@@ -907,7 +1035,7 @@ async def bulk_review(
                 vendor_repository=VendorRepositoryImpl(session),
             )
             await service.transition_case_status(
-                case_uuid, request.company_code, CaseStatus.REVIEW
+                case_uuid, request.company_code, CaseStatus.REVIEW_PENDING
             )
 
             results.append(BulkActionResultItem(
@@ -1003,7 +1131,7 @@ async def bulk_review_done(
                 vendor_repository=VendorRepositoryImpl(session),
             )
             await service.transition_case_status(
-                case_uuid, request.company_code, CaseStatus.PENDING_APPROVAL
+                case_uuid, request.company_code, CaseStatus.SIGNOFF_REQUESTED
             )
 
             results.append(BulkActionResultItem(

@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { useSearchParams, useNavigate, useParams } from 'react-router-dom';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Button } from 'primereact/button';
 import { Message } from 'primereact/message';
@@ -21,6 +21,7 @@ type AuthStatus = 'authenticating' | 'success' | 'expired' | 'invalid' | 'error'
 
 export const PortalAuthPage = () => {
   const [searchParams] = useSearchParams();
+  const { token: pathToken } = useParams<{ token?: string }>();
   const navigate = useNavigate();
   const [status, setStatus] = useState<AuthStatus>('authenticating');
   const [errorMessage, setErrorMessage] = useState('');
@@ -34,7 +35,8 @@ export const PortalAuthPage = () => {
   const requestNewLinkMutation = useRequestNewLink();
 
   useEffect(() => {
-    const token = searchParams.get('token');
+    // Read token from URL path param (/portal/access/:token) or query param (?token=xxx)
+    const token = pathToken || searchParams.get('token');
 
     if (!token) {
       setStatus('invalid');

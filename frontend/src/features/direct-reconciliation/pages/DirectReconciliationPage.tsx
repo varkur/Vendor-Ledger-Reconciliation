@@ -111,6 +111,7 @@ export const DirectReconciliationPage = () => {
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [showNewDialog, setShowNewDialog] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedVendorFile, setSelectedVendorFile] = useState<File | null>(null);
   const fileUploadRef = useRef<FileUpload>(null);
 
   // ─── API Hooks ───────────────────────────────────────────────────────────────
@@ -132,7 +133,7 @@ export const DirectReconciliationPage = () => {
   const {
     data: vendorsData,
     isLoading: vendorsLoading,
-  } = useVendors(companyCode, { status: 'Active' }, 1, 100);
+  } = useVendors(companyCode, {}, 1, 2000);
 
   // ─── Form Setup ──────────────────────────────────────────────────────────────
   const fiscalYearOptions = useMemo(() => generateFiscalYearOptions(), []);
@@ -149,6 +150,7 @@ export const DirectReconciliationPage = () => {
     control,
     handleSubmit,
     reset,
+    setValue,
     formState: { errors },
   } = useForm<QuickCreateFormData>({
     resolver: zodResolver(quickCreateSchema),
@@ -165,6 +167,7 @@ export const DirectReconciliationPage = () => {
     if (!showNewDialog) {
       reset();
       setSelectedFile(null);
+      setSelectedVendorFile(null);
     }
   }, [showNewDialog, reset]);
 
@@ -208,16 +211,34 @@ export const DirectReconciliationPage = () => {
     setShowNewDialog(true);
   }, []);
 
+  const [fileValidationShown, setFileValidationShown] = useState(false);
+
   const onFormSubmit = useCallback(
-    (data: QuickCreateFormData) => {
+    async (data: QuickCreateFormData) => {
+      if (!selectedFile || !selectedVendorFile) {
+        setFileValidationShown(true);
+        return;
+      }
+      setFileValidationShown(false);
+
+      // Use the direct reconciliation endpoint that accepts both files
+      const formData = new FormData();
+      formData.append('company_file', selectedFile);
+      formData.append('vendor_file', selectedVendorFile);
+      formData.append('config', JSON.stringify({
+        company_code: companyCode,
+        vendor_id: data.vendor_id,
+        fiscal_year: data.fiscal_year,
+        period_start: toISODateString(data.period_start),
+        period_end: toISODateString(data.period_end),
+        tolerance_amount: 1,
+        fuzzy_threshold: 0.8,
+        tds_percentage: 10,
+        gst_percentage: 18,
+      }));
+
       createMutation.mutate(
-        {
-          company_code: companyCode,
-          fiscal_year: data.fiscal_year,
-          period_start: toISODateString(data.period_start),
-          period_end: toISODateString(data.period_end),
-          vendor_ids: [data.vendor_id],
-        },
+        formData as any,
         {
           onSuccess: () => {
             setShowNewDialog(false);
@@ -225,7 +246,7 @@ export const DirectReconciliationPage = () => {
         }
       );
     },
-    [createMutation, companyCode]
+    [createMutation, companyCode, selectedFile, selectedVendorFile]
   );
 
   const handleFileSelect = useCallback((e: FileUploadSelectEvent) => {
@@ -490,6 +511,7 @@ export const DirectReconciliationPage = () => {
               <Message
                 severity="error"
                 text={
+                  (createMutation.error as any)?.response?.data?.detail ??
                   createMutation.error?.message ??
                   'Failed to create reconciliation. Please try again.'
                 }
@@ -506,10 +528,22 @@ export const DirectReconciliationPage = () => {
                 render={({ field }) => (
                   <Dropdown
                     id="fiscal_year"
-                    {...field}
+                    value={field.value}
                     options={fiscalYearOptions}
                     placeholder="Select Fiscal Year"
                     className={errors.fiscal_year ? 'p-invalid' : ''}
+                    onChange={(e) => {
+                      field.onChange(e.value);
+                      // Auto-set period dates based on Indian fiscal year (Apr 1 – Mar 31)
+                      const fy = e.value as string; // e.g., "2025-26"
+                      if (fy && fy.includes('-')) {
+                        const startYear = parseInt(fy.split('-')[0] ?? '0', 10);
+                        if (startYear > 2000) {
+                          setValue('period_start', new Date(startYear, 3, 1)); // Apr 1
+                          setValue('period_end', new Date(startYear + 1, 2, 31)); // Mar 31
+                        }
+                      }
+                    }}
                   />
                 )}
               />
@@ -593,7 +627,7 @@ export const DirectReconciliationPage = () => {
 
             {/* File Upload (Optional) */}
             <div className="field">
-              <label htmlFor="company_ledger">Company Ledger (optional)</label>
+              <label htmlFor="company_ledger">Company Ledger *</label>
               <FileUpload
                 ref={fileUploadRef}
                 mode="basic"
@@ -608,6 +642,36 @@ export const DirectReconciliationPage = () => {
                 <small className="text-color-secondary mt-1">
                   Selected: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
                 </small>
+              )}
+              {!selectedFile && fileValidationShown && (
+                <small className="p-error">Company Ledger is required</small>
+              )}
+            </div>
+
+            {/* Vendor Ledger */}
+            <div className="field">
+              <label htmlFor="vendor_ledger">Vendor Ledger *</label>
+              <FileUpload
+                mode="basic"
+                accept=".xlsx,.xls,.csv"
+                maxFileSize={52428800}
+                chooseLabel={selectedVendorFile ? selectedVendorFile.name : 'Browse File'}
+                auto={false}
+                onSelect={(e) => {
+                  if (e.files && e.files.length > 0) {
+                    const file = e.files[0];
+                    if (file) setSelectedVendorFile(file as unknown as File);
+                  }
+                }}
+                onClear={() => setSelectedVendorFile(null)}
+              />
+              {selectedVendorFile && (
+                <small className="text-color-secondary mt-1">
+                  Selected: {selectedVendorFile.name} ({(selectedVendorFile.size / 1024).toFixed(1)} KB)
+                </small>
+              )}
+              {!selectedVendorFile && fileValidationShown && (
+                <small className="p-error">Vendor Ledger is required</small>
               )}
             </div>
 

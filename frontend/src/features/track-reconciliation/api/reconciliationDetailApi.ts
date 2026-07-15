@@ -88,6 +88,68 @@ export interface BulkActionResponse {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Statistics Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Amount and entry count for a difference or action row. */
+export interface AmountEntry {
+  amount: number;
+  entry_count: number;
+}
+
+/** Amount statistics row for a specific category. */
+export interface AmountCategoryRow {
+  category: string;
+  total_company_amount: number;
+  company_amount_responded: number;
+  party_amount_responded: number;
+  net_difference: number;
+}
+
+/** Statement status counts. */
+export interface StatementStatusCounts {
+  total: number;
+  responded: number;
+  not_responded: number;
+  rejected: number;
+  failed: number;
+}
+
+/** Reconciliation status counts per sub-status. */
+export interface ReconciliationStatusCounts {
+  in_progress: number;
+  statement_received: number;
+  mapping_pending: number;
+  statement_mapped: number;
+  auto_completed: number;
+  review_pending: number;
+  reviewed: number;
+  signoff_requested: number;
+  signoff_completed: number;
+  reco_rejected: number;
+}
+
+/** Reminder info. */
+export interface ReminderInfo {
+  reminders_sent: number;
+  max_reminders: number;
+  last_reminder_date: string | null;
+}
+
+/** Full statistics response from the backend. */
+export interface RequestStatisticsResponse {
+  request_id: string;
+  total_cases: number;
+  cases_by_status: Record<string, number>;
+  statement_status: StatementStatusCounts;
+  reconciliation_status: ReconciliationStatusCounts;
+  amount_statistics: AmountCategoryRow[];
+  reason_for_difference: Record<string, AmountEntry>;
+  action_summary: Record<string, AmountEntry>;
+  reminder_info: ReminderInfo;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // API Functions
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -146,6 +208,22 @@ export async function bulkSignoffRequest(
   const response = await apiClient.post<BulkActionResponse>(
     '/vlr/cases/bulk-signoff-request',
     data
+  );
+  return response.data;
+}
+
+
+/**
+ * Fetch statistics for a reconciliation request.
+ * GET /api/v1/vlr/requests/{request_id}/statistics
+ */
+export async function getRequestStatistics(
+  requestId: string,
+  companyCode: string
+): Promise<RequestStatisticsResponse> {
+  const response = await apiClient.get<RequestStatisticsResponse>(
+    `/vlr/requests/${requestId}/statistics`,
+    { params: { company_code: companyCode } }
   );
   return response.data;
 }

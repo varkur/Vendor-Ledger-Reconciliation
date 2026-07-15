@@ -82,12 +82,22 @@ export interface VendorListResponse {
 
 /**
  * Create a new statement request (reconciliation request).
+ * Extracts backend error messages for user-friendly display.
  */
 export async function createStatementRequest(
   data: CreateStatementRequest
 ): Promise<StatementRequestResponse> {
-  const response = await apiClient.post<StatementRequestResponse>(REQUESTS_BASE, data);
-  return response.data;
+  try {
+    const response = await apiClient.post<StatementRequestResponse>(REQUESTS_BASE, data);
+    return response.data;
+  } catch (error: any) {
+    // Extract the backend detail message for user-friendly errors
+    const detail = error.response?.data?.detail;
+    if (detail) {
+      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    }
+    throw new Error(error.message || 'Failed to create statement request. Please try again.');
+  }
 }
 
 /**
@@ -134,6 +144,7 @@ export interface UploadCompanyLedgerResponse {
 export async function uploadCompanyLedger(
   requestId: string,
   file: File,
+  companyCode: string,
   onProgress?: (progress: number) => void
 ): Promise<UploadCompanyLedgerResponse> {
   const formData = new FormData();
@@ -143,6 +154,7 @@ export async function uploadCompanyLedger(
     `/vlr/reconciliation-requests/${requestId}/upload-company-ledger`,
     formData,
     {
+      params: { company_code: companyCode },
       headers: {
         'Content-Type': 'multipart/form-data',
       },

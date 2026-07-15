@@ -310,10 +310,10 @@ export const ReconciliationDetailPage = () => {
    */
   const getActionLabel = (status: string): string => {
     const s = status.toLowerCase();
-    if (s.includes('completed') || s.includes('closed') || s.includes('auto_completed') || s.includes('signoff_completed')) {
+    if (s.includes('signoff_completed') || s.includes('reco_rejected')) {
       return 'View';
     }
-    if (s.includes('mapping_pending') || s.includes('in_progress')) {
+    if (s.includes('mapping_pending') || s.includes('in_progress') || s.includes('statement_received')) {
       return 'Reconcile';
     }
     if (s.includes('review')) {
@@ -485,7 +485,7 @@ export const ReconciliationDetailPage = () => {
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'statistics' && <StatisticsTab />}
+      {activeTab === 'statistics' && <StatisticsTab requestId={requestId || ''} />}
 
       {activeTab === 'allParties' && renderTabContent(
         <div>
