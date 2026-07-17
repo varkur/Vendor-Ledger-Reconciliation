@@ -541,6 +541,201 @@ reconciliation_requests_router = APIRouter(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# GET /{request_id}/cases — List cases for a request with stage filtering
+# ──────────────────────────────────────────────────────────────────────
+
+
+class BatchCaseRow(BaseModel):
+    """Enriched case row for the Track Reconciliation page."""
+    id: str
+    case_id: str
+    vendor_code: str
+    vendor_name: str
+    status: str
+    workflow_step: str = ""
+    last_update_date: str = ""
+    days_elapsed: int = 0
+    company_amount: float = 0
+    difference_amount: float = 0
+    file_extension: str = ""
+    owner: str = ""
+    reviewer: str = ""
+    no_of_lines: int = 0
+    unmatched_entries: int = 0
+    reminder_count: int = 0
+    contact_person: str = ""
+
+
+class BatchCasesSummary(BaseModel):
+    total_parties: int = 0
+    reco_stage_count: int = 0
+    review_stage_count: int = 0
+    signoff_stage_count: int = 0
+
+
+class BatchCasesResponse(BaseModel):
+    items: list[BatchCaseRow]
+    total: int = 0
+    page: int = 1
+    page_size: int = 50
+    summary: BatchCasesSummary = Field(default_factory=BatchCasesSummary)
+
+
+# Stage filter mapping (maps stage query param to case status values)
+STAGE_STATUS_MAP = {
+    "reconciliation": ["created", "data_received", "matching", "mapping_pending", "statement_mapped", "in_progress", "auto_completed", "matched", "ledger_confirmed", "invited"],
+    "review": ["review", "review_pending", "pending_approval"],
+    "signoff": ["approved", "signed_off", "signoff_requested", "signoff_completed", "closed"],
+    "action_tracker": None,  # Special: returns action summary, not case list
+}
+
+
+@reconciliation_requests_router.get(
+    "/{request_id}/cases",
+    response_model=BatchCasesResponse,
+    summary="List enriched cases for a reconciliation request with stage filtering",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def get_batch_cases(
+    request_id: UUID,
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    stage: str | None = Query(default=None, description="Stage filter: reconciliation, review, signoff"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> BatchCasesResponse:
+    """
+    GET /api/v1/vlr/reconciliation-requests/{request_id}/cases
+
+    Returns enriched case rows with vendor details, computed days elapsed,
+    amounts, and stage filtering for the Track Reconciliation tabs.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select, func, and_, case as sql_case
+    from src.infrastructure.database.models.vlr.reconciliation_case_model import ReconciliationCaseModel
+    from src.infrastructure.database.models.vlr.reconciliation_request_model import ReconciliationRequestModel
+    from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+    from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
+
+    # Verify request belongs to company
+    req_stmt = select(ReconciliationRequestModel).where(
+        ReconciliationRequestModel.id == request_id,
+        ReconciliationRequestModel.company_code == company_code,
+    )
+    req_result = await session.execute(req_stmt)
+    req_obj = req_result.scalar_one_or_none()
+    if req_obj is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    # Base query: cases joined with vendor
+    base_query = (
+        select(ReconciliationCaseModel, VendorModel)
+        .join(VendorModel, ReconciliationCaseModel.vendor_id == VendorModel.id)
+        .where(
+            ReconciliationCaseModel.request_id == request_id,
+            ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+        )
+    )
+
+    # Apply stage filter
+    if stage and stage in STAGE_STATUS_MAP and STAGE_STATUS_MAP[stage] is not None:
+        statuses = STAGE_STATUS_MAP[stage]
+        base_query = base_query.where(ReconciliationCaseModel.status.in_(statuses))
+
+    # Count total
+    count_query = select(func.count()).select_from(
+        base_query.with_only_columns(ReconciliationCaseModel.id).subquery()
+    )
+    total = (await session.execute(count_query)).scalar_one()
+
+    # Paginate
+    offset = (page - 1) * page_size
+    data_query = base_query.order_by(ReconciliationCaseModel.created_date.desc()).offset(offset).limit(page_size)
+    result = await session.execute(data_query)
+    rows = result.all()
+
+    # Build enriched response
+    now = datetime.now(timezone.utc)
+    items: list[BatchCaseRow] = []
+
+    for case_model, vendor_model in rows:
+        # Compute days elapsed
+        created = case_model.created_date
+        days = (now - created).days if created else 0
+
+        # Get company amount (sum of company-side ledger entries)
+        amt_stmt = select(func.coalesce(func.sum(LedgerEntryModel.amount), 0)).where(
+            LedgerEntryModel.case_id == case_model.id,
+            LedgerEntryModel.side == "company",
+        )
+        company_amount = float((await session.execute(amt_stmt)).scalar_one())
+
+        # Get difference amount (net_difference from case or compute)
+        difference = float(case_model.net_difference or 0)
+
+        # Count lines (vendor-side entries)
+        lines_stmt = select(func.count(LedgerEntryModel.id)).where(
+            LedgerEntryModel.case_id == case_model.id,
+            LedgerEntryModel.side == "vendor",
+        )
+        no_of_lines = (await session.execute(lines_stmt)).scalar_one()
+
+        # Count unmatched entries
+        unmatched_stmt = select(func.count(LedgerEntryModel.id)).where(
+            LedgerEntryModel.case_id == case_model.id,
+            LedgerEntryModel.match_id == None,  # noqa: E711
+        )
+        unmatched = (await session.execute(unmatched_stmt)).scalar_one()
+
+        items.append(BatchCaseRow(
+            id=str(case_model.id),
+            case_id=str(case_model.id),
+            vendor_code=vendor_model.vendor_code,
+            vendor_name=vendor_model.name,
+            status=case_model.status,
+            workflow_step=case_model.current_workflow_step or case_model.status,
+            last_update_date=case_model.modified_date.strftime("%d-%b-%Y") if case_model.modified_date else "",
+            days_elapsed=days,
+            company_amount=company_amount,
+            difference_amount=difference,
+            no_of_lines=no_of_lines,
+            unmatched_entries=unmatched,
+            reminder_count=0,
+            owner="",
+            reviewer="",
+            contact_person="",
+        ))
+
+    # Compute summary counts (across ALL cases, not just filtered)
+    all_cases_stmt = select(ReconciliationCaseModel.status).where(
+        ReconciliationCaseModel.request_id == request_id,
+        ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+    )
+    all_cases_result = await session.execute(all_cases_stmt)
+    all_statuses = [r[0] for r in all_cases_result.all()]
+
+    reco_statuses = set(STAGE_STATUS_MAP.get("reconciliation", []))
+    review_statuses = set(STAGE_STATUS_MAP.get("review", []))
+    signoff_statuses = set(STAGE_STATUS_MAP.get("signoff", []))
+
+    summary = BatchCasesSummary(
+        total_parties=len(all_statuses),
+        reco_stage_count=sum(1 for s in all_statuses if s in reco_statuses),
+        review_stage_count=sum(1 for s in all_statuses if s in review_statuses),
+        signoff_stage_count=sum(1 for s in all_statuses if s in signoff_statuses),
+    )
+
+    return BatchCasesResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        summary=summary,
+    )
+
+
 @reconciliation_requests_router.post(
     "/{request_id}/upload-company-ledger",
     response_model=UploadCompanyLedgerResponse,

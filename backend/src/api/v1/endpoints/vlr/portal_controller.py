@@ -315,16 +315,50 @@ async def upload_vendor_statement(
         # Update status to matching
         await case_repo.update(case.id, {"status": "matching", "modified_by": "vendor_portal"})
 
-        # Execute the 7-pass reconciliation engine
+        # Load reconciliation settings from the parent request
+        from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+            ReconciliationRequestModel,
+        )
+        from sqlalchemy import select as sa_select
+        req_stmt = sa_select(ReconciliationRequestModel).where(
+            ReconciliationRequestModel.id == case.request_id
+        )
+        req_result_obj = await session.execute(req_stmt)
+        parent_request = req_result_obj.scalar_one_or_none()
+
+        # Extract settings (with fallback defaults)
+        tolerance_pct = float(parent_request.tolerance_amount or 0) if parent_request else 0
+        tds_pct = float(parent_request.tds_percentage or 0) if parent_request else 0
+        gst_pct = float(parent_request.gst_percentage or 0) if parent_request else 0
+
+        # Convert percentage tolerance to absolute value
+        # For percentage-based tolerance, we pass it as a fraction (1% = 0.01)
+        # The engine will use it as: amount * tolerance_fraction
+        tolerance_fraction = RDecimal(str(tolerance_pct / 100)) if tolerance_pct > 0 else RDecimal("0")
+
+        # Execute the 7-pass reconciliation engine with actual settings
         reco_result = await engine.execute(
             case_id=case.id,
-            tolerance=RDecimal("0"),
+            tolerance=tolerance_fraction,
             fuzzy_threshold=0.8,
-            date_tolerance_days=3,
+            date_tolerance_days=15,  # Max from UI date range setting
+            tds_percentage=RDecimal(str(tds_pct)),
+            gst_percentage=RDecimal(str(gst_pct)),
         )
 
-        # Update status to matched
-        await case_repo.update(case.id, {"status": "matched", "modified_by": "vendor_portal"})
+        # Determine status based on results
+        total_entries = reco_result.statistics.total_company_entries + reco_result.statistics.total_vendor_entries
+        total_matched = reco_result.statistics.total_matched_company + reco_result.statistics.total_matched_vendor
+        has_unmatched = len(reco_result.unmatched_company_ids) > 0 or len(reco_result.unmatched_vendor_ids) > 0
+
+        if has_unmatched:
+            # Not everything matched — needs manual column mapping
+            final_status = "mapping_pending"
+        else:
+            # Everything matched automatically
+            final_status = "auto_completed"
+
+        await case_repo.update(case.id, {"status": final_status, "modified_by": "vendor_portal"})
         reco_status = "reconciliation_complete"
         reco_stats = {
             "total_matched_company": reco_result.statistics.total_matched_company,

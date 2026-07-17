@@ -276,8 +276,13 @@ export const MainLayout = () => {
                 justifyContent: 'center',
                 cursor: 'pointer',
               }}
+              onClick={() => {
+                dispatch({ type: 'auth/logout' });
+                navigate('/login');
+              }}
+              title="Logout"
             >
-              <i className="pi pi-user" style={{ fontSize: 14, color: 'var(--color-primary)' }} />
+              <i className="pi pi-sign-out" style={{ fontSize: 14, color: 'var(--color-primary)' }} />
             </div>
           </div>
         </header>

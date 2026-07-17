@@ -174,6 +174,8 @@ class ReconciliationEngineService:
         tolerance: Decimal = Decimal("0"),
         fuzzy_threshold: float = 0.8,
         date_tolerance_days: int = 3,
+        tds_percentage: Decimal = Decimal("0"),
+        gst_percentage: Decimal = Decimal("0"),
     ) -> ReconciliationResult:
         """
         Execute the full 7-pass reconciliation engine for a case.
@@ -235,6 +237,24 @@ class ReconciliationEngineService:
             matched_company_ids.add(pair.company_entry_id)
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
+
+        # ─── Pass 2.5: TDS/GST Tolerance Match ─────────────────────────────
+        # Match entries where the difference equals TDS% or GST% of the amount
+        # (e.g., company booked ₹100 but vendor shows ₹90 because 10% TDS was deducted)
+        if tds_percentage > 0 or gst_percentage > 0:
+            available_company = [
+                e for e in company_entries if e.id not in matched_company_ids
+            ]
+            available_vendor = [
+                e for e in vendor_entries if e.id not in matched_vendor_ids
+            ]
+            tds_gst_pairs = self._tds_gst_match(
+                available_company, available_vendor, tds_percentage, gst_percentage
+            )
+            for pair in tds_gst_pairs:
+                matched_company_ids.add(pair.company_entry_id)
+                matched_vendor_ids.add(pair.vendor_entry_id)
+                result.match_pairs.append(pair)
 
         # ─── Pass 3: Fuzzy Reference Match ────────────────────────────────
         available_company = [
@@ -396,6 +416,9 @@ class ReconciliationEngineService:
         Match entries where amount difference is within tolerance
         AND reference numbers match exactly.
 
+        Tolerance can be a percentage (fraction like 0.01 for 1%) applied to
+        the company entry amount, or an absolute value if > 1.
+
         Requirement 5.3: Amount within configured Tolerance_Amount
         and reference numbers match.
         """
@@ -404,6 +427,9 @@ class ReconciliationEngineService:
 
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
+
+        # Determine if tolerance is percentage-based (< 1) or absolute (>= 1)
+        is_percentage = tolerance < Decimal("1")
 
         # Build reference lookup for vendor entries
         vendor_by_ref: dict[str, list[LedgerEntryData]] = {}
@@ -416,8 +442,14 @@ class ReconciliationEngineService:
                 if v_entry.id in used_vendor_ids:
                     continue
                 diff = abs(c_entry.amount - v_entry.amount)
-                if diff <= tolerance:
-                    # BRD: Pass 2 confidence = 0.85 (normalized from MatchScore 85)
+
+                # Calculate allowed tolerance
+                if is_percentage:
+                    allowed = abs(c_entry.amount) * tolerance
+                else:
+                    allowed = tolerance
+
+                if diff <= allowed:
                     pairs.append(
                         MatchPair(
                             company_entry_id=c_entry.id,
@@ -430,6 +462,82 @@ class ReconciliationEngineService:
                     )
                     used_vendor_ids.add(v_entry.id)
                     break
+
+        return pairs
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 3: Fuzzy Reference Match
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 2.5: TDS/GST Tolerance Match
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _tds_gst_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        tds_percentage: Decimal,
+        gst_percentage: Decimal,
+    ) -> list[MatchPair]:
+        """
+        Match entries where the amount difference equals TDS% or GST% of the base amount.
+
+        Example: Company records ₹100,000, Vendor records ₹90,000.
+        If TDS = 10%, then ₹100,000 * 0.10 = ₹10,000 = difference. Match!
+
+        This accounts for:
+        - TDS deducted by company (company < vendor by TDS%)
+        - GST differences (one side includes/excludes GST)
+        """
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        tds_fraction = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        gst_fraction = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
+
+        for c_entry in company:
+            if abs(c_entry.amount) == 0:
+                continue
+            for v_entry in vendor:
+                if v_entry.id in used_vendor_ids:
+                    continue
+
+                diff = abs(c_entry.amount - v_entry.amount)
+                base_amount = max(abs(c_entry.amount), abs(v_entry.amount))
+
+                matched = False
+
+                # Check if difference = TDS% of the larger amount
+                if tds_fraction > 0:
+                    expected_tds = abs(base_amount * tds_fraction)
+                    # Allow 1% tolerance on the TDS calculation itself
+                    if abs(diff - expected_tds) <= expected_tds * Decimal("0.01"):
+                        matched = True
+
+                # Check if difference = GST% of the smaller amount
+                if not matched and gst_fraction > 0:
+                    smaller = min(abs(c_entry.amount), abs(v_entry.amount))
+                    expected_gst = abs(smaller * gst_fraction)
+                    if abs(diff - expected_gst) <= expected_gst * Decimal("0.01"):
+                        matched = True
+
+                if matched:
+                    # Also verify references have some similarity (>50%)
+                    ref_sim = self._reference_similarity(
+                        c_entry.reference_number, v_entry.reference_number
+                    )
+                    if ref_sim >= 0.5 or c_entry.reference_number == v_entry.reference_number:
+                        pairs.append(
+                            MatchPair(
+                                company_entry_id=c_entry.id,
+                                vendor_entry_id=v_entry.id,
+                                confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
+                                pass_number=MatchPassType.TOLERANCE,
+                                matched_amount=c_entry.amount,
+                                difference_amount=c_entry.amount - v_entry.amount,
+                            )
+                        )
+                        used_vendor_ids.add(v_entry.id)
+                        break
 
         return pairs
 

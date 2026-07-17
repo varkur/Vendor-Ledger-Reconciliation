@@ -130,7 +130,7 @@ export const TrackReconciliationPage = () => {
     <div className="flex align-items-center gap-2">
       <span
         className="link-view"
-        onClick={() => navigate(`/track-reconciliation/${rowData.id}`)}
+        onClick={() => navigate(`/track-reconciliation/${rowData.request_id}`)}
         style={{ cursor: 'pointer' }}
       >
         View
