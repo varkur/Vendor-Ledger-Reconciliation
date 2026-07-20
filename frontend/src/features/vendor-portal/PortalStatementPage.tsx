@@ -160,15 +160,15 @@ export const PortalStatementPage = () => {
   // Determine displayed status
   const displayStatus = caseIsDisputed ? 'disputed' : statement.status;
 
-  // Sign-off is only allowed when the case is in certain statuses
-  const SIGN_OFF_ALLOWED_STATUSES = ['matched', 'review_complete', 'awaiting_signoff'];
+  // Sign-off is only allowed once the reconciliation team has requested it.
+  const SIGN_OFF_ALLOWED_STATUSES = ['signoff_requested'];
   const canProceedToSignOff = !caseIsDisputed && SIGN_OFF_ALLOWED_STATUSES.includes(statement.status);
 
   const getSignOffDisabledReason = (): string => {
     if (caseIsDisputed) {
       return 'Sign-off is not available because a dispute has been raised on this reconciliation.';
     }
-    return 'Sign-off is not available yet. The reconciliation must be in "Matched" or "Review Complete" state before you can proceed.';
+    return 'Sign-off is not available yet. The reconciliation team must request your sign-off first.';
   };
 
   const handleOpenDisputeDialog = () => {

@@ -280,12 +280,15 @@ async def get_request_statistics(
     total_cases = sum(cases_by_status.values())
 
     # ─── Statement Status ─────────────────────────────────────────────────
-    # Map case statuses to statement status buckets
+    # Map case statuses to statement status buckets. A vendor has "responded"
+    # once they've uploaded (any status past 'created'/'invited').
     responded_statuses = {
         "data_received", "matching", "matched", "review",
         "pending_approval", "approved", "signed_off", "closed",
+        "mapping_pending", "statement_mapped", "in_progress", "auto_completed",
+        "review_pending", "reviewed", "signoff_requested", "signoff_completed",
     }
-    rejected_statuses = {"rejected"}
+    rejected_statuses = {"rejected", "reco_rejected"}
     failed_statuses = {"failed"}
 
     responded = sum(v for k, v in cases_by_status.items() if k in responded_statuses)
@@ -302,10 +305,10 @@ async def get_request_statistics(
     )
 
     # ─── Reconciliation Status ────────────────────────────────────────────
-    # These are more granular statuses tracked via current_workflow_step
-    workflow_step_stmt = (
+    # Use the actual case status field (reflects real reconciliation state)
+    status_stmt = (
         sa_select(
-            ReconciliationCaseModel.current_workflow_step,
+            ReconciliationCaseModel.status,
             func.count(ReconciliationCaseModel.id).label("count"),
         )
         .join(
@@ -317,21 +320,21 @@ async def get_request_statistics(
             ReconciliationCaseModel.is_deleted == False,  # noqa: E712
             ReconciliationRequestModel.company_code == company_code,
         )
-        .group_by(ReconciliationCaseModel.current_workflow_step)
+        .group_by(ReconciliationCaseModel.status)
     )
-    ws_result = await session.execute(workflow_step_stmt)
+    ws_result = await session.execute(status_stmt)
     step_counts = {(row[0] or "unknown"): row[1] for row in ws_result.all()}
 
     reconciliation_status = ReconciliationStatusCounts(
-        in_progress=step_counts.get("in_progress", 0),
-        statement_received=step_counts.get("statement_received", 0),
+        in_progress=step_counts.get("in_progress", 0) + step_counts.get("matching", 0) + step_counts.get("created", 0),
+        statement_received=step_counts.get("data_received", 0) + step_counts.get("statement_received", 0),
         mapping_pending=step_counts.get("mapping_pending", 0),
         statement_mapped=step_counts.get("statement_mapped", 0),
-        auto_completed=step_counts.get("auto_completed", 0),
-        review_pending=step_counts.get("review_pending", 0),
+        auto_completed=step_counts.get("auto_completed", 0) + step_counts.get("matched", 0),
+        review_pending=step_counts.get("review_pending", 0) + step_counts.get("review", 0),
         reviewed=step_counts.get("reviewed", 0),
         signoff_requested=step_counts.get("signoff_requested", 0),
-        signoff_completed=step_counts.get("signoff_completed", 0),
+        signoff_completed=step_counts.get("signoff_completed", 0) + step_counts.get("signed_off", 0),
         reco_rejected=step_counts.get("reco_rejected", 0),
     )
 
@@ -854,6 +857,21 @@ async def upload_company_ledger(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No cases found for reconciliation request {request_id}.",
+        )
+
+    # ─── Save original file headers for column mapping UI ────────────────
+    if result.raw_headers:
+        import json as _json
+        from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
+            SettingRepositoryImpl as _SettingRepoHeaders,
+        )
+        _headers_repo = _SettingRepoHeaders(session)
+        await _headers_repo.upsert(
+            company_code="__global__",
+            key=f"file_headers.{case.id}.company",
+            value=_json.dumps(result.raw_headers),
+            value_type="json",
+            description="Original file headers from company ledger upload",
         )
 
     # ─── Store ledger entries ─────────────────────────────────────────────

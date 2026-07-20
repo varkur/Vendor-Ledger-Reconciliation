@@ -231,6 +231,15 @@ class DifferencesSummaryResponse(BaseModel):
     total_pending_confirmation: int = Field(
         0, description="Total entries pending finance confirmation"
     )
+    unmatched_company_amount: Decimal = Field(
+        Decimal("0"), description="Sum of unmatched company entry amounts (excl. balances)"
+    )
+    unmatched_vendor_amount: Decimal = Field(
+        Decimal("0"), description="Sum of unmatched vendor entry amounts (excl. balances)"
+    )
+    residual_difference: Decimal = Field(
+        Decimal("0"), description="Net residual difference from unmatched items (company - vendor)"
+    )
 
     model_config = {"from_attributes": True}
 

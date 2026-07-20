@@ -13,6 +13,9 @@ import { DirectReconciliationPage } from '@features/direct-reconciliation/pages/
 import { TrackReconciliationPage } from '@features/track-reconciliation/pages/TrackReconciliationPage';
 import { ReconciliationDetailPage } from '@features/track-reconciliation/pages/ReconciliationDetailPage';
 import { ReconciliationOutputPage } from '@features/track-reconciliation/pages/ReconciliationOutputPage';
+import { ColumnMappingPage } from '@features/track-reconciliation/pages/ColumnMappingPage';
+import { MappingFormPage } from '@features/track-reconciliation/pages/MappingFormPage';
+import { LinkUnmatchedPage } from '@features/track-reconciliation/pages/LinkUnmatchedPage';
 import { RolesPage } from '@features/rbac-admin/pages/RolesPage';
 import { AuditLogsPage } from '@features/rbac-admin/pages/AuditLogsPage';
 import { ExceptionListPage } from '@features/exceptions/ExceptionListPage';
@@ -72,7 +75,10 @@ export const AppRouter = () => {
           <Route path="direct-reconciliation" element={<DirectReconciliationPage />} />
           <Route path="track-reconciliation" element={<TrackReconciliationPage />} />
           <Route path="track-reconciliation/:requestId" element={<ReconciliationDetailPage />} />
+          <Route path="track-reconciliation/:requestId/:caseId" element={<ColumnMappingPage />} />
+          <Route path="track-reconciliation/:requestId/:caseId/mapping/:side" element={<MappingFormPage />} />
           <Route path="track-reconciliation/:requestId/case/:caseId" element={<ReconciliationOutputPage />} />
+          <Route path="track-reconciliation/:requestId/case/:caseId/link" element={<LinkUnmatchedPage />} />
 
           {/* Exception Management */}
           <Route path="exceptions" element={<ExceptionListPage />} />

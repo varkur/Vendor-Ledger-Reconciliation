@@ -112,6 +112,7 @@ class FileValidationResult:
     errors: list[str] = field(default_factory=list)
     row_count: int = 0
     file_type: FileType | None = None
+    raw_headers: list[str] = field(default_factory=list)
 
 
 class FileParserService:
@@ -249,6 +250,8 @@ class FileParserService:
 
             # Normalize headers (strip whitespace, lowercase)
             raw_headers = [h.strip().lower() for h in reader.fieldnames]
+            # Keep original-case headers for UI display
+            original_headers = [h.strip() for h in reader.fieldnames]
 
             # Validate mandatory columns
             column_mapping = self._resolve_column_mapping(raw_headers)
@@ -289,6 +292,7 @@ class FileParserService:
                     errors=row_errors,
                     row_count=len(entries) + len(row_errors),
                     file_type=file_type,
+                    raw_headers=original_headers,
                 )
 
             return FileValidationResult(
@@ -296,6 +300,7 @@ class FileParserService:
                 entries=entries,
                 row_count=len(entries),
                 file_type=file_type,
+                raw_headers=original_headers,
             )
 
         except csv.Error as e:
@@ -349,6 +354,11 @@ class FileParserService:
                 str(h).strip().lower() if h is not None else ""
                 for h in rows[0]
             ]
+            # Keep original-case headers for UI display
+            original_headers = [
+                str(h).strip() if h is not None else ""
+                for h in rows[0]
+            ]
 
             # If first row has mostly empty cells or only 1 meaningful cell,
             # it's likely a title row — try the next row
@@ -357,6 +367,10 @@ class FileParserService:
                 header_row_idx = 1
                 raw_headers = [
                     str(h).strip().lower() if h is not None else ""
+                    for h in rows[1]
+                ]
+                original_headers = [
+                    str(h).strip() if h is not None else ""
                     for h in rows[1]
                 ]
 
@@ -412,6 +426,7 @@ class FileParserService:
                     errors=row_errors,
                     row_count=len(entries) + len(row_errors),
                     file_type=file_type,
+                    raw_headers=[h for h in original_headers if h],
                 )
 
             return FileValidationResult(
@@ -419,6 +434,7 @@ class FileParserService:
                 entries=entries,
                 row_count=len(entries),
                 file_type=file_type,
+                raw_headers=[h for h in original_headers if h],
             )
 
         except Exception as e:

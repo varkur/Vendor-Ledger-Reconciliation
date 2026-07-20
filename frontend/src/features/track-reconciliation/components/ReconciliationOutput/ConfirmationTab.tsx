@@ -86,7 +86,7 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
   };
 
   const differenceTemplate = (rowData: ConfirmationItem) => {
-    const value = rowData.difference;
+    const value = Number(rowData.difference ?? 0);
     return (
       <span className={value !== 0 ? 'text-orange-500 font-semibold' : ''}>
         {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}

@@ -79,10 +79,10 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
   // ─── Column Templates ────────────────────────────────────────────────────────
 
   const amountTemplate = (rowData: UnmatchedVendorItem) => {
-    const value = rowData.amount;
+    const value = Number(rowData.amount ?? 0);
     return (
       <span className={value < 0 ? 'text-red-500' : ''}>
-        {rowData.currency} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        {rowData.currency ?? 'INR'} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
       </span>
     );
   };

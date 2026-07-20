@@ -47,8 +47,13 @@ export const PortalAuthPage = () => {
       onSuccess: (data) => {
         setAuthenticated(token, data);
         setStatus('success');
-        // Auto-redirect after successful auth
-        setTimeout(() => navigate('/portal/upload'), 1500);
+        // Route based on case status: sign-off states go to the statement/sign-off
+        // page; otherwise the vendor uploads their statement.
+        const s = (data.status || '').toLowerCase();
+        const dest = ['signoff_requested', 'reviewed', 'signoff_completed', 'signed_off', 'closed'].includes(s)
+          ? '/portal/statement'
+          : '/portal/upload';
+        setTimeout(() => navigate(dest), 1500);
       },
       onError: (error) => {
         const statusCode = error.response?.status;
@@ -80,7 +85,11 @@ export const PortalAuthPage = () => {
       onSuccess: (data) => {
         setAuthenticated(token, data);
         setStatus('success');
-        setTimeout(() => navigate('/portal/upload'), 1500);
+        const s = (data.status || '').toLowerCase();
+        const dest = ['signoff_requested', 'reviewed', 'signoff_completed', 'signed_off', 'closed'].includes(s)
+          ? '/portal/statement'
+          : '/portal/upload';
+        setTimeout(() => navigate(dest), 1500);
       },
       onError: (error) => {
         const statusCode = error.response?.status;

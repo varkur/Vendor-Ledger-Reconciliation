@@ -26,6 +26,10 @@ DEFAULT_DOC_TYPE_MAP: dict[str, str] = {
     "RO": "Receipt",
     # TDS
     "KA": "TDS Adjusted",
+    # Opening / Closing Balance markers
+    "OP": "Opening Balance",
+    "CL": "Closing Balance",
+    "BAL": "Opening Balance",
 }
 
 # Standard Firmway categories for the mapping dropdown

@@ -28,7 +28,7 @@ interface DifferencesSummaryTabProps {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function formatAmount(value: number, currency?: string): string {
-  const formatted = value.toLocaleString(undefined, {
+  const formatted = Number(value ?? 0).toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -78,6 +78,11 @@ export const DifferencesSummaryTab = ({ caseId }: DifferencesSummaryTabProps) =>
   }
 
   const { balance_comparison, type_totals, net_difference, currency } = data;
+  const unmatchedCompanyAmt = (data as any).unmatched_company_amount ?? 0;
+  const unmatchedVendorAmt = (data as any).unmatched_vendor_amount ?? 0;
+  const residualDiff = (data as any).residual_difference ?? 0;
+  const unmatchedCompanyCount = (data as any).total_unmatched_company ?? 0;
+  const unmatchedVendorCount = (data as any).total_unmatched_vendor ?? 0;
 
   // ─── Column Templates for Type Totals ────────────────────────────────────────
 
@@ -182,6 +187,40 @@ export const DifferencesSummaryTab = ({ caseId }: DifferencesSummaryTabProps) =>
               <Tag value="Unreconciled" severity="warning" />
             )}
           </div>
+        </div>
+      </div>
+
+      {/* Residual Difference Breakdown (from unmatched items) */}
+      <div className="em-card">
+        <h4 className="mt-0 mb-3">Unreconciled Difference (from unmatched items)</h4>
+        <div className="flex flex-column gap-2">
+          <div className="flex justify-content-between align-items-center">
+            <span className="text-color-secondary">
+              Unmatched Company Entries ({unmatchedCompanyCount})
+            </span>
+            <span className="font-semibold">
+              {formatAmount(unmatchedCompanyAmt, currency)}
+            </span>
+          </div>
+          <div className="flex justify-content-between align-items-center">
+            <span className="text-color-secondary">
+              Unmatched Vendor Entries ({unmatchedVendorCount})
+            </span>
+            <span className="font-semibold">
+              {formatAmount(unmatchedVendorAmt, currency)}
+            </span>
+          </div>
+          <hr className="my-2" style={{ borderColor: 'var(--color-surface-border)' }} />
+          <div className="flex justify-content-between align-items-center">
+            <span className="font-semibold">Residual Difference</span>
+            <span className={`text-xl font-bold ${Math.abs(residualDiff) < 0.01 ? 'text-green-600' : 'text-orange-500'}`}>
+              {formatAmount(residualDiff, currency)}
+            </span>
+          </div>
+          <small className="text-color-secondary mt-1">
+            This is the net gap remaining after all matched items are removed. Resolve the
+            unmatched entries (timing differences, unbooked invoices, adjustments) to bring this to zero.
+          </small>
         </div>
       </div>
 

@@ -14,7 +14,12 @@ import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Tag } from 'primereact/tag';
 
+import { useRef } from 'react';
+import { Button } from 'primereact/button';
+import { Toast } from 'primereact/toast';
+import { useQueryClient } from '@tanstack/react-query';
 import { useMatchedItems } from './useReconciliationOutput';
+import { manualUnlink } from './reconciliationOutputApi';
 import type { ListParams, MatchedItem, MatchType } from './reconciliationOutputApi';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,6 +28,7 @@ import type { ListParams, MatchedItem, MatchType } from './reconciliationOutputA
 
 interface MatchedItemsTabProps {
   caseId: string;
+  editable?: boolean;
 }
 
 const MATCH_TYPE_OPTIONS = [
@@ -68,7 +74,7 @@ function getConfidenceSeverity(score: number): 'success' | 'warning' | 'danger' 
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const MatchedItemsTab = ({ caseId }: MatchedItemsTabProps) => {
+export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabProps) => {
   const [params, setParams] = useState<ListParams>({
     page: 1,
     page_size: 10,
@@ -77,6 +83,18 @@ export const MatchedItemsTab = ({ caseId }: MatchedItemsTabProps) => {
   });
   const [searchInput, setSearchInput] = useState('');
   const [matchTypeFilter, setMatchTypeFilter] = useState<string>('');
+  const toast = useRef<Toast>(null);
+  const queryClient = useQueryClient();
+
+  const handleUnlink = async (matchId: string) => {
+    try {
+      await manualUnlink(caseId, matchId);
+      toast.current?.show({ severity: 'success', summary: 'Unlinked', detail: 'Match removed; entries returned to unmatched.', life: 4000 });
+      queryClient.invalidateQueries({ queryKey: ['vlr', 'reconciliation', caseId] });
+    } catch (err: any) {
+      toast.current?.show({ severity: 'error', summary: 'Unlink Failed', detail: err.response?.data?.detail || 'Failed to unlink.', life: 6000 });
+    }
+  };
 
   const { data, isLoading, error, refetch } = useMatchedItems(caseId, {
     ...params,
@@ -125,10 +143,10 @@ export const MatchedItemsTab = ({ caseId }: MatchedItemsTabProps) => {
   };
 
   const amountTemplate = (field: 'company_amount' | 'vendor_amount') => (rowData: MatchedItem) => {
-    const value = rowData[field];
+    const value = Number(rowData[field] ?? 0);
     return (
       <span className={value < 0 ? 'text-red-500' : ''}>
-        {rowData.currency} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        {rowData.currency ?? 'INR'} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
       </span>
     );
   };
@@ -170,6 +188,7 @@ export const MatchedItemsTab = ({ caseId }: MatchedItemsTabProps) => {
 
   return (
     <div>
+      <Toast ref={toast} />
       {/* Filter Bar */}
       <div className="flex align-items-center gap-3 mb-3">
         <div className="em-search-bar">
@@ -221,6 +240,41 @@ export const MatchedItemsTab = ({ caseId }: MatchedItemsTabProps) => {
           <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ width: '10%', textAlign: 'center' }} />
           <Column field="posting_date" header="Posting Date" sortable style={{ width: '12%' }} />
           <Column field="document_type" header="Doc Type" sortable style={{ width: '10%' }} />
+          {editable && (
+            <Column
+              header="Action"
+              style={{ width: '9%', textAlign: 'center' }}
+              body={(row: MatchedItem) => (
+                <button
+                  onClick={() => handleUnlink((row as any).id)}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '5px 12px',
+                    fontSize: '0.8rem',
+                    fontWeight: 600,
+                    color: '#dc2626',
+                    background: '#fff',
+                    border: '1px solid #dc2626',
+                    borderRadius: 6,
+                    cursor: 'pointer',
+                  }}
+                  onMouseOver={(e) => {
+                    e.currentTarget.style.background = '#dc2626';
+                    e.currentTarget.style.color = '#fff';
+                  }}
+                  onMouseOut={(e) => {
+                    e.currentTarget.style.background = '#fff';
+                    e.currentTarget.style.color = '#dc2626';
+                  }}
+                >
+                  <i className="pi pi-times" style={{ fontSize: '0.7rem' }} />
+                  Unlink
+                </button>
+              )}
+            />
+          )}
         </DataTable>
       </div>
     </div>

@@ -223,6 +223,23 @@ class ReconciliationEngineService:
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
 
+        # ─── Pass 1.5: Amount + Date Match (ignoring doc number) ──────────
+        # Most common scenario: company SAP doc numbers don't match vendor invoice numbers
+        # but amounts are exactly equal and dates are close
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        amount_date_pairs = self._amount_date_match(
+            available_company, available_vendor, date_tolerance_days
+        )
+        for pair in amount_date_pairs:
+            matched_company_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
         # ─── Pass 2: Tolerance Match ─────────────────────────────────────
         available_company = [
             e for e in company_entries if e.id not in matched_company_ids
@@ -320,6 +337,26 @@ class ReconciliationEngineService:
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
 
+        # ─── Pass 6.5: Tolerance + Date Match (amounts within tolerance) ──
+        # Catches invoices that differ by GST rounding or small journal
+        # adjustments (e.g. company 208,683 vs vendor 208,860, diff 177).
+        # Only applies when tolerance/tds/gst settings allow a difference.
+        if tolerance > 0 or tds_percentage > 0 or gst_percentage > 0:
+            available_company = [
+                e for e in company_entries if e.id not in matched_company_ids
+            ]
+            available_vendor = [
+                e for e in vendor_entries if e.id not in matched_vendor_ids
+            ]
+            tol_date_pairs = self._tolerance_date_match(
+                available_company, available_vendor,
+                tolerance, tds_percentage, gst_percentage, date_tolerance_days,
+            )
+            for pair in tol_date_pairs:
+                matched_company_ids.add(pair.company_entry_id)
+                matched_vendor_ids.add(pair.vendor_entry_id)
+                result.match_pairs.append(pair)
+
         # ─── Pass 7: Mark Unmatched ───────────────────────────────────────
         result.unmatched_company_ids = [
             e.id for e in company_entries if e.id not in matched_company_ids
@@ -344,6 +381,11 @@ class ReconciliationEngineService:
         # Persist results
         await self._persist_results(case_id, result, company_entries, vendor_entries)
 
+        # Compute and store balances, document categories, and net difference
+        await self._compute_summary_fields(
+            case_id, company_entries_raw, vendor_entries_raw
+        )
+
         duration_ms = (time.perf_counter() - start) * 1000
         _structured_logger.log_success(
             operation="execute_reconciliation",
@@ -358,6 +400,89 @@ class ReconciliationEngineService:
         )
 
         return result
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Summary Field Computation (balances, categories, net difference)
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def _compute_summary_fields(
+        self,
+        case_id: UUID,
+        company_entries_raw: list,
+        vendor_entries_raw: list,
+    ) -> None:
+        """
+        Compute opening/closing balances, classify document categories, and
+        net difference. Stores balances + net_difference on the case and
+        updates document_category on each ledger entry.
+        """
+        from src.domain.services.vlr.doc_type_mapping import classify_document_type
+
+        def _classify_entries(entries: list) -> None:
+            """Set document_category on each entry based on its doc type."""
+            for e in entries:
+                dt = getattr(e, "document_type", None)
+                if dt:
+                    category = classify_document_type(dt)
+                    # If not in the SAP map, use the doc type itself if it's already a category
+                    if category == "Unknown":
+                        # Vendor ledgers often already have category-like doc types
+                        lowered = dt.lower()
+                        if "open" in lowered:
+                            category = "Opening Balance"
+                        elif "clos" in lowered:
+                            category = "Closing Balance"
+                        elif "sale" in lowered or "invoice" in lowered:
+                            category = "Invoice"
+                        elif "payment" in lowered or "receipt" in lowered:
+                            category = "Payment"
+                        elif "journal" in lowered:
+                            category = "Journal"
+                        else:
+                            category = dt
+                    e.document_category = category
+
+        _classify_entries(company_entries_raw)
+        _classify_entries(vendor_entries_raw)
+
+        def _find_balance(entries: list, keyword: str) -> Decimal | None:
+            """Find opening/closing balance from entries by category keyword."""
+            for e in entries:
+                cat = (getattr(e, "document_category", "") or "").lower()
+                if keyword in cat:
+                    amt = getattr(e, "amount", None)
+                    if amt is not None:
+                        return Decimal(str(amt))
+            return None
+
+        company_opening = _find_balance(company_entries_raw, "opening")
+        company_closing = _find_balance(company_entries_raw, "closing")
+        vendor_opening = _find_balance(vendor_entries_raw, "opening")
+        vendor_closing = _find_balance(vendor_entries_raw, "closing")
+
+        # Net difference = company closing - vendor closing (if both present)
+        net_difference = None
+        if company_closing is not None and vendor_closing is not None:
+            net_difference = company_closing - vendor_closing
+
+        # Persist balance/category updates via the ledger repo's session
+        await self._ledger_repo._session.flush()
+
+        # Update case with balances and net difference
+        update_data: dict = {}
+        if company_opening is not None:
+            update_data["company_opening_balance"] = company_opening
+        if company_closing is not None:
+            update_data["company_closing_balance"] = company_closing
+        if vendor_opening is not None:
+            update_data["vendor_opening_balance"] = vendor_opening
+        if vendor_closing is not None:
+            update_data["vendor_closing_balance"] = vendor_closing
+        if net_difference is not None:
+            update_data["net_difference"] = net_difference
+
+        if update_data:
+            await self._case_repo.update(case_id, update_data)
 
     # ──────────────────────────────────────────────────────────────────────
     # Pass 1: Exact Match
@@ -399,6 +524,160 @@ class ReconciliationEngineService:
                     )
                     used_vendor_ids.add(v_entry.id)
                     break
+
+        return pairs
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 1.5: Amount + Date Match (cross-format doc numbers)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _amount_date_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        date_tolerance_days: int = 15,
+    ) -> list[MatchPair]:
+        """
+        Match entries where amounts are exactly equal (with sign flip since company
+        records payables as negative, vendor records sales as positive) and dates
+        are within tolerance days.
+
+        This is the most common matching scenario between SAP company ledgers and
+        vendor ledgers where document numbers use different formats.
+
+        Confidence: 0.90 (high confidence since amounts match exactly)
+        """
+        from datetime import timedelta
+
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        # Build vendor lookup by absolute amount for fast matching
+        vendor_by_abs_amount: dict[Decimal, list[LedgerEntryData]] = {}
+        for v_entry in vendor:
+            abs_amt = abs(v_entry.amount)
+            vendor_by_abs_amount.setdefault(abs_amt, []).append(v_entry)
+
+        for c_entry in company:
+            abs_c_amount = abs(c_entry.amount)
+            candidates = vendor_by_abs_amount.get(abs_c_amount, [])
+
+            best_match: LedgerEntryData | None = None
+            best_date_diff: int = date_tolerance_days + 1
+
+            for v_entry in candidates:
+                if v_entry.id in used_vendor_ids:
+                    continue
+
+                # Check date proximity
+                if c_entry.posting_date and v_entry.posting_date:
+                    try:
+                        c_date = c_entry.posting_date
+                        v_date = v_entry.posting_date
+                        date_diff = abs((c_date - v_date).days)
+                    except (TypeError, AttributeError):
+                        date_diff = 0
+                else:
+                    date_diff = 0
+
+                if date_diff <= date_tolerance_days and date_diff < best_date_diff:
+                    best_date_diff = date_diff
+                    best_match = v_entry
+
+            if best_match is not None:
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=best_match.id,
+                        confidence_score=0.90,
+                        pass_number=MatchPassType.EXACT,  # Categorize under exact for simplicity
+                        matched_amount=c_entry.amount,
+                        difference_amount=c_entry.amount + best_match.amount,  # sign-aware diff
+                    )
+                )
+                used_vendor_ids.add(best_match.id)
+
+        return pairs
+
+    def _tolerance_date_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        tolerance: Decimal,
+        tds_percentage: Decimal,
+        gst_percentage: Decimal,
+        date_tolerance_days: int = 15,
+    ) -> list[MatchPair]:
+        """
+        Match entries whose ABSOLUTE amounts are within an allowed difference
+        (tolerance %, TDS %, or GST %) and whose dates are within tolerance days,
+        WITHOUT requiring reference numbers to match.
+
+        Catches invoices that differ by GST rounding or small journal adjustments
+        (e.g. company 208,683 vs vendor 208,860 → diff 177 within tolerance).
+        These are flagged as needing confirmation (Pass 6 confidence).
+        """
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        # Determine tolerance fraction (tolerance may be percentage < 1 or absolute)
+        is_pct = tolerance < Decimal("1")
+        tds_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
+
+        for c_entry in company:
+            abs_c = abs(c_entry.amount)
+            if abs_c == 0:
+                continue
+
+            # Compute the maximum allowed absolute difference for this entry
+            allowed = Decimal("0")
+            if tolerance > 0:
+                allowed = abs_c * tolerance if is_pct else tolerance
+            # Also allow up to the larger of TDS/GST portion (some diffs are tax-driven)
+            tax_allowed = abs_c * max(tds_frac, gst_frac)
+            allowed = max(allowed, tax_allowed)
+            # A small floor to absorb rounding (₹5)
+            allowed = max(allowed, Decimal("5"))
+
+            best_match: LedgerEntryData | None = None
+            best_diff: Decimal | None = None
+
+            for v_entry in vendor:
+                if v_entry.id in used_vendor_ids:
+                    continue
+
+                diff = abs(abs_c - abs(v_entry.amount))
+                if diff > allowed:
+                    continue
+
+                # Date proximity check
+                if c_entry.posting_date and v_entry.posting_date:
+                    try:
+                        date_diff = abs((c_entry.posting_date - v_entry.posting_date).days)
+                    except (TypeError, AttributeError):
+                        date_diff = 0
+                else:
+                    date_diff = 0
+                if date_diff > date_tolerance_days:
+                    continue
+
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_match = v_entry
+
+            if best_match is not None:
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=best_match.id,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
+                        pass_number=MatchPassType.TOLERANCE,
+                        matched_amount=c_entry.amount,
+                        difference_amount=c_entry.amount + best_match.amount,
+                    )
+                )
+                used_vendor_ids.add(best_match.id)
 
         return pairs
 
@@ -615,9 +894,9 @@ class ReconciliationEngineService:
         groups: list[MatchGroup] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Sort company entries by amount descending (larger amounts more likely
-        # to be sums of multiple smaller vendor entries)
-        sorted_company = sorted(company, key=lambda e: e.amount, reverse=True)
+        # Sort company entries by absolute amount descending (larger amounts more
+        # likely to be sums of multiple smaller vendor entries)
+        sorted_company = sorted(company, key=lambda e: abs(e.amount), reverse=True)
 
         for c_entry in sorted_company:
             available_vendor = [
@@ -626,22 +905,22 @@ class ReconciliationEngineService:
             if len(available_vendor) < 2:
                 continue
 
-            # Find subset of vendor entries that sum to company amount
+            # Find subset of vendor entries whose absolute amounts sum to company amount
             matching_subset = self._find_subset_sum(
                 available_vendor, c_entry.amount
             )
 
             if matching_subset and len(matching_subset) >= 2:
                 vendor_ids = [v.id for v in matching_subset]
-                total_amount = sum(v.amount for v in matching_subset)
+                total_amount = sum(abs(v.amount) for v in matching_subset)
                 groups.append(
                     MatchGroup(
                         company_entry_ids=[c_entry.id],
                         vendor_entry_ids=vendor_ids,
                         confidence_score=CONFIDENCE_SCORES[MatchPassType.ONE_TO_MANY],
                         pass_number=MatchPassType.ONE_TO_MANY,
-                        matched_amount=c_entry.amount,
-                        difference_amount=c_entry.amount - total_amount,
+                        matched_amount=abs(c_entry.amount),
+                        difference_amount=abs(c_entry.amount) - total_amount,
                     )
                 )
                 for vid in vendor_ids:
@@ -666,8 +945,8 @@ class ReconciliationEngineService:
         groups: list[MatchGroup] = []
         used_company_ids: set[UUID] = set()
 
-        # Sort vendor entries by amount descending
-        sorted_vendor = sorted(vendor, key=lambda e: e.amount, reverse=True)
+        # Sort vendor entries by absolute amount descending
+        sorted_vendor = sorted(vendor, key=lambda e: abs(e.amount), reverse=True)
 
         for v_entry in sorted_vendor:
             available_company = [
@@ -676,22 +955,22 @@ class ReconciliationEngineService:
             if len(available_company) < 2:
                 continue
 
-            # Find subset of company entries that sum to vendor amount
+            # Find subset of company entries whose absolute amounts sum to vendor amount
             matching_subset = self._find_subset_sum(
                 available_company, v_entry.amount
             )
 
             if matching_subset and len(matching_subset) >= 2:
                 company_ids = [c.id for c in matching_subset]
-                total_amount = sum(c.amount for c in matching_subset)
+                total_amount = sum(abs(c.amount) for c in matching_subset)
                 groups.append(
                     MatchGroup(
                         company_entry_ids=company_ids,
                         vendor_entry_ids=[v_entry.id],
                         confidence_score=CONFIDENCE_SCORES[MatchPassType.MANY_TO_ONE],
                         pass_number=MatchPassType.MANY_TO_ONE,
-                        matched_amount=v_entry.amount,
-                        difference_amount=total_amount - v_entry.amount,
+                        matched_amount=abs(v_entry.amount),
+                        difference_amount=total_amount - abs(v_entry.amount),
                     )
                 )
                 for cid in company_ids:
@@ -839,30 +1118,40 @@ class ReconciliationEngineService:
         entries: list[LedgerEntryData],
         target: Decimal,
         max_subset_size: int = 5,
+        tolerance: Decimal = Decimal("0.01"),
     ) -> list[LedgerEntryData] | None:
         """
-        Find a subset of entries whose amounts sum to the target.
-        Limits search to combinations of up to max_subset_size entries
-        for performance (Requirement 5.8).
+        Find a subset of entries whose ABSOLUTE amounts sum to the absolute target.
 
-        Returns the matching subset or None if not found.
+        Sign-aware: company records payments as positive while vendor records
+        receipts as negative (and vice-versa). Matching is done on absolute
+        values so that e.g. company payments (+73,750 + +641,625) match a
+        vendor receipt (-715,375).
+
+        A small tolerance absorbs rounding differences.
+        Limits search to combinations of up to max_subset_size entries.
         """
         from itertools import combinations
 
-        # Limit to entries with amounts that could plausibly sum to target
-        # (positive amounts less than or equal to target)
-        candidates = [e for e in entries if Decimal("0") < e.amount <= target]
+        abs_target = abs(target)
+        if abs_target == 0:
+            return None
 
-        # Try combinations of increasing size (2 to max_subset_size)
-        max_candidates = min(len(candidates), 20)  # Performance cap
+        # Use absolute values; only consider entries not larger than the target
+        candidates = [
+            e for e in entries if Decimal("0") < abs(e.amount) <= abs_target + tolerance
+        ]
+
+        # Performance cap: keep the largest candidates
+        max_candidates = min(len(candidates), 20)
         candidates = sorted(
-            candidates, key=lambda e: e.amount, reverse=True
+            candidates, key=lambda e: abs(e.amount), reverse=True
         )[:max_candidates]
 
         for size in range(2, min(max_subset_size + 1, len(candidates) + 1)):
             for combo in combinations(candidates, size):
-                total = sum(e.amount for e in combo)
-                if total == target:
+                total = sum(abs(e.amount) for e in combo)
+                if abs(total - abs_target) <= tolerance:
                     return list(combo)
 
         return None

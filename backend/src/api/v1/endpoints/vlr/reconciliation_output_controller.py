@@ -556,8 +556,21 @@ async def get_differences_summary(
         difference=closing_diff,
     )
 
-    # Calculate totals by document category/type
-    doc_types = ["Invoice", "Payment", "Credit Note", "Debit Note"]
+    # Calculate totals by document category/type — dynamically from all categories present
+    cat_stmt = (
+        select(LedgerEntryModel.document_category)
+        .where(
+            and_(
+                LedgerEntryModel.case_id == str(case_id),
+                LedgerEntryModel.document_category.isnot(None),
+            )
+        )
+        .distinct()
+    )
+    cat_result = await session.execute(cat_stmt)
+    doc_types = sorted({r[0] for r in cat_result.all() if r[0]})
+    # Exclude balance rows from the transaction-type totals (they're shown separately)
+    doc_types = [d for d in doc_types if d not in ("Opening Balance", "Closing Balance")]
     totals_by_type: list[TypeTotal] = []
 
     for doc_type in doc_types:
@@ -642,6 +655,40 @@ async def get_differences_summary(
         else None
     )
 
+    # Sum of unmatched amounts on each side (excluding balance rows), so the
+    # residual reconciliation difference is fully explained.
+    unmatched_company_amt_stmt = select(
+        func.coalesce(func.sum(LedgerEntryModel.amount), 0)
+    ).where(
+        and_(
+            LedgerEntryModel.case_id == str(case_id),
+            LedgerEntryModel.side == "company",
+            LedgerEntryModel.match_id.is_(None),
+            LedgerEntryModel.document_category.notin_(["Opening Balance", "Closing Balance"]),
+        )
+    )
+    unmatched_company_amount = Decimal(
+        str((await session.execute(unmatched_company_amt_stmt)).scalar() or 0)
+    )
+
+    unmatched_vendor_amt_stmt = select(
+        func.coalesce(func.sum(LedgerEntryModel.amount), 0)
+    ).where(
+        and_(
+            LedgerEntryModel.case_id == str(case_id),
+            LedgerEntryModel.side == "vendor",
+            LedgerEntryModel.match_id.is_(None),
+            LedgerEntryModel.document_category.notin_(["Opening Balance", "Closing Balance"]),
+        )
+    )
+    unmatched_vendor_amount = Decimal(
+        str((await session.execute(unmatched_vendor_amt_stmt)).scalar() or 0)
+    )
+
+    # Residual difference: company and vendor use opposite signs, so the
+    # net gap is the sum of both sides' unmatched amounts.
+    residual_difference = unmatched_company_amount + unmatched_vendor_amount
+
     return DifferencesSummaryResponse(
         case_id=case_id,
         opening_balance=opening_balance,
@@ -652,6 +699,9 @@ async def get_differences_summary(
         total_unmatched_company=total_unmatched_company,
         total_unmatched_vendor=total_unmatched_vendor,
         total_pending_confirmation=total_pending,
+        unmatched_company_amount=unmatched_company_amount,
+        unmatched_vendor_amount=unmatched_vendor_amount,
+        residual_difference=residual_difference,
     )
 
 
@@ -767,3 +817,189 @@ async def confirm_match(
         success=True,
         message=message,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Manual Link / Unlink (reviewer pairs unmatched entries)
+# ──────────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _LinkBaseModel  # noqa: E402
+from uuid import uuid4 as _uuid4  # noqa: E402
+
+
+class ManualLinkRequest(_LinkBaseModel):
+    """Request to manually link unmatched company + vendor entries."""
+    company_entry_ids: list[str]
+    vendor_entry_ids: list[str]
+    notes: str | None = None
+
+
+class ManualLinkResponse(_LinkBaseModel):
+    match_id: str
+    company_amount: float
+    vendor_amount: float
+    difference: float
+    message: str
+
+
+class UnlinkRequest(_LinkBaseModel):
+    """Request to remove a manual/auto match, returning entries to unmatched."""
+    match_id: str
+
+
+@router.post(
+    "/{case_id}/link",
+    response_model=ManualLinkResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Manually link unmatched company + vendor entries",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def manual_link(
+    case_id: UUID,
+    request: ManualLinkRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ManualLinkResponse:
+    """
+    POST /api/v1/vlr/reconciliation/{case_id}/link
+
+    Creates a confirmed manual match linking the selected company and vendor
+    entries. Entries must currently be unmatched (match_id is NULL).
+    """
+    await _verify_case_exists(case_id, session)
+
+    if not request.company_entry_ids and not request.vendor_entry_ids:
+        raise HTTPException(status_code=400, detail="Select at least one entry to link.")
+
+    # Load and validate the selected entries
+    all_ids = request.company_entry_ids + request.vendor_entry_ids
+    stmt = select(LedgerEntryModel).where(
+        and_(
+            LedgerEntryModel.case_id == str(case_id),
+            LedgerEntryModel.id.in_(all_ids),
+        )
+    )
+    result = await session.execute(stmt)
+    entries = list(result.scalars().all())
+
+    company_entries = [e for e in entries if e.side == "company"]
+    vendor_entries = [e for e in entries if e.side == "vendor"]
+
+    # Guard: don't re-link already matched entries
+    already = [e for e in entries if e.match_id is not None]
+    if already:
+        raise HTTPException(
+            status_code=409,
+            detail="One or more selected entries are already matched. Unlink them first.",
+        )
+
+    company_amount = sum(Decimal(str(e.amount or 0)) for e in company_entries)
+    vendor_amount = sum(Decimal(str(e.amount or 0)) for e in vendor_entries)
+    # Company and vendor use opposite signs; difference is the net residual
+    difference = company_amount + vendor_amount
+
+    match_id = _uuid4()
+    match_type = "manual"
+    if len(company_entries) == 1 and len(vendor_entries) == 1:
+        match_type = "manual_pair"
+    elif len(company_entries) > 1 or len(vendor_entries) > 1:
+        match_type = "manual_group"
+
+    match_record = MatchResultModel(
+        id=match_id,
+        case_id=str(case_id),
+        pass_number=8,  # 8 = manual
+        match_type=match_type,
+        confidence_score=1.0,  # manual = fully confirmed
+        is_confirmed=True,
+        company_entry_ids=[str(e.id) for e in company_entries],
+        vendor_entry_ids=[str(e.id) for e in vendor_entries],
+        matched_amount=float(abs(company_amount) or abs(vendor_amount)),
+        difference_amount=float(difference),
+    )
+    session.add(match_record)
+
+    # Stamp match_id on each entry so they leave the unmatched pool
+    for e in entries:
+        e.match_id = match_id
+        e.pass_number = 8
+        e.confidence_score = 1.0
+        session.add(e)
+
+    await session.flush()
+
+    # Audit
+    audit_service = AuditTrailService(audit_repository=AuditTrailRepositoryImpl(session))
+    await audit_service.log_event(AuditEvent(
+        actor_username=current_user.username or str(current_user.id),
+        actor_id=current_user.id,
+        event_type=AuditEventType.MATCH_OVERRIDE,
+        case_id=case_id,
+        event_details={
+            "action": "manual_link",
+            "match_id": str(match_id),
+            "company_entries": len(company_entries),
+            "vendor_entries": len(vendor_entries),
+            "difference": float(difference),
+            "notes": request.notes or "",
+        },
+    ))
+
+    await session.commit()
+
+    return ManualLinkResponse(
+        match_id=str(match_id),
+        company_amount=float(company_amount),
+        vendor_amount=float(vendor_amount),
+        difference=float(difference),
+        message=(
+            f"Linked {len(company_entries)} company + {len(vendor_entries)} vendor "
+            f"entries. Net difference: {float(difference):.2f}"
+        ),
+    )
+
+
+@router.post(
+    "/{case_id}/unlink",
+    status_code=status.HTTP_200_OK,
+    summary="Unlink a match, returning entries to the unmatched pool",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def manual_unlink(
+    case_id: UUID,
+    request: UnlinkRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """
+    POST /api/v1/vlr/reconciliation/{case_id}/unlink
+
+    Removes a match (manual or auto) and returns its entries to unmatched.
+    """
+    await _verify_case_exists(case_id, session)
+
+    match_stmt = select(MatchResultModel).where(
+        and_(
+            MatchResultModel.id == str(request.match_id),
+            MatchResultModel.case_id == str(case_id),
+        )
+    )
+    match_record = (await session.execute(match_stmt)).scalar_one_or_none()
+    if match_record is None:
+        raise HTTPException(status_code=404, detail="Match not found.")
+
+    entry_ids = list(match_record.company_entry_ids or []) + list(match_record.vendor_entry_ids or [])
+    for entry_id in entry_ids:
+        e_stmt = select(LedgerEntryModel).where(LedgerEntryModel.id == str(entry_id))
+        entry = (await session.execute(e_stmt)).scalar_one_or_none()
+        if entry:
+            entry.match_id = None
+            entry.pass_number = None
+            entry.confidence_score = None
+            session.add(entry)
+
+    await session.delete(match_record)
+    await session.flush()
+    await session.commit()
+
+    return {"success": True, "message": "Match unlinked. Entries returned to unmatched pool."}

@@ -134,8 +134,20 @@ export const ReconciliationDetailPage = () => {
     );
   };
 
-  const handleSendForReview = () => {
-    const case_ids = recoStageSelection.map((r) => r.case_id || r.id);
+  const handleSendForReview = (
+    selection: BatchCaseRow[] = recoStageSelection,
+    clearSelection: () => void = () => setRecoStageSelection([]),
+  ) => {
+    const case_ids = selection.map((r) => r.case_id || r.id);
+    if (case_ids.length === 0) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'No cases selected',
+        detail: 'Select at least one case to send for review.',
+        life: 3000,
+      });
+      return;
+    }
     bulkReviewMutation.mutate(
       { case_ids },
       {
@@ -146,7 +158,7 @@ export const ReconciliationDetailPage = () => {
             detail: `${case_ids.length} case(s) sent for review.`,
             life: 3000,
           });
-          setRecoStageSelection([]);
+          clearSelection();
         },
         onError: (err) => {
           toast.current?.show({
@@ -330,12 +342,24 @@ export const ReconciliationDetailPage = () => {
         <span
           className="link-view"
           style={{ cursor: 'pointer' }}
-          onClick={() => navigate(`/track-reconciliation/${requestId}/case/${caseId}`)}
+          onClick={() => {
+            const s = (row.status || '').toLowerCase();
+            if (s.includes('mapping_pending') || s.includes('statement_mapped') || s.includes('in_progress') || s.includes('data_received') || s.includes('created')) {
+              navigate(`/track-reconciliation/${requestId}/${caseId}`);
+            } else {
+              navigate(`/track-reconciliation/${requestId}/case/${caseId}`);
+            }
+          }}
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
-              navigate(`/track-reconciliation/${requestId}/case/${caseId}`);
+              const s = (row.status || '').toLowerCase();
+              if (s.includes('mapping_pending') || s.includes('statement_mapped') || s.includes('in_progress') || s.includes('data_received') || s.includes('created')) {
+                navigate(`/track-reconciliation/${requestId}/${caseId}`);
+              } else {
+                navigate(`/track-reconciliation/${requestId}/case/${caseId}`);
+              }
             }
           }}
         >
@@ -491,11 +515,11 @@ export const ReconciliationDetailPage = () => {
         <div>
           <div className="em-action-bar">
             <Button
-              label="Send Reminder"
-              icon={sendReminderMutation.isPending ? 'pi pi-spin pi-spinner' : 'pi pi-send'}
+              label="Send For Review"
+              icon={bulkReviewMutation.isPending ? 'pi pi-spin pi-spinner' : 'pi pi-check-square'}
               className="p-button-outlined p-button-sm"
-              disabled={allPartiesSelection.length === 0 || sendReminderMutation.isPending}
-              onClick={() => handleSendReminder(allPartiesSelection, () => setAllPartiesSelection([]))}
+              disabled={allPartiesSelection.length === 0 || bulkReviewMutation.isPending}
+              onClick={() => handleSendForReview(allPartiesSelection, () => setAllPartiesSelection([]))}
             >
               {renderCountBadge(allPartiesSelection.length)}
             </Button>

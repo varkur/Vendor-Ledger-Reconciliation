@@ -1021,14 +1021,9 @@ async def bulk_review(
                 ))
                 continue
 
-            # Advance to FINANCE_REVIEW step via workflow orchestrator
-            await orchestrator.advance(
-                case_id=case_uuid,
-                target_step=WorkflowStep.FINANCE_REVIEW,
-                triggered_by=current_user.username,
-            )
-
-            # Also transition case status to review
+            # Transition case status to review_pending.
+            # (The workflow orchestrator step-advance is best-effort and must not
+            # block the status transition, so we do the status change directly.)
             service = RequestManagerService(
                 request_repository=RequestRepositoryImpl(session),
                 case_repository=case_repo,
@@ -1037,6 +1032,16 @@ async def bulk_review(
             await service.transition_case_status(
                 case_uuid, request.company_code, CaseStatus.REVIEW_PENDING
             )
+
+            # Best-effort workflow step advance (non-blocking)
+            try:
+                await orchestrator.advance(
+                    case_id=case_uuid,
+                    target_step=WorkflowStep.FINANCE_REVIEW,
+                    triggered_by=current_user.username,
+                )
+            except Exception as wf_exc:
+                logger.warning("Workflow step advance skipped for case %s: %s", case_id_str, str(wf_exc))
 
             results.append(BulkActionResultItem(
                 case_id=case_id_str,
@@ -1117,21 +1122,14 @@ async def bulk_review_done(
                 ))
                 continue
 
-            # Advance to FINANCE_APPROVAL step (post-review)
-            await orchestrator.advance(
-                case_id=case_uuid,
-                target_step=WorkflowStep.FINANCE_APPROVAL,
-                triggered_by=current_user.username,
-            )
-
-            # Transition case status to pending approval
+            # Transition case status: review_pending -> reviewed
             service = RequestManagerService(
                 request_repository=RequestRepositoryImpl(session),
                 case_repository=case_repo,
                 vendor_repository=VendorRepositoryImpl(session),
             )
             await service.transition_case_status(
-                case_uuid, request.company_code, CaseStatus.SIGNOFF_REQUESTED
+                case_uuid, request.company_code, CaseStatus.REVIEWED
             )
 
             results.append(BulkActionResultItem(
@@ -1213,30 +1211,42 @@ async def bulk_signoff_request(
                 ))
                 continue
 
-            # Advance to VENDOR_SIGN_OFF step
-            await orchestrator.advance(
-                case_id=case_uuid,
-                target_step=WorkflowStep.VENDOR_SIGN_OFF,
-                triggered_by=current_user.username,
+            # Transition case status: reviewed -> signoff_requested
+            service = RequestManagerService(
+                request_repository=RequestRepositoryImpl(session),
+                case_repository=case_repo,
+                vendor_repository=VendorRepositoryImpl(session),
+            )
+            await service.transition_case_status(
+                case_uuid, request.company_code, CaseStatus.SIGNOFF_REQUESTED
             )
 
-            # Dispatch sign-off invite notification
+            # Best-effort workflow step advance (non-blocking)
             try:
-                from src.infrastructure.tasks.vlr.notification_tasks import send_signoff_invite_task
-
-                send_signoff_invite_task.delay(
-                    case_id=case_id_str,
-                    company_code=request.company_code,
+                await orchestrator.advance(
+                    case_id=case_uuid,
+                    target_step=WorkflowStep.VENDOR_SIGN_OFF,
                     triggered_by=current_user.username,
                 )
-            except (ImportError, Exception):
-                # Task module not available — continue anyway
-                pass
+            except Exception as wf_exc:
+                logger.warning("Workflow step advance skipped for case %s: %s", case_id_str, str(wf_exc))
+
+            # Send sign-off request email directly via SMTP (best-effort)
+            try:
+                from src.infrastructure.external.email.vlr_mailer import (
+                    send_signoff_request_email,
+                )
+
+                sent, msg = await send_signoff_request_email(session, case_uuid)
+                if not sent:
+                    logger.warning("Sign-off email not sent for case %s: %s", case_id_str, msg)
+            except Exception as mail_exc:
+                logger.warning("Sign-off email error for case %s: %s", case_id_str, str(mail_exc))
 
             results.append(BulkActionResultItem(
                 case_id=case_id_str,
                 success=True,
-                message="Sign-off invite sent to vendor portal.",
+                message="Sign-off requested.",
             ))
 
         except (WorkflowTransitionError, CaseNotFoundError) as e:
@@ -1260,3 +1270,163 @@ async def bulk_signoff_request(
             ))
 
     return BulkActionResponse(results=results)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Start Reconciliation (after manual mapping)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class StartReconciliationResponse(BaseModel):
+    """Response for starting reconciliation after mapping."""
+    case_id: str
+    status: str
+    message: str
+    statistics: dict | None = None
+
+
+@router.post(
+    "/{case_id}/start-reconciliation",
+    response_model=StartReconciliationResponse,
+    summary="Start reconciliation engine after column mapping is complete",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def start_reconciliation(
+    case_id: UUID,
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> StartReconciliationResponse:
+    """
+    POST /api/v1/vlr/cases/{case_id}/start-reconciliation
+
+    Triggers the reconciliation engine after manual column mapping is complete.
+    Sets case status to 'in_progress' during execution, then to 'auto_completed'
+    or 'mapping_pending' based on results.
+    """
+    from decimal import Decimal as RDecimal
+    from sqlalchemy import select
+    from src.infrastructure.database.models.vlr.reconciliation_case_model import (
+        ReconciliationCaseModel,
+    )
+    from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+        ReconciliationRequestModel,
+    )
+    from src.infrastructure.database.repositories.vlr.ledger_entry_repository_impl import (
+        LedgerEntryRepositoryImpl as LedgerRepoForReco,
+    )
+    from src.infrastructure.database.repositories.vlr.match_result_repository_impl import (
+        MatchResultRepositoryImpl,
+    )
+    from src.infrastructure.database.repositories.vlr.exception_repository_impl import (
+        ExceptionRepositoryImpl,
+    )
+    from src.domain.services.vlr.reconciliation_engine_service import (
+        ReconciliationEngineService,
+    )
+
+    # Get case
+    case_stmt = select(ReconciliationCaseModel).where(
+        ReconciliationCaseModel.id == case_id,
+        ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+    )
+    case_result = await session.execute(case_stmt)
+    case = case_result.scalar_one_or_none()
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
+
+    # Validate status allows reconciliation
+    allowed_statuses = ["statement_mapped"]
+    if case.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot start reconciliation from status '{case.status}'. Column mapping must be completed first (status must be 'statement_mapped').",
+        )
+
+    # Load reconciliation settings from parent request
+    req_stmt = select(ReconciliationRequestModel).where(
+        ReconciliationRequestModel.id == case.request_id
+    )
+    req_result = await session.execute(req_stmt)
+    parent_request = req_result.scalar_one_or_none()
+
+    tolerance_pct = float(parent_request.tolerance_amount or 0) if parent_request else 0
+    tds_pct = float(parent_request.tds_percentage or 0) if parent_request else 0
+    gst_pct = float(parent_request.gst_percentage or 0) if parent_request else 0
+    tolerance_fraction = RDecimal(str(tolerance_pct / 100)) if tolerance_pct > 0 else RDecimal("0")
+
+    # Set status to in_progress
+    case.status = "in_progress"
+    case.modified_by = current_user.username
+    await session.flush()
+
+    # Initialize repositories and engine
+    case_repo = CaseRepositoryImpl(session)
+    ledger_repo = LedgerRepoForReco(session)
+    match_repo = MatchResultRepositoryImpl(session)
+    exception_repo = ExceptionRepositoryImpl(session)
+
+    engine = ReconciliationEngineService(
+        ledger_entry_repository=ledger_repo,
+        match_result_repository=match_repo,
+        case_repository=case_repo,
+        exception_repository=exception_repo,
+    )
+
+    try:
+        # Execute the 7-pass reconciliation engine
+        reco_result = await engine.execute(
+            case_id=case_id,
+            tolerance=tolerance_fraction,
+            fuzzy_threshold=0.8,
+            date_tolerance_days=15,
+            tds_percentage=RDecimal(str(tds_pct)),
+            gst_percentage=RDecimal(str(gst_pct)),
+        )
+
+        # After manual mapping + reconciliation, the case is 'statement_mapped'
+        # (differences are allowed — they get reviewed). If everything matched
+        # cleanly it's 'auto_completed'. Either way the case can be sent for review.
+        has_unmatched = len(reco_result.unmatched_company_ids) > 0 or len(reco_result.unmatched_vendor_ids) > 0
+        final_status = "statement_mapped" if has_unmatched else "auto_completed"
+
+        case.status = final_status
+        case.modified_by = current_user.username
+        await session.flush()
+
+        stats = {
+            "total_company_entries": reco_result.statistics.total_company_entries,
+            "total_vendor_entries": reco_result.statistics.total_vendor_entries,
+            "total_matched_company": reco_result.statistics.total_matched_company,
+            "total_matched_vendor": reco_result.statistics.total_matched_vendor,
+            "match_pairs": len(reco_result.match_pairs),
+            "match_groups": len(reco_result.match_groups),
+            "unmatched_company": len(reco_result.unmatched_company_ids),
+            "unmatched_vendor": len(reco_result.unmatched_vendor_ids),
+        }
+
+        logger.info(
+            "Reconciliation started: case_id=%s, status=%s, matched=%d/%d, user=%s",
+            case_id, final_status,
+            reco_result.statistics.total_matched_company,
+            reco_result.statistics.total_company_entries,
+            current_user.username,
+        )
+
+        return StartReconciliationResponse(
+            case_id=str(case_id),
+            status=final_status,
+            message=f"Reconciliation complete. {reco_result.statistics.total_matched_company}/{reco_result.statistics.total_company_entries} company entries matched.",
+            statistics=stats,
+        )
+
+    except Exception as e:
+        # Revert status on failure
+        case.status = "statement_mapped"
+        case.modified_by = current_user.username
+        await session.flush()
+        logger.error("Reconciliation failed: case_id=%s, error=%s", case_id, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Reconciliation engine failed: {str(e)}",
+        )

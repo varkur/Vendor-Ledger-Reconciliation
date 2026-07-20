@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/vlr/portal", tags=["VLR - Vendor Portal"])
 
 # Maximum upload attempts allowed per case
-MAX_UPLOAD_ATTEMPTS = 1
+MAX_UPLOAD_ATTEMPTS = 3
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -194,10 +194,10 @@ async def upload_vendor_statement(
     case = await _validate_portal_token(x_portal_token, session)
 
     # Block upload if a file has already been submitted for this case
-    if case.upload_count >= 1:
+    if case.upload_count >= 3:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="A statement has already been submitted for this request. No further uploads are allowed.",
+            detail="Maximum upload limit reached (3 attempts). Please contact the reconciliation team if you need to upload additional files.",
         )
 
     # Read file content
@@ -244,6 +244,21 @@ async def upload_vendor_statement(
         await session.execute(del_stmt)
         await session.flush()
 
+    # Save original file headers for column mapping UI
+    if result.raw_headers:
+        import json as _json
+        from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
+            SettingRepositoryImpl as _SettingRepo,
+        )
+        _setting_repo = _SettingRepo(session)
+        await _setting_repo.upsert(
+            company_code="__global__",
+            key=f"file_headers.{case.id}.vendor",
+            value=_json.dumps(result.raw_headers),
+            value_type="json",
+            description="Original file headers from vendor upload",
+        )
+
     # Create new vendor ledger entries from parsed data
     entries_data = [
         {
@@ -273,22 +288,25 @@ async def upload_vendor_statement(
     case_repo = CaseRepositoryImpl(session)
     new_upload_count = await case_repo.increment_upload_count(case.id)
 
-    # Transition case status to data_received
+    # Transition to data_received then run the reconciliation engine automatically
     await case_repo.update(
         case.id,
         {
-            "status": "data_received",
+            "status": "matching",
             "modified_by": "vendor_portal",
             "modified_date": datetime.now(timezone.utc),
         },
     )
 
-    # ─── Run reconciliation engine directly ───────────────────────────────
-    reco_status = "awaiting_reconciliation"
+    reco_status = "mapping_pending"
     reco_stats = None
+
+    # ─── Run reconciliation engine automatically ──────────────────────────
     try:
-        from src.infrastructure.database.repositories.vlr.ledger_entry_repository_impl import (
-            LedgerEntryRepositoryImpl as LedgerRepoForReco,
+        from decimal import Decimal as RDecimal
+        from sqlalchemy import select as _sa_select
+        from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+            ReconciliationRequestModel,
         )
         from src.infrastructure.database.repositories.vlr.match_result_repository_impl import (
             MatchResultRepositoryImpl,
@@ -299,87 +317,56 @@ async def upload_vendor_statement(
         from src.domain.services.vlr.reconciliation_engine_service import (
             ReconciliationEngineService,
         )
-        from decimal import Decimal as RDecimal
 
-        ledger_repo_reco = LedgerRepoForReco(session)
-        match_repo = MatchResultRepositoryImpl(session)
-        exception_repo = ExceptionRepositoryImpl(session)
-
-        engine = ReconciliationEngineService(
-            ledger_entry_repository=ledger_repo_reco,
-            match_result_repository=match_repo,
-            case_repository=case_repo,
-            exception_repository=exception_repo,
-        )
-
-        # Update status to matching
-        await case_repo.update(case.id, {"status": "matching", "modified_by": "vendor_portal"})
-
-        # Load reconciliation settings from the parent request
-        from src.infrastructure.database.models.vlr.reconciliation_request_model import (
-            ReconciliationRequestModel,
-        )
-        from sqlalchemy import select as sa_select
-        req_stmt = sa_select(ReconciliationRequestModel).where(
+        # Load reconciliation settings from parent request
+        req_stmt = _sa_select(ReconciliationRequestModel).where(
             ReconciliationRequestModel.id == case.request_id
         )
-        req_result_obj = await session.execute(req_stmt)
-        parent_request = req_result_obj.scalar_one_or_none()
-
-        # Extract settings (with fallback defaults)
+        parent_request = (await session.execute(req_stmt)).scalar_one_or_none()
         tolerance_pct = float(parent_request.tolerance_amount or 0) if parent_request else 0
         tds_pct = float(parent_request.tds_percentage or 0) if parent_request else 0
         gst_pct = float(parent_request.gst_percentage or 0) if parent_request else 0
-
-        # Convert percentage tolerance to absolute value
-        # For percentage-based tolerance, we pass it as a fraction (1% = 0.01)
-        # The engine will use it as: amount * tolerance_fraction
         tolerance_fraction = RDecimal(str(tolerance_pct / 100)) if tolerance_pct > 0 else RDecimal("0")
 
-        # Execute the 7-pass reconciliation engine with actual settings
+        engine = ReconciliationEngineService(
+            ledger_entry_repository=ledger_repo,
+            match_result_repository=MatchResultRepositoryImpl(session),
+            case_repository=case_repo,
+            exception_repository=ExceptionRepositoryImpl(session),
+        )
+
         reco_result = await engine.execute(
             case_id=case.id,
             tolerance=tolerance_fraction,
             fuzzy_threshold=0.8,
-            date_tolerance_days=15,  # Max from UI date range setting
+            date_tolerance_days=15,
             tds_percentage=RDecimal(str(tds_pct)),
             gst_percentage=RDecimal(str(gst_pct)),
         )
 
-        # Determine status based on results
-        total_entries = reco_result.statistics.total_company_entries + reco_result.statistics.total_vendor_entries
-        total_matched = reco_result.statistics.total_matched_company + reco_result.statistics.total_matched_vendor
-        has_unmatched = len(reco_result.unmatched_company_ids) > 0 or len(reco_result.unmatched_vendor_ids) > 0
-
-        if has_unmatched:
-            # Not everything matched — needs manual column mapping
-            final_status = "mapping_pending"
-        else:
-            # Everything matched automatically
-            final_status = "auto_completed"
-
+        has_unmatched = (
+            len(reco_result.unmatched_company_ids) > 0
+            or len(reco_result.unmatched_vendor_ids) > 0
+        )
+        final_status = "mapping_pending" if has_unmatched else "auto_completed"
         await case_repo.update(case.id, {"status": final_status, "modified_by": "vendor_portal"})
-        reco_status = "reconciliation_complete"
+        reco_status = final_status
         reco_stats = {
-            "total_matched_company": reco_result.statistics.total_matched_company,
-            "total_matched_vendor": reco_result.statistics.total_matched_vendor,
-            "total_company_entries": reco_result.statistics.total_company_entries,
-            "total_vendor_entries": reco_result.statistics.total_vendor_entries,
-            "match_pairs": len(reco_result.match_pairs),
-            "match_groups": len(reco_result.match_groups),
-            "unmatched_company": len(reco_result.unmatched_company_ids),
-            "unmatched_vendor": len(reco_result.unmatched_vendor_ids),
+            "matched_company": reco_result.statistics.total_matched_company,
+            "matched_vendor": reco_result.statistics.total_matched_vendor,
+            "total_company": reco_result.statistics.total_company_entries,
+            "total_vendor": reco_result.statistics.total_vendor_entries,
         }
         logger.info(
-            "Reconciliation completed after vendor upload: case_id=%s, matched_company=%d/%d",
-            case.id, reco_result.statistics.total_matched_company, reco_result.statistics.total_company_entries,
+            "Auto-reconciliation after upload: case_id=%s, status=%s, matched=%d/%d",
+            case.id, final_status,
+            reco_result.statistics.total_matched_company,
+            reco_result.statistics.total_company_entries,
         )
     except Exception as reco_exc:
-        logger.error(
-            "Reconciliation engine failed after vendor upload: case_id=%s, error=%s",
-            case.id, str(reco_exc),
-        )
-        reco_status = "reconciliation_failed"
+        logger.error("Auto-reconciliation failed: case_id=%s, error=%s", case.id, str(reco_exc))
+        await case_repo.update(case.id, {"status": "mapping_pending", "modified_by": "vendor_portal"})
+        reco_status = "mapping_pending"
 
     logger.info(
         "Portal upload successful: case_id=%s, upload_count=%d, entries=%d, is_reupload=%s",
@@ -407,13 +394,12 @@ async def upload_vendor_statement(
 
     return PortalUploadResponse(
         case_id=case.id,
-        status=reco_status if reco_status == "reconciliation_complete" else "data_received",
+        status="mapping_pending",
         upload_count=new_upload_count,
         entries_parsed=len(result.entries),
         message=(
             f"Successfully uploaded {len(result.entries)} entries. "
-            + (f"Reconciliation complete: {reco_stats['total_matched_company']}/{reco_stats['total_company_entries']} company entries matched."
-               if reco_stats else "Reconciliation engine is processing.")
+            f"Awaiting column mapping and reconciliation."
         ),
     )
 
@@ -558,7 +544,7 @@ async def sign_off(
     case = await _validate_portal_token(x_portal_token, session)
 
     # Ensure the case is in a state that allows sign-off (must be matched or review)
-    allowed_statuses = ("matched", "review")
+    allowed_statuses = ("signoff_requested", "matched", "review")
     if case.status not in allowed_statuses:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -985,7 +971,7 @@ async def sign_off_case(
         )
 
     # Ensure the case is in a state that allows sign-off
-    allowed_statuses = ("matched", "review", "pending_approval")
+    allowed_statuses = ("signoff_requested", "matched", "review", "pending_approval")
     if case.status not in allowed_statuses:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
