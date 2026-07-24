@@ -133,7 +133,10 @@ class ReconciliationCaseModel(BaseModel):
         CheckConstraint(
             "status IN ('created', 'ledger_confirmed', 'invited', 'data_received', "
             "'matching', 'matched', 'review', 'pending_approval', 'approved', "
-            "'signed_off', 'closed')",
+            "'signed_off', 'closed', "
+            "'mapping_pending', 'statement_mapped', 'in_progress', 'auto_completed', "
+            "'review_pending', 'reviewed', 'signoff_requested', 'signoff_completed', "
+            "'reco_rejected')",
             name="ck_vlr_case_valid_status",
         ),
         CheckConstraint(
