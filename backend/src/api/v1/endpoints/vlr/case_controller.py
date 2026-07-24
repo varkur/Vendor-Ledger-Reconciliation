@@ -1335,12 +1335,14 @@ async def start_reconciliation(
     if not case:
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
 
-    # Validate status allows reconciliation
-    allowed_statuses = ["statement_mapped"]
+    # Validate status allows reconciliation. Manual column mapping is optional
+    # (the parser already extracts amount/date/doc number), so the engine can run
+    # directly from mapping_pending as well as statement_mapped / in_progress.
+    allowed_statuses = ["statement_mapped", "mapping_pending", "in_progress"]
     if case.status not in allowed_statuses:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot start reconciliation from status '{case.status}'. Column mapping must be completed first (status must be 'statement_mapped').",
+            detail=f"Cannot start reconciliation from status '{case.status}'. The vendor ledger must be uploaded first.",
         )
 
     # Load reconciliation settings from parent request

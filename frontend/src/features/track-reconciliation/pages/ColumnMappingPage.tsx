@@ -49,6 +49,9 @@ export const ColumnMappingPage = () => {
   const [isSendingReview, setIsSendingReview] = useState(false);
   const [showCompany, setShowCompany] = useState(false);
   const [showVendor, setShowVendor] = useState(false);
+  const [busySide, setBusySide] = useState<string | null>(null);
+  const companyFileRef = useRef<HTMLInputElement>(null);
+  const vendorFileRef = useRef<HTMLInputElement>(null);
 
   // Fetch case detail
   const { data: caseData, isLoading } = useQuery<CaseDetail>({
@@ -72,6 +75,40 @@ export const ColumnMappingPage = () => {
       return data;
     },
     enabled: !!caseData?.vendor_id && !!companyCode,
+  });
+
+  // Per-side presence check — the headers endpoint 404s when a side has no
+  // ledger entries, so we use it to know whether each ledger is present.
+  const { data: companyHasData } = useQuery<boolean>({
+    queryKey: ['ledger-present', caseId, 'company'],
+    queryFn: async () => {
+      try {
+        await apiClient.get(`/vlr/column-mapping/${caseId}/headers`, {
+          params: { side: 'company', company_code: companyCode },
+        });
+        return true;
+      } catch (e: any) {
+        if (e.response?.status === 404) return false;
+        throw e;
+      }
+    },
+    enabled: !!caseId && !!companyCode,
+  });
+
+  const { data: vendorHasData } = useQuery<boolean>({
+    queryKey: ['ledger-present', caseId, 'vendor'],
+    queryFn: async () => {
+      try {
+        await apiClient.get(`/vlr/column-mapping/${caseId}/headers`, {
+          params: { side: 'vendor', company_code: companyCode },
+        });
+        return true;
+      } catch (e: any) {
+        if (e.response?.status === 404) return false;
+        throw e;
+      }
+    },
+    enabled: !!caseId && !!companyCode,
   });
 
   // Fetch company entries (sample)
@@ -141,6 +178,83 @@ export const ColumnMappingPage = () => {
     }
   };
 
+  // ─── Ledger file management (download / delete / re-upload) ───────────────
+  const handleDownloadLedger = async (side: 'company' | 'vendor') => {
+    if (!caseId) return;
+    try {
+      const response = await apiClient.get(`/vlr/column-mapping/${caseId}/download`, {
+        params: { side, company_code: companyCode },
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      // Filename: partycode_partyname_ledger.csv (sanitized for filesystem)
+      const partyCode = (vendorData as any)?.vendor_code || 'party';
+      const partyName = (vendorData as any)?.name || side;
+      const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      link.download = `${sanitize(partyCode)}_${sanitize(partyName)}_ledger.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error: any) {
+      const detail = error.response?.status === 404
+        ? `No ${side} ledger data to download.`
+        : error.response?.data?.detail || 'Download failed.';
+      toast.current?.show({ severity: 'warn', summary: 'Download', detail, life: 5000 });
+    }
+  };
+
+  const handleDeleteLedger = async (side: 'company' | 'vendor') => {
+    if (!caseId) return;
+    if (!window.confirm(`Delete the ${side} ledger? You'll need to re-upload it before reconciling again.`)) {
+      return;
+    }
+    setBusySide(`delete-${side}`);
+    try {
+      const { data } = await apiClient.delete(`/vlr/column-mapping/${caseId}/ledger`, {
+        params: { side, company_code: companyCode },
+      });
+      toast.current?.show({ severity: 'success', summary: 'Deleted', detail: data.message, life: 4000 });
+      if (side === 'company') setShowCompany(false); else setShowVendor(false);
+      queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
+      queryClient.invalidateQueries({ queryKey: ['ledger-entries', caseId, side] });
+      queryClient.invalidateQueries({ queryKey: ['ledger-present', caseId, side] });
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || 'Delete failed.';
+      toast.current?.show({ severity: 'error', summary: 'Delete Failed', detail, life: 6000 });
+    } finally {
+      setBusySide(null);
+    }
+  };
+
+  const handleReuploadLedger = async (side: 'company' | 'vendor', file: File) => {
+    if (!caseId || !file) return;
+    setBusySide(`upload-${side}`);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const { data } = await apiClient.post(
+        `/vlr/column-mapping/${caseId}/reupload`,
+        formData,
+        {
+          params: { side, company_code: companyCode },
+          headers: { 'Content-Type': 'multipart/form-data' },
+        }
+      );
+      toast.current?.show({ severity: 'success', summary: 'Uploaded', detail: data.message, life: 4000 });
+      queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
+      queryClient.invalidateQueries({ queryKey: ['ledger-entries', caseId, side] });
+      queryClient.invalidateQueries({ queryKey: ['ledger-present', caseId, side] });
+    } catch (error: any) {
+      const detail = error.response?.data?.detail || 'Upload failed.';
+      toast.current?.show({ severity: 'error', summary: 'Upload Failed', detail, life: 8000 });
+    } finally {
+      setBusySide(null);
+    }
+  };
+
   if (isLoading) {
     return (
       <div className="flex justify-content-center align-items-center" style={{ minHeight: 300 }}>
@@ -150,7 +264,18 @@ export const ColumnMappingPage = () => {
   }
 
   const status = caseData?.status || '';
-  const canStartReco = status === 'statement_mapped';
+  // Reconciliation can run once the vendor ledger is uploaded. Manual column
+  // mapping is optional since the parser already extracts amount/date/doc number,
+  // so allow it from mapping_pending as well as statement_mapped / in_progress.
+  // Both ledgers must be present to reconcile. companyHasData/vendorHasData are
+  // undefined while loading — treat undefined as "present" so we don't flash
+  // the disabled state on first load.
+  const bothLedgersPresent = companyHasData !== false && vendorHasData !== false;
+  const canStartReco =
+    bothLedgersPresent &&
+    (status === 'statement_mapped' ||
+      status === 'mapping_pending' ||
+      status === 'in_progress');
   const canSendForReview = status === 'statement_mapped' || status === 'auto_completed';
 
   const handleSendForReview = async () => {
@@ -216,64 +341,198 @@ export const ColumnMappingPage = () => {
       {/* Ledger Cards */}
       <div className="grid mb-4">
         <div className="col-12 md:col-6">
-          <div className="em-card" style={{ padding: '20px', borderLeft: '4px solid #10b981' }}>
+          <div
+            className="em-card"
+            style={{
+              padding: '20px',
+              borderLeft: '4px solid #10b981',
+              opacity: companyHasData === false ? 0.75 : 1,
+              background: companyHasData === false ? 'var(--color-surface-alt, #f8f9fa)' : undefined,
+            }}
+          >
             <div className="flex align-items-center justify-content-between mb-2">
               <h4 className="m-0">Company Ledger</h4>
-              <div className="flex gap-2">
+              {companyHasData !== false && (
+                <div className="flex gap-2">
+                  <Button
+                    label="Map"
+                    icon="pi pi-cog"
+                    className="p-button-text p-button-sm"
+                    onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/company`)}
+                  />
+                  <Button
+                    label={showCompany ? 'Hide' : 'Preview'}
+                    icon={showCompany ? 'pi pi-eye-slash' : 'pi pi-eye'}
+                    className="p-button-text p-button-sm"
+                    onClick={() => setShowCompany(!showCompany)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Hidden file input (shared by empty-state and re-upload button) */}
+            <input
+              type="file"
+              ref={companyFileRef}
+              style={{ display: 'none' }}
+              accept=".csv,.xlsx,.xls"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleReuploadLedger('company', f);
+                e.target.value = '';
+              }}
+            />
+
+            {companyHasData === false ? (
+              /* Empty state — only Upload is available */
+              <div style={{ textAlign: 'center', padding: '16px 0' }}>
+                <i className="pi pi-inbox" style={{ fontSize: '1.75rem', color: 'var(--color-text-muted)' }} />
+                <div className="my-2" style={{ color: 'var(--color-text-muted)' }}>
+                  No company ledger uploaded. Upload a file to continue.
+                </div>
                 <Button
-                  label="Map"
-                  icon="pi pi-cog"
-                  className="p-button-text p-button-sm"
-                  onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/company`)}
-                />
-                <Button
-                  label={showCompany ? 'Hide' : 'Preview'}
-                  icon={showCompany ? 'pi pi-eye-slash' : 'pi pi-eye'}
-                  className="p-button-text p-button-sm"
-                  onClick={() => setShowCompany(!showCompany)}
+                  label="Upload Company Ledger"
+                  icon={busySide === 'upload-company' ? 'pi pi-spin pi-spinner' : 'pi pi-upload'}
+                  className="p-button-sm"
+                  style={{ background: '#10b981', border: 'none' }}
+                  disabled={busySide !== null}
+                  onClick={() => companyFileRef.current?.click()}
                 />
               </div>
-            </div>
-            {showCompany && companyEntries && (
-              <DataTable value={companyEntries} size="small" scrollable scrollHeight="200px">
-                <Column field="document_number" header="Doc No" />
-                <Column field="amount" header="Amount" body={(r) => r.amount?.toLocaleString('en-IN')} />
-                <Column field="posting_date" header="Date" />
-                <Column field="document_type" header="Type" />
-              </DataTable>
+            ) : (
+              <>
+                {/* File actions: right-aligned */}
+                <div className="flex gap-2 mb-2 justify-content-end">
+                  <Button
+                    label="Download"
+                    icon="pi pi-download"
+                    className="p-button-outlined p-button-sm"
+                    onClick={() => handleDownloadLedger('company')}
+                  />
+                  <Button
+                    label="Re-upload"
+                    icon={busySide === 'upload-company' ? 'pi pi-spin pi-spinner' : 'pi pi-upload'}
+                    className="p-button-outlined p-button-sm"
+                    disabled={busySide !== null}
+                    onClick={() => companyFileRef.current?.click()}
+                  />
+                  <Button
+                    label="Delete"
+                    icon={busySide === 'delete-company' ? 'pi pi-spin pi-spinner' : 'pi pi-trash'}
+                    className="p-button-outlined p-button-danger p-button-sm"
+                    disabled={busySide !== null}
+                    onClick={() => handleDeleteLedger('company')}
+                  />
+                </div>
+                {showCompany && companyEntries && (
+                  <DataTable value={companyEntries} size="small" scrollable scrollHeight="200px">
+                    <Column field="document_number" header="Doc No" />
+                    <Column field="amount" header="Amount" body={(r) => r.amount?.toLocaleString('en-IN')} />
+                    <Column field="posting_date" header="Date" />
+                    <Column field="document_type" header="Type" />
+                  </DataTable>
+                )}
+                {showCompany && !companyEntries && <ProgressSpinner style={{ width: 30, height: 30 }} />}
+              </>
             )}
-            {showCompany && !companyEntries && <ProgressSpinner style={{ width: 30, height: 30 }} />}
           </div>
         </div>
 
         <div className="col-12 md:col-6">
-          <div className="em-card" style={{ padding: '20px', borderLeft: '4px solid #f59e0b' }}>
+          <div
+            className="em-card"
+            style={{
+              padding: '20px',
+              borderLeft: '4px solid #f59e0b',
+              opacity: vendorHasData === false ? 0.75 : 1,
+              background: vendorHasData === false ? 'var(--color-surface-alt, #f8f9fa)' : undefined,
+            }}
+          >
             <div className="flex align-items-center justify-content-between mb-2">
               <h4 className="m-0">Vendor Ledger</h4>
-              <div className="flex gap-2">
+              {vendorHasData !== false && (
+                <div className="flex gap-2">
+                  <Button
+                    label="Map"
+                    icon="pi pi-cog"
+                    className="p-button-text p-button-sm"
+                    onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/vendor`)}
+                  />
+                  <Button
+                    label={showVendor ? 'Hide' : 'Preview'}
+                    icon={showVendor ? 'pi pi-eye-slash' : 'pi pi-eye'}
+                    className="p-button-text p-button-sm"
+                    onClick={() => setShowVendor(!showVendor)}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Hidden file input (shared by empty-state and re-upload button) */}
+            <input
+              type="file"
+              ref={vendorFileRef}
+              style={{ display: 'none' }}
+              accept=".csv,.xlsx,.xls"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleReuploadLedger('vendor', f);
+                e.target.value = '';
+              }}
+            />
+
+            {vendorHasData === false ? (
+              /* Empty state — only Upload is available */
+              <div style={{ textAlign: 'center', padding: '16px 0' }}>
+                <i className="pi pi-inbox" style={{ fontSize: '1.75rem', color: 'var(--color-text-muted)' }} />
+                <div className="my-2" style={{ color: 'var(--color-text-muted)' }}>
+                  No vendor ledger uploaded. Upload a file to continue.
+                </div>
                 <Button
-                  label="Map"
-                  icon="pi pi-cog"
-                  className="p-button-text p-button-sm"
-                  onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/vendor`)}
-                />
-                <Button
-                  label={showVendor ? 'Hide' : 'Preview'}
-                  icon={showVendor ? 'pi pi-eye-slash' : 'pi pi-eye'}
-                  className="p-button-text p-button-sm"
-                  onClick={() => setShowVendor(!showVendor)}
+                  label="Upload Vendor Ledger"
+                  icon={busySide === 'upload-vendor' ? 'pi pi-spin pi-spinner' : 'pi pi-upload'}
+                  className="p-button-sm"
+                  style={{ background: '#f59e0b', border: 'none' }}
+                  disabled={busySide !== null}
+                  onClick={() => vendorFileRef.current?.click()}
                 />
               </div>
-            </div>
-            {showVendor && vendorEntries && (
-              <DataTable value={vendorEntries} size="small" scrollable scrollHeight="200px">
-                <Column field="document_number" header="Doc No" />
-                <Column field="amount" header="Amount" body={(r) => r.amount?.toLocaleString('en-IN')} />
-                <Column field="posting_date" header="Date" />
-                <Column field="document_type" header="Type" />
-              </DataTable>
+            ) : (
+              <>
+                {/* File actions: right-aligned */}
+                <div className="flex gap-2 mb-2 justify-content-end">
+                  <Button
+                    label="Download"
+                    icon="pi pi-download"
+                    className="p-button-outlined p-button-sm"
+                    onClick={() => handleDownloadLedger('vendor')}
+                  />
+                  <Button
+                    label="Re-upload"
+                    icon={busySide === 'upload-vendor' ? 'pi pi-spin pi-spinner' : 'pi pi-upload'}
+                    className="p-button-outlined p-button-sm"
+                    disabled={busySide !== null}
+                    onClick={() => vendorFileRef.current?.click()}
+                  />
+                  <Button
+                    label="Delete"
+                    icon={busySide === 'delete-vendor' ? 'pi pi-spin pi-spinner' : 'pi pi-trash'}
+                    className="p-button-outlined p-button-danger p-button-sm"
+                    disabled={busySide !== null}
+                    onClick={() => handleDeleteLedger('vendor')}
+                  />
+                </div>
+                {showVendor && vendorEntries && (
+                  <DataTable value={vendorEntries} size="small" scrollable scrollHeight="200px">
+                    <Column field="document_number" header="Doc No" />
+                    <Column field="amount" header="Amount" body={(r) => r.amount?.toLocaleString('en-IN')} />
+                    <Column field="posting_date" header="Date" />
+                    <Column field="document_type" header="Type" />
+                  </DataTable>
+                )}
+                {showVendor && !vendorEntries && <ProgressSpinner style={{ width: 30, height: 30 }} />}
+              </>
             )}
-            {showVendor && !vendorEntries && <ProgressSpinner style={{ width: 30, height: 30 }} />}
           </div>
         </div>
       </div>

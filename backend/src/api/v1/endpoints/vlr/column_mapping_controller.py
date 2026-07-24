@@ -17,7 +17,7 @@ import logging
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
 from sqlalchemy import and_, select, update
@@ -698,3 +698,287 @@ async def apply_column_mapping(
         side=request.side,
         entries_updated=entries_updated,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Ledger file management: download, delete, re-upload
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{case_id}/download",
+    summary="Download a ledger side as CSV",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def download_ledger(
+    case_id: UUID,
+    side: str = Query(..., description="'company' or 'vendor'"),
+    company_code: str = Query(..., description="Company code for tenant scoping"),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    GET /api/v1/vlr/column-mapping/{case_id}/download?side=company|vendor
+
+    Exports the stored ledger entries for the given side as a CSV file.
+    """
+    import csv
+    import io as _io
+
+    from fastapi.responses import Response
+
+    if side not in ("company", "vendor"):
+        raise HTTPException(status_code=400, detail="side must be 'company' or 'vendor'.")
+
+    await _get_case(session, case_id)
+
+    stmt = (
+        select(LedgerEntryModel)
+        .where(
+            and_(
+                LedgerEntryModel.case_id == str(case_id),
+                LedgerEntryModel.side == side,
+            )
+        )
+        .order_by(LedgerEntryModel.posting_date.asc())
+    )
+    result = await session.execute(stmt)
+    entries = list(result.scalars().all())
+
+    if not entries:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {side} ledger entries found for this case.",
+        )
+
+    buffer = _io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "Document Number", "Document Type", "Reference Number", "Posting Date",
+        "Clearing Date", "Amount", "Currency", "Assignment Number",
+        "Description", "Document Category",
+    ])
+    for e in entries:
+        writer.writerow([
+            e.document_number or "",
+            e.document_type or "",
+            e.reference_number or "",
+            e.posting_date.isoformat() if e.posting_date else "",
+            e.clearing_date.isoformat() if e.clearing_date else "",
+            str(e.amount if e.amount is not None else ""),
+            e.currency or "",
+            e.assignment_number or "",
+            e.description or "",
+            e.document_category or "",
+        ])
+
+    csv_bytes = buffer.getvalue().encode("utf-8-sig")
+    filename = f"{side}_ledger_{case_id}.csv"
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.delete(
+    "/{case_id}/ledger",
+    response_model=None,
+    summary="Delete all ledger entries for a side (allows re-upload)",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def delete_ledger(
+    case_id: UUID,
+    side: str = Query(..., description="'company' or 'vendor'"),
+    company_code: str = Query(..., description="Company code for tenant scoping"),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """
+    DELETE /api/v1/vlr/column-mapping/{case_id}/ledger?side=company|vendor
+
+    Removes all stored ledger entries for the given side and clears any match
+    data, so a fresh file can be re-uploaded and reconciliation re-run.
+    """
+    from sqlalchemy import delete as sql_delete
+
+    from src.infrastructure.database.models.vlr.match_result_model import (
+        MatchResultModel,
+    )
+
+    if side not in ("company", "vendor"):
+        raise HTTPException(status_code=400, detail="side must be 'company' or 'vendor'.")
+
+    case = await _get_case(session, case_id)
+
+    # Clear match results for the whole case (matches span both sides)
+    await session.execute(
+        sql_delete(MatchResultModel).where(MatchResultModel.case_id == str(case_id))
+    )
+
+    # Reset match metadata on remaining (other-side) entries so nothing points
+    # at now-deleted matches.
+    await session.execute(
+        update(LedgerEntryModel)
+        .where(LedgerEntryModel.case_id == str(case_id))
+        .values(match_id=None, pass_number=None, confidence_score=None)
+    )
+
+    # Delete the entries for the requested side
+    del_result = await session.execute(
+        sql_delete(LedgerEntryModel).where(
+            and_(
+                LedgerEntryModel.case_id == str(case_id),
+                LedgerEntryModel.side == side,
+            )
+        )
+    )
+
+    # Move the case back to mapping_pending and clear stale match statistics so
+    # the UI's Match Results panel refreshes (shows nothing) after deletion.
+    case.status = "mapping_pending"
+    case.match_statistics = None
+    case.modified_by = current_user.username
+
+    await session.commit()
+
+    deleted = del_result.rowcount or 0
+    logger.info(
+        "Ledger deleted: case_id=%s, side=%s, deleted=%d, user=%s",
+        case_id, side, deleted, current_user.username,
+    )
+    return {
+        "message": f"Deleted {deleted} {side} ledger entries. You can now re-upload.",
+        "case_id": str(case_id),
+        "side": side,
+        "deleted": deleted,
+    }
+
+
+@router.post(
+    "/{case_id}/reupload",
+    summary="Re-upload a ledger file for a side",
+    dependencies=[Depends(require_permission("vlr.cases.write"))],
+)
+async def reupload_ledger(
+    case_id: UUID,
+    side: str = Query(..., description="'company' or 'vendor'"),
+    company_code: str = Query(..., description="Company code for tenant scoping"),
+    file: UploadFile = File(..., description="Ledger file (CSV, XLSX, or XLS)"),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """
+    POST /api/v1/vlr/column-mapping/{case_id}/reupload?side=company|vendor
+
+    Replaces the ledger entries for a side with the contents of the uploaded
+    file (.csv/.xlsx/.xls), clears prior match data, and sets the case back to
+    mapping_pending so reconciliation can be re-run.
+    """
+    import json as _json
+
+    from sqlalchemy import delete as sql_delete
+
+    from src.domain.exceptions.vlr import FileValidationException
+    from src.domain.services.vlr.file_parser_service import FileParserService
+    from src.infrastructure.database.models.vlr.match_result_model import (
+        MatchResultModel,
+    )
+
+    if side not in ("company", "vendor"):
+        raise HTTPException(status_code=400, detail="side must be 'company' or 'vendor'.")
+
+    case = await _get_case(session, case_id)
+
+    filename = file.filename or ""
+    if not filename.lower().endswith((".csv", ".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Upload .csv, .xlsx, or .xls.",
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    max_size = 50 * 1024 * 1024
+    parser = FileParserService(max_file_size_bytes=max_size)
+    try:
+        result = parser.validate_and_parse(content, filename)
+    except FileValidationException as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"File validation failed: {'; '.join(e.errors)}",
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"Failed to parse file: {str(e)}")
+
+    if not result.entries:
+        raise HTTPException(status_code=422, detail="No valid entries found in the file.")
+
+    # Clear match data (spans both sides) and existing entries for this side.
+    await session.execute(
+        sql_delete(MatchResultModel).where(MatchResultModel.case_id == str(case_id))
+    )
+    await session.execute(
+        update(LedgerEntryModel)
+        .where(LedgerEntryModel.case_id == str(case_id))
+        .values(match_id=None, pass_number=None, confidence_score=None)
+    )
+    await session.execute(
+        sql_delete(LedgerEntryModel).where(
+            and_(
+                LedgerEntryModel.case_id == str(case_id),
+                LedgerEntryModel.side == side,
+            )
+        )
+    )
+
+    # Store new entries.
+    for entry in result.entries:
+        session.add(LedgerEntryModel(
+            case_id=str(case_id),
+            side=side,
+            document_number=entry.document_number,
+            document_type=entry.document_type,
+            reference_number=entry.reference_number,
+            posting_date=entry.posting_date,
+            clearing_date=entry.clearing_date,
+            clearing_document=entry.clearing_document,
+            amount=float(entry.amount),
+            currency=entry.currency,
+            assignment_number=entry.assignment_number,
+            description=entry.description,
+            source="upload",
+            created_by=current_user.username,
+            modified_by=current_user.username,
+        ))
+
+    # Save raw headers for the column-mapping UI.
+    if result.raw_headers:
+        headers_repo = SettingRepositoryImpl(session)
+        await headers_repo.upsert(
+            company_code="__global__",
+            key=f"file_headers.{case_id}.{side}",
+            value=_json.dumps(result.raw_headers),
+            value_type="json",
+            description=f"Original file headers from {side} ledger re-upload",
+        )
+
+    # Back to mapping_pending for re-reconciliation; clear stale match stats.
+    case.status = "mapping_pending"
+    case.match_statistics = None
+    case.modified_by = current_user.username
+
+    await session.commit()
+
+    logger.info(
+        "Ledger re-uploaded: case_id=%s, side=%s, entries=%d, file=%s, user=%s",
+        case_id, side, len(result.entries), filename, current_user.username,
+    )
+    return {
+        "message": f"Re-uploaded {len(result.entries)} {side} entries from '{filename}'.",
+        "case_id": str(case_id),
+        "side": side,
+        "entries_parsed": len(result.entries),
+    }

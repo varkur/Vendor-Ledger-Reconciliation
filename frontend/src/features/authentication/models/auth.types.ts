@@ -26,5 +26,7 @@ export interface AuthState {
   user: CurrentUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
+  /** True while restoring the session from stored tokens on app startup. */
+  isInitializing: boolean;
   error: string | null;
 }

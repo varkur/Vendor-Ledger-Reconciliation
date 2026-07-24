@@ -272,6 +272,7 @@ async def update_document_type(
 @router.delete(
     "/document-types/{id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="Delete document type mapping",
     dependencies=[Depends(require_permission("vlr.settings.write"))],
 )

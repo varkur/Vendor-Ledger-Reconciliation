@@ -954,6 +954,17 @@ class SendInviteResponse(BaseModel):
     details: list[dict] = Field(default_factory=list)
 
 
+class SendInviteRequest(BaseModel):
+    """Optional request body for send vendor invites.
+
+    `cc_emails` are additional recipients (e.g. the contact person selected in
+    the UI dropdown) that get CC'd on every invite email alongside the vendor's
+    primary contact.
+    """
+
+    cc_emails: list[str] = Field(default_factory=list)
+
+
 @reconciliation_requests_router.post(
     "/{request_id}/send-vendor-invites",
     response_model=SendInviteResponse,
@@ -963,6 +974,7 @@ class SendInviteResponse(BaseModel):
 async def send_vendor_invites(
     request_id: UUID,
     company_code: str = Query(..., min_length=1, description="Company code"),
+    body: SendInviteRequest | None = None,
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> SendInviteResponse:
@@ -1018,6 +1030,16 @@ async def send_vendor_invites(
     sender_email = await _get_setting("sender_email")
     sender_name = await _get_setting("sender_name")
     use_tls = (await _get_setting("use_tls", "true")).lower() == "true"
+
+    # Additional CC recipients selected in the UI (contact person dropdown).
+    cc_emails = [e.strip() for e in (body.cc_emails if body else []) if e and e.strip()]
+
+    # Base URL for the vendor portal link. Configurable via the PORTAL_BASE_URL
+    # setting (or env) so emails point at the real server, not localhost.
+    portal_base_url = (await _get_setting("portal_base_url")).rstrip("/")
+    if not portal_base_url:
+        import os
+        portal_base_url = os.getenv("PORTAL_BASE_URL", "http://localhost:3000").rstrip("/")
 
     if not smtp_host or not sender_email:
         raise HTTPException(
@@ -1111,8 +1133,8 @@ async def send_vendor_invites(
         case.token_expiry = token_expiry
         await session.flush()
 
-        # Build portal URL
-        portal_url = f"http://localhost:3000/portal/access/{case.portal_token}"
+        # Build portal URL (uses configurable base so it works off-localhost)
+        portal_url = f"{portal_base_url}/portal/access/{case.portal_token}"
 
         # Build email body
         period_start = str(request_obj.period_start) if request_obj.period_start else ""
@@ -1154,11 +1176,12 @@ async def send_vendor_invites(
 
         subject = f"Ledger Reconciliation Request - {period_start} to {period_end}"
 
-        # Send email
+        # Send email to the vendor's primary contact, CC the selected contact(s)
         success = await email_sender.send_email(
             to_email=contact.email,
             subject=subject,
             body_html=body_html,
+            cc=cc_emails,
         )
 
         if success:
@@ -1168,6 +1191,7 @@ async def send_vendor_invites(
                 "vendor_code": vendor.vendor_code,
                 "vendor_name": vendor.name,
                 "email": contact.email,
+                "cc": cc_emails,
                 "portal_url": portal_url,
                 "status": "sent",
             })

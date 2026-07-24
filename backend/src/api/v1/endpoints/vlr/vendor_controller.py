@@ -16,6 +16,7 @@ Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.7, 2.8, 2.9, 11.2, 11.6
 
 import csv
 import io
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, UploadFile, File, status
@@ -45,6 +46,8 @@ from src.infrastructure.database.repositories.vlr.vendor_repository_impl import 
 )
 from src.infrastructure.database.session import get_db_session
 from src.infrastructure.security.permission_manager import require_permission
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/vlr/vendors", tags=["VLR - Vendor Management"])
 
@@ -328,6 +331,7 @@ async def update_vendor(
 @router.delete(
     "/{vendor_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
     summary="Soft-delete a vendor",
     dependencies=[Depends(require_permission("vlr.vendors.delete"))],
 )
@@ -429,47 +433,63 @@ async def bulk_import_vendors(
         raise FileValidationException(errors=["File is empty or has no data rows."])
 
     # Map template column names to backend field names
+    def _clean(value, max_len: int | None = None) -> str:
+        """Coerce any cell value to a trimmed string, optionally truncated to a
+        DB column limit. Prevents 500s from None values or over-length data."""
+        s = "" if value is None else str(value).strip()
+        if max_len is not None and len(s) > max_len:
+            s = s[:max_len]
+        return s
+
+    # DB column limits (see vlr_vendors / vlr_vendor_contacts models)
+    LEN_VENDOR_CODE = 50
+    LEN_NAME = 255
+    LEN_PAN = 20
+    LEN_GSTIN = 20
+    LEN_CITY = 100
+    LEN_EMAIL = 255
+    LEN_PHONE = 50
+
     mapped_rows = []
     for row in rows:
         mapped = {}
         # Map from template headers to internal field names
-        mapped["vendor_code"] = (
-            row.get("Party Code *", "") or row.get("Party Code", "") or
-            row.get("party_code", "") or row.get("vendor_code", "")
-        ).strip()
-        mapped["name"] = (
-            row.get("Party Name *", "") or row.get("Party Name", "") or
-            row.get("party_name", "") or row.get("name", "")
-        ).strip()
+        mapped["vendor_code"] = _clean(
+            row.get("Party Code *") or row.get("Party Code") or
+            row.get("party_code") or row.get("vendor_code"),
+            LEN_VENDOR_CODE,
+        )
+        mapped["name"] = _clean(
+            row.get("Party Name *") or row.get("Party Name") or
+            row.get("party_name") or row.get("name"),
+            LEN_NAME,
+        )
         mapped["company_code"] = company_code
         mapped["status"] = (
-            row.get("Status *", "") or row.get("Status", "") or
-            row.get("status", "") or "active"
-        ).strip().lower() or "active"
-        mapped["pan"] = (
-            row.get("PAN", "") or row.get("pan", "")
-        ).strip()
-        mapped["gstin"] = (
-            row.get("GSTIN", "") or row.get("gstin", "")
-        ).strip()
-        mapped["city"] = (
-            row.get("City", "") or row.get("city", "")
-        ).strip()
+            _clean(row.get("Status *") or row.get("Status") or row.get("status") or "active").lower()
+            or "active"
+        )
+        # Normalize any unexpected status value to a valid one
+        if mapped["status"] not in ("active", "inactive"):
+            mapped["status"] = "active"
+        mapped["pan"] = _clean(row.get("PAN") or row.get("pan"), LEN_PAN)
+        mapped["gstin"] = _clean(row.get("GSTIN") or row.get("gstin"), LEN_GSTIN)
+        mapped["city"] = _clean(row.get("City") or row.get("city"), LEN_CITY)
 
         # Extract contacts from template columns (up to 10 contacts)
         contacts = []
         # Contact 1
-        c1_name = (row.get("Contact 1 Name *", "") or row.get("Contact 1 Name", "") or row.get("contact_1_name", "")).strip()
-        c1_email = (row.get("Contact 1 Email *", "") or row.get("Contact 1 Email", "") or row.get("contact_1_email", "")).strip()
-        c1_mobile = (row.get("Contact Mobile", "") or row.get("Contact 1 Mobile", "") or row.get("contact_mobile", "")).strip()
+        c1_name = _clean(row.get("Contact 1 Name *") or row.get("Contact 1 Name") or row.get("contact_1_name"), LEN_NAME)
+        c1_email = _clean(row.get("Contact 1 Email *") or row.get("Contact 1 Email") or row.get("contact_1_email"), LEN_EMAIL)
+        c1_mobile = _clean(row.get("Contact Mobile") or row.get("Contact 1 Mobile") or row.get("contact_mobile"), LEN_PHONE)
         if c1_name or c1_email:
             contacts.append({"name": c1_name or "Contact", "email": c1_email, "phone": c1_mobile, "is_primary": True})
 
         # Contacts 2-10
         for i in range(2, 11):
-            cn_name = (row.get(f"Contact {i} Name", "") or row.get(f"contact_{i}_name", "")).strip()
-            cn_email = (row.get(f"Contact {i} Email", "") or row.get(f"contact_{i}_email", "")).strip()
-            cn_mobile = (row.get(f"Contact {i} Mobile", "") or row.get(f"contact_{i}_mobile", "")).strip()
+            cn_name = _clean(row.get(f"Contact {i} Name") or row.get(f"contact_{i}_name"), LEN_NAME)
+            cn_email = _clean(row.get(f"Contact {i} Email") or row.get(f"contact_{i}_email"), LEN_EMAIL)
+            cn_mobile = _clean(row.get(f"Contact {i} Mobile") or row.get(f"contact_{i}_mobile"), LEN_PHONE)
             if cn_name or cn_email:
                 contacts.append({"name": cn_name or f"Contact {i}", "email": cn_email, "phone": cn_mobile, "is_primary": False})
 
@@ -483,7 +503,15 @@ async def bulk_import_vendors(
     if not mapped_rows:
         raise FileValidationException(errors=["No valid party data found in the file."])
 
-    result = await service.bulk_import(mapped_rows, company_code)
+    try:
+        result = await service.bulk_import(mapped_rows, company_code)
+    except FileValidationException:
+        raise
+    except Exception as e:  # noqa: BLE001 — surface a readable error instead of a bare 500
+        logger.exception("Vendor bulk import failed for company_code=%s", company_code)
+        raise FileValidationException(
+            errors=[f"Import failed while saving records: {str(e)[:300]}"]
+        )
 
     return BulkImportResultResponse(
         total_rows=result.total_rows,

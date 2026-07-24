@@ -17,13 +17,19 @@ interface PrivateRouteProps {
 const DEV_BYPASS_AUTH = import.meta.env.VITE_DEV_BYPASS_AUTH === 'true';
 
 export const PrivateRoute = ({ children, menuKey }: PrivateRouteProps) => {
-  const { isAuthenticated } = useAppSelector((state) => state.auth);
+  const { isAuthenticated, isInitializing } = useAppSelector((state) => state.auth);
   const { menuKeys, isLoaded: rbacLoaded } = useAppSelector((state) => state.rbac);
   const location = useLocation();
 
   // In dev mode, bypass auth entirely
   if (DEV_BYPASS_AUTH) {
     return <>{children}</>;
+  }
+
+  // While the session is being restored from stored tokens (page refresh),
+  // don't redirect to /login yet — wait for restoreSession to resolve.
+  if (isInitializing) {
+    return null;
   }
 
   if (!isAuthenticated) {

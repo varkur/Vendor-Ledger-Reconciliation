@@ -374,9 +374,16 @@ export const RequestStatementPage = () => {
     if (!requestId) return;
     setIsSendingInvites(true);
     try {
+      // Resolve the selected contact-person id to its email, sent as CC so the
+      // chosen contact is copied alongside the vendor's primary contact.
+      const selectedContact = (vendorContactsData || []).find(
+        (c) => c.id === contactPerson
+      );
+      const ccEmails = selectedContact?.email ? [selectedContact.email] : [];
+
       const { data } = await apiClient.post(
         `/vlr/reconciliation-requests/${requestId}/send-vendor-invites`,
-        null,
+        { cc_emails: ccEmails },
         { params: { company_code: companyCode } }
       );
       setInviteSent(true);
@@ -409,7 +416,7 @@ export const RequestStatementPage = () => {
     } finally {
       setIsSendingInvites(false);
     }
-  }, [requestId, companyCode]);
+  }, [requestId, companyCode, contactPerson, vendorContactsData]);
 
   // ─── Main Render ────────────────────────────────────────────────────────────
   return (

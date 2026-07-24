@@ -225,7 +225,6 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
           <Column field="match_type" header="Match Type" sortable style={{ width: '10%' }} />
           <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ width: '9%', textAlign: 'center' }} />
           <Column field="reason" header="Reason" sortable style={{ width: '12%' }} />
-          <Column header="Actions" body={actionsTemplate} style={{ width: '13%' }} />
         </DataTable>
       </div>
     </div>

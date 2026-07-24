@@ -97,6 +97,9 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": True,
+        # Ignore unknown env vars (e.g. deployment-specific keys in .env that
+        # this model doesn't define) instead of raising a validation error.
+        "extra": "ignore",
     }
 
 

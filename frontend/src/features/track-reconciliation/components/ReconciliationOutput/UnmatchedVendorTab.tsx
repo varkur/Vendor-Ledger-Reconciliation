@@ -215,7 +215,6 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
           <Column field="amount" header="Amount" sortable body={amountTemplate} style={{ width: '14%', textAlign: 'right' }} />
           <Column field="date" header="Date" sortable style={{ width: '12%' }} />
           <Column field="description" header="Description" sortable style={{ width: '28%' }} />
-          <Column header="Actions" body={actionsTemplate} style={{ width: '15%' }} />
         </DataTable>
       </div>
     </div>
