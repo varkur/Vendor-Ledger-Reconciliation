@@ -19,6 +19,7 @@ from src.infrastructure.database.models.vlr.vendor_contact_model import VendorCo
 from src.infrastructure.database.models.vlr.reconciliation_request_model import ReconciliationRequestModel
 from src.infrastructure.database.models.vlr.reconciliation_case_model import ReconciliationCaseModel
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
+from src.infrastructure.database.models.vlr.ledger_file_model import LedgerFileModel
 from src.infrastructure.database.models.vlr.match_result_model import MatchResultModel
 from src.infrastructure.database.models.vlr.reco_exception_model import RecoExceptionModel
 from src.infrastructure.database.models.vlr.resolution_record_model import ResolutionRecordModel
@@ -52,6 +53,7 @@ __all__ = [
     "ReconciliationRequestModel",
     "ReconciliationCaseModel",
     "LedgerEntryModel",
+    "LedgerFileModel",
     "MatchResultModel",
     "RecoExceptionModel",
     "ResolutionRecordModel",

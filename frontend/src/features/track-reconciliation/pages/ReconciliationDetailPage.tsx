@@ -19,8 +19,11 @@ import { Skeleton } from 'primereact/skeleton';
 import { Message } from 'primereact/message';
 import { Toast } from 'primereact/toast';
 import { Menu } from 'primereact/menu';
+import { useQuery } from '@tanstack/react-query';
 import { StatisticsTab } from '../components/StatisticsTab';
 import { StatusBadge } from '@shared/components/StatusBadge';
+import { apiClient } from '@shared/services/apiClient';
+import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import {
   useBatchCases,
   useSendReminder,
@@ -29,6 +32,14 @@ import {
   useBulkSignoffRequest,
 } from '../hooks/useReconciliationDetail';
 import type { BatchCaseRow } from '../api/reconciliationDetailApi';
+
+/** Format an ISO date (YYYY-MM-DD) as dd-Mon-yyyy for display. */
+function formatRecoDate(iso?: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
+}
 
 type TabKey = 'statistics' | 'allParties' | 'recoStage' | 'reviewStage' | 'signOffStage' | 'actionTracker';
 
@@ -94,6 +105,31 @@ export const ReconciliationDetailPage = () => {
 
   const cases = shouldFetch ? (casesData?.items ?? []) : [];
   const summary = casesData?.summary;
+
+  // Fetch the parent request so the header shows its real period / type
+  // instead of a hardcoded string.
+  const { companyCode } = useSelectedEntity();
+  const { data: requestDetail } = useQuery({
+    queryKey: ['reco-request-detail', companyCode, requestId],
+    queryFn: async () => {
+      const { data } = await apiClient.get(`/vlr/requests/${requestId}`, {
+        params: { company_code: companyCode },
+      });
+      return data as {
+        period_start?: string;
+        period_end?: string;
+        fiscal_year?: string;
+        case_type?: string;
+      };
+    },
+    enabled: !!companyCode && !!requestId,
+  });
+
+  const recoPeriod =
+    requestDetail?.period_start || requestDetail?.period_end
+      ? `${formatRecoDate(requestDetail?.period_start)} to ${formatRecoDate(requestDetail?.period_end)}`
+      : '—';
+  const recoType = (requestDetail as any)?.reco_type || (requestDetail as any)?.case_type || 'bulkreco';
 
   // ─────────────────────────────────────────────────────────────────────────
   // Mutation hooks
@@ -473,11 +509,11 @@ export const ReconciliationDetailPage = () => {
           <Button icon="pi pi-arrow-left" className="p-button-text p-button-sm" onClick={() => navigate('/track-reconciliation')} />
           <div>
             <span className="text-sm" style={{ color: 'var(--color-text-muted)' }}>Reco Type</span>
-            <span className="ml-3 font-semibold">bulkreco</span>
+            <span className="ml-3 font-semibold">{recoType}</span>
           </div>
           <div>
             <span className="text-sm" style={{ color: 'var(--color-text-muted)' }}>Reco Period</span>
-            <span className="ml-3 font-semibold">01-Apr-2025 to 31-Mar-2026</span>
+            <span className="ml-3 font-semibold">{recoPeriod}</span>
           </div>
         </div>
         <div>

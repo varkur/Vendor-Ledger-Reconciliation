@@ -4,7 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.infrastructure.database.models.base_model import BaseModel
@@ -79,6 +79,12 @@ class LedgerEntryModel(BaseModel):
     )
     tds_parent_entry_id: Mapped[str | None] = mapped_column(
         UUID(as_uuid=True), nullable=True, comment="Link to parent invoice entry"
+    )
+
+    # Full original uploaded row (header -> value), so the formatted export can
+    # reproduce every column the user provided (SAP fields not otherwise modelled).
+    raw_data: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True, comment="Original uploaded row, keyed by source header"
     )
 
     # Relationships

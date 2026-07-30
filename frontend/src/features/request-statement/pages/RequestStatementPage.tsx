@@ -297,6 +297,7 @@ export const RequestStatementPage = () => {
       {
         company_code: companyCode,
         fiscal_year: DEFAULT_FISCAL_YEAR,
+        title: title || undefined,
         period_start: formatDateToISO(startDate),
         period_end: formatDateToISO(endDate),
         vendor_ids: selectedVendorIds,
@@ -311,7 +312,7 @@ export const RequestStatementPage = () => {
       }
     );
   }, [
-    validateForm, createMutation, startDate, endDate,
+    validateForm, createMutation, startDate, endDate, title,
     selectedVendorIds, amountTolerance, tdsMax, gstPercentage,
   ]);
 
@@ -383,7 +384,7 @@ export const RequestStatementPage = () => {
 
       const { data } = await apiClient.post(
         `/vlr/reconciliation-requests/${requestId}/send-vendor-invites`,
-        { cc_emails: ccEmails },
+        { cc_emails: ccEmails, remarks: remarks || '' },
         { params: { company_code: companyCode } }
       );
       setInviteSent(true);

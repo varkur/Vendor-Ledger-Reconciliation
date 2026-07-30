@@ -76,3 +76,54 @@ export async function getCaseById(
   });
   return response.data;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request-level listing (one row per reconciliation request / statement)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A single reconciliation request (statement) row. */
+export interface ReconciliationRequest {
+  id: string;
+  company_code: string;
+  fiscal_year: string;
+  period_start: string;
+  period_end: string;
+  status: string;
+  request_number: string | null;
+  title: string | null;
+  sent_date: string | null;
+  created_by: string | null;
+  created_date: string | null;
+  party_count: number;
+}
+
+/** Paginated response wrapper for requests. */
+export interface PaginatedRequestResponse {
+  items: ReconciliationRequest[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+/** Query parameters for listing/filtering requests. */
+export interface RequestListParams {
+  company_code: string;
+  page?: number;
+  page_size?: number;
+  status?: string;
+  fiscal_year?: string;
+}
+
+/**
+ * List reconciliation requests (one per statement) with pagination.
+ * GET /api/v1/vlr/requests
+ */
+export async function listRequests(
+  params: RequestListParams
+): Promise<PaginatedRequestResponse> {
+  const response = await apiClient.get<PaginatedRequestResponse>('/vlr/requests', {
+    params,
+  });
+  return response.data;
+}

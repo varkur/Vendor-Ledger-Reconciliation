@@ -36,6 +36,9 @@ export const CompanyProfilePage = () => {
   const updateMutation = useUpdateCompanyProfile();
 
   // Editable fields
+  const [entityName, setEntityName] = useState('');
+  const [entityType, setEntityType] = useState('');
+  const [panCard, setPanCard] = useState('');
   const [email, setEmail] = useState('');
   const [website, setWebsite] = useState('');
   const [telephone, setTelephone] = useState('');
@@ -47,6 +50,9 @@ export const CompanyProfilePage = () => {
 
   useEffect(() => {
     if (profile) {
+      setEntityName(profile.entity_name);
+      setEntityType(profile.entity_type);
+      setPanCard(profile.pan_card);
       setEmail(profile.email);
       setWebsite(profile.website);
       setTelephone(profile.telephone);
@@ -58,9 +64,28 @@ export const CompanyProfilePage = () => {
     }
   }, [profile]);
 
+  // Mandatory-field gating: the three core entity details + company code must
+  // be filled before the profile can be saved.
+  const isProfileValid =
+    entityName.trim() !== '' &&
+    entityType.trim() !== '' &&
+    panCard.trim() !== '' &&
+    companyCode.trim() !== '';
+
   const handleUpdate = () => {
+    if (!isProfileValid) {
+      toast.current?.show({
+        severity: 'warn',
+        summary: 'Missing required fields',
+        detail: 'Entity Name, Entity Type, PAN Card and Company Code are mandatory.',
+      });
+      return;
+    }
     updateMutation.mutate(
       {
+        entity_name: entityName,
+        entity_type: entityType,
+        pan_card: panCard,
         email,
         website,
         telephone,
@@ -91,6 +116,9 @@ export const CompanyProfilePage = () => {
 
   const handleCancel = () => {
     if (profile) {
+      setEntityName(profile.entity_name);
+      setEntityType(profile.entity_type);
+      setPanCard(profile.pan_card);
       setEmail(profile.email);
       setWebsite(profile.website);
       setTelephone(profile.telephone);
@@ -133,32 +161,46 @@ export const CompanyProfilePage = () => {
         <div className="grid mb-4">
           <div className="col-12 md:col-6">
             <div className="flex align-items-center gap-2 mb-1">
-              <label className="font-bold text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-                Entity Name
+              <label htmlFor="cp-entity-name" className="font-bold text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+                Entity Name <span style={{ color: 'var(--color-error, red)' }}>*</span>
               </label>
+              {profile?.verified && <Badge value="Verified" severity="success" />}
             </div>
-            <div className="flex align-items-center gap-2">
-              <span className="text-lg font-semibold">{profile?.entity_name || '—'}</span>
-              {profile?.verified && (
-                <Badge value="Verified" severity="success" />
-              )}
-            </div>
+            <InputText
+              id="cp-entity-name"
+              value={entityName}
+              onChange={(e) => setEntityName(e.target.value)}
+              placeholder="Entity Name"
+              className={`w-full ${entityName.trim() === '' ? 'p-invalid' : ''}`}
+            />
           </div>
           <div className="col-12 md:col-6">
-            <label className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-              Entity Type
+            <label htmlFor="cp-entity-type" className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+              Entity Type <span style={{ color: 'var(--color-error, red)' }}>*</span>
             </label>
-            <span className="text-lg">{profile?.entity_type || '—'}</span>
+            <InputText
+              id="cp-entity-type"
+              value={entityType}
+              onChange={(e) => setEntityType(e.target.value)}
+              placeholder="e.g. Public company / Private company"
+              className={`w-full ${entityType.trim() === '' ? 'p-invalid' : ''}`}
+            />
           </div>
         </div>
 
         {/* Row 2: Entity PAN Card + Entity Email */}
         <div className="grid mb-4">
           <div className="col-12 md:col-6">
-            <label className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-              Entity PAN Card
+            <label htmlFor="cp-pan" className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+              Entity PAN Card <span style={{ color: 'var(--color-error, red)' }}>*</span>
             </label>
-            <span className="text-lg font-mono">{profile?.pan_card || '—'}</span>
+            <InputText
+              id="cp-pan"
+              value={panCard}
+              onChange={(e) => setPanCard(e.target.value.toUpperCase())}
+              placeholder="Entity PAN"
+              className={`w-full ${panCard.trim() === '' ? 'p-invalid' : ''}`}
+            />
           </div>
           <div className="col-12 md:col-6">
             <label htmlFor="cp-email" className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
@@ -277,15 +319,18 @@ export const CompanyProfilePage = () => {
             </div>
             <div>
               <label htmlFor="cp-code" className="font-bold text-sm block mb-1" style={{ color: 'var(--color-text-secondary)' }}>
-                Company Code
+                Company Code <span style={{ color: 'var(--color-error, red)' }}>*</span>
               </label>
               <InputText
                 id="cp-code"
                 value={companyCode}
-                onChange={(e) => setCompanyCode(e.target.value)}
-                placeholder="Company Code"
-                className="w-full"
+                onChange={(e) => setCompanyCode(e.target.value.toUpperCase())}
+                placeholder="e.g. EPL, GBL, ZHL, EBL"
+                className={`w-full ${companyCode.trim() === '' ? 'p-invalid' : ''}`}
               />
+              <small className="block mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                Used as the prefix for request IDs (e.g. EPL-00094).
+              </small>
             </div>
           </div>
         </div>
@@ -302,6 +347,7 @@ export const CompanyProfilePage = () => {
             icon="pi pi-check"
             onClick={handleUpdate}
             loading={updateMutation.isPending}
+            disabled={!isProfileValid}
           />
         </div>
       </div>

@@ -36,6 +36,7 @@ class CreateRequestRequest(BaseModel):
     period_start: date = Field(..., description="Start of reconciliation period")
     period_end: date = Field(..., description="End of reconciliation period")
     vendor_ids: list[UUID] = Field(..., min_length=1, description="List of vendor IDs to include")
+    title: str | None = Field(default=None, max_length=255, description="Request title/name")
     tolerance_amount: Decimal = Field(default=Decimal("0"), ge=0, description="Tolerance amount for matching")
     tds_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="TDS percentage")
     gst_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="GST percentage")
@@ -84,6 +85,9 @@ class ReconciliationRequestResponse(BaseModel):
     period_start: date
     period_end: date
     status: str
+    request_number: str | None = None
+    title: str | None = None
+    sent_date: datetime | None = None
     tolerance_amount: Decimal | None = None
     tds_percentage: Decimal | None = None
     gst_percentage: Decimal | None = None
@@ -91,6 +95,7 @@ class ReconciliationRequestResponse(BaseModel):
     assigned_manager_id: UUID | None = None
     created_by: str | None = None
     created_date: datetime | None = None
+    party_count: int = Field(default=0, description="Number of vendor cases (parties) in this request")
 
     model_config = {"from_attributes": True}
 

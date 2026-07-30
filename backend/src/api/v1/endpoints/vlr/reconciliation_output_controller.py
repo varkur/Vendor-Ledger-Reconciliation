@@ -706,6 +706,112 @@ async def get_differences_summary(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Excel Export (Firmway-format multi-sheet workbook)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{case_id}/export",
+    summary="Export reconciliation as a formatted Excel workbook",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def export_reconciliation(
+    case_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    GET /api/v1/vlr/reconciliation/{case_id}/export
+
+    Builds a multi-sheet Excel workbook (Summary + Reconciliation + annexures +
+    Party) matching the reference reconciliation export format.
+    """
+    from datetime import datetime, timezone
+
+    from fastapi.responses import Response
+
+    from src.domain.services.vlr.reconciliation_export_service import (
+        ReconciliationExportService,
+    )
+    from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+    from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+        ReconciliationRequestModel,
+    )
+
+    case = await _verify_case_exists(case_id, session)
+
+    # Vendor
+    vendor = None
+    if case.vendor_id:
+        vres = await session.execute(
+            select(VendorModel).where(VendorModel.id == str(case.vendor_id))
+        )
+        vendor = vres.scalar_one_or_none()
+
+    # Parent request (period + tolerances)
+    parent = None
+    if case.request_id:
+        pres = await session.execute(
+            select(ReconciliationRequestModel).where(
+                ReconciliationRequestModel.id == str(case.request_id)
+            )
+        )
+        parent = pres.scalar_one_or_none()
+
+    # Ledger entries
+    ce_res = await session.execute(
+        select(LedgerEntryModel).where(
+            and_(LedgerEntryModel.case_id == str(case_id), LedgerEntryModel.side == "company")
+        )
+    )
+    company_entries = list(ce_res.scalars().all())
+
+    ve_res = await session.execute(
+        select(LedgerEntryModel).where(
+            and_(LedgerEntryModel.case_id == str(case_id), LedgerEntryModel.side == "vendor")
+        )
+    )
+    vendor_entries = list(ve_res.scalars().all())
+
+    # Match results
+    mr_res = await session.execute(
+        select(MatchResultModel).where(MatchResultModel.case_id == str(case_id))
+    )
+    match_results = list(mr_res.scalars().all())
+
+    # Tolerances (as display strings)
+    tol_amt = f"{float(parent.tolerance_amount or 0)} Rs" if parent else "0 Rs"
+    tds_pct = f"0.0 - {float(parent.tds_percentage or 0)}" if parent else "0.0"
+    party_code = getattr(vendor, "vendor_code", "") or ""
+    party_name = getattr(vendor, "name", "reconciliation") or "reconciliation"
+
+    service = ReconciliationExportService()
+    xlsx_bytes = service.build(
+        case=case,
+        vendor=vendor,
+        company_entries=company_entries,
+        vendor_entries=vendor_entries,
+        match_results=match_results,
+        reco_datetime=datetime.now(timezone.utc),
+        period_start=getattr(parent, "period_start", None),
+        period_end=getattr(parent, "period_end", None),
+        party_code=party_code,
+        tolerance_amount=tol_amt,
+        tds_percentage=tds_pct,
+    )
+
+    def _san(s: str) -> str:
+        return "".join(ch if ch.isalnum() else "-" for ch in str(s)).strip("-")
+
+    filename = f"Reconciliation-{_san(party_name)}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Confirm/Reject Match Action
 # ──────────────────────────────────────────────────────────────────────
 

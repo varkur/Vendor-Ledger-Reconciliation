@@ -20,6 +20,7 @@ import { Column } from 'primereact/column';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
+import { downloadBlob, filenameFromDisposition } from '@shared/utils/downloadBlob';
 
 interface CaseDetail {
   id: string;
@@ -50,6 +51,7 @@ export const ColumnMappingPage = () => {
   const [showCompany, setShowCompany] = useState(false);
   const [showVendor, setShowVendor] = useState(false);
   const [busySide, setBusySide] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
   const companyFileRef = useRef<HTMLInputElement>(null);
   const vendorFileRef = useRef<HTMLInputElement>(null);
 
@@ -178,6 +180,35 @@ export const ColumnMappingPage = () => {
     }
   };
 
+  // ─── Export the formatted reconciliation workbook (available post-mapping) ──
+  const handleExport = async () => {
+    if (!caseId) return;
+    setIsExporting(true);
+    try {
+      const response = await apiClient.get(`/vlr/reconciliation/${caseId}/export`, {
+        responseType: 'blob',
+      });
+      const filename = filenameFromDisposition(
+        response.headers['content-disposition'],
+        `Reconciliation-${caseId}.xlsx`,
+      );
+      downloadBlob(
+        response.data,
+        filename,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+    } catch (error: any) {
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Export Failed',
+        detail: error.response?.data?.detail || 'Could not generate the Excel file.',
+        life: 6000,
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   // ─── Ledger file management (download / delete / re-upload) ───────────────
   const handleDownloadLedger = async (side: 'company' | 'vendor') => {
     if (!caseId) return;
@@ -186,18 +217,15 @@ export const ColumnMappingPage = () => {
         params: { side, company_code: companyCode },
         responseType: 'blob',
       });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = url;
       // Filename: partycode_partyname_ledger.csv (sanitized for filesystem)
       const partyCode = (vendorData as any)?.vendor_code || 'party';
       const partyName = (vendorData as any)?.name || side;
       const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-      link.download = `${sanitize(partyCode)}_${sanitize(partyName)}_ledger.csv`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
+      downloadBlob(
+        response.data,
+        `${sanitize(partyCode)}_${sanitize(partyName)}_ledger.csv`,
+        'text/csv',
+      );
     } catch (error: any) {
       const detail = error.response?.status === 404
         ? `No ${side} ledger data to download.`
@@ -544,8 +572,18 @@ export const ColumnMappingPage = () => {
         text="The reconciliation engine matches entries by amount, date proximity, and reference number similarity. Click 'Start Reconciliation' to run the matching algorithm."
       />
 
-      {/* Start Reconciliation + Send for Review */}
+      {/* Start Reconciliation + Send for Review + Export */}
       <div className="flex justify-content-center gap-3">
+        {status !== 'mapping_pending' && (
+          <Button
+            label="Download Excel"
+            icon={isExporting ? 'pi pi-spin pi-spinner' : 'pi pi-file-excel'}
+            className="p-button-lg p-button-success"
+            style={{ padding: '14px 32px', fontSize: '1.1rem', color: '#fff' }}
+            disabled={isExporting}
+            onClick={handleExport}
+          />
+        )}
         <Button
           label="Start Reconciliation"
           icon={isReconciling ? 'pi pi-spin pi-spinner' : 'pi pi-play'}

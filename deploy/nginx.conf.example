@@ -1,0 +1,45 @@
+# Nginx site config for the Vendor Ledger Reconciliation frontend (dist)
+# with reverse proxy to the backend API (app).
+#
+# Serves the built SPA and forwards /api/* to the FastAPI backend, so the
+# frontend's relative "/api/v1" calls work with no code changes and no CORS.
+#
+# Copy dist/ to /var/www/vlr and run the backend (app) on 127.0.0.1:8000.
+
+server {
+    listen 80;
+    server_name vlr.your-domain.com;   # <-- change to your PAM server hostname
+
+    # --- Frontend static files ---
+    root /var/www/vlr;                 # <-- where you copied deploy/dist
+    index index.html;
+
+    # SPA client-side routing: fall back to index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Long-cache hashed assets
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # --- Backend API reverse proxy ---
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;   # <-- backend (app) host:port
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        client_max_body_size 50m;           # allow ledger file uploads
+    }
+
+    # Optional: proxy API docs
+    location ~ ^/(docs|redoc|openapi.json) {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+    }
+}

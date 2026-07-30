@@ -30,13 +30,13 @@
   --color-surface-border: #E9ECEF;
   --color-surface-hover: #F1F3F5;
 
-  /* Sidebar */
-  --sidebar-bg: #1C2434;
-  --sidebar-text: #C8D6E5;
-  --sidebar-text-active: #FFFFFF;
-  --sidebar-active-bg: rgba(237, 28, 36, 0.15);
+  /* Sidebar — light theme (matches Emcure enterprise template) */
+  --sidebar-bg: #FFFFFF;
+  --sidebar-text: #495057;
+  --sidebar-text-active: #ED1C24;
+  --sidebar-active-bg: #FFF0F0;
   --sidebar-active-border: #ED1C24;
-  --sidebar-hover-bg: rgba(255, 255, 255, 0.05);
+  --sidebar-hover-bg: #F1F3F5;
   --sidebar-width: 220px;
 
   /* Spacing */
@@ -72,6 +72,12 @@ body {
   margin: 0;
 }
 
+/* Slightly deeper main content background so it reads as distinct from the
+   white sidebar, with an inset edge shadow along the sidebar boundary. */
+.em-main-content {
+  background: #EEF1F4;
+}
+
 h2 {
   font-size: 1.25rem;
   font-weight: 600;
@@ -92,6 +98,8 @@ h2 {
   transition: width 0.2s ease;
   overflow: hidden;
   z-index: 100;
+  border-right: 1px solid #DEE2E6;
+  box-shadow: 2px 0 8px rgba(16, 24, 40, 0.06);
 }
 
 .em-sidebar-logo {
@@ -100,11 +108,11 @@ h2 {
   align-items: center;
   padding: 0 16px;
   gap: 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--color-surface-border);
 }
 
 .em-sidebar-logo .logo-text {
-  color: #FFFFFF;
+  color: var(--color-text-primary);
   font-size: 14px;
   font-weight: 700;
   letter-spacing: 1.5px;
@@ -121,85 +129,91 @@ h2 {
 }
 
 .em-sidebar-nav::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.12);
   border-radius: 4px;
 }
 
-.em-nav-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
-  margin: 2px 8px;
+/* ─── Sidebar navigation: PrimeReact PanelMenu ─── */
+
+.em-panelmenu.p-panelmenu {
+  padding: 0 8px;
+}
+
+.em-panelmenu .p-panelmenu-panel {
+  margin-bottom: 2px;
+  border: none;
+  background: transparent;
+}
+
+/* Top-level group headers */
+.em-panelmenu .p-panelmenu-header > .p-panelmenu-header-content {
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-md);
+}
+
+.em-panelmenu .p-panelmenu-header > .p-panelmenu-header-content .p-panelmenu-header-link,
+.em-panelmenu .p-panelmenu-header-link {
+  padding: 10px 14px;
   border-radius: var(--radius-md);
   color: var(--sidebar-text);
   font-size: 13px;
-  font-weight: 400;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  border: none;
-  background: transparent;
-  width: calc(100% - 16px);
-  text-align: left;
-  text-decoration: none;
-}
-
-.em-nav-item:hover {
-  background: var(--sidebar-hover-bg);
-  color: var(--sidebar-text-active);
-}
-
-.em-nav-item.active {
-  background: var(--sidebar-active-bg);
-  color: var(--sidebar-text-active);
   font-weight: 500;
-  border-left: 3px solid var(--sidebar-active-border);
-  padding-left: 13px;
+  transition: all 0.15s ease;
+  gap: 12px;
 }
 
-.em-nav-item i {
+.em-panelmenu .p-panelmenu-header > .p-panelmenu-header-content:hover {
+  background: var(--sidebar-hover-bg);
+}
+
+.em-panelmenu .p-panelmenu-header .p-menuitem-icon {
   font-size: 15px;
   width: 20px;
   text-align: center;
+  color: var(--sidebar-text);
 }
 
-/* ─── Submenu ─── */
-
-.em-submenu {
+/* Submenu container + items */
+.em-panelmenu .p-panelmenu-content {
+  border: none;
+  background: transparent;
   padding: 2px 0 4px 0;
 }
 
-.em-nav-subitem {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 16px 8px 48px;
-  margin: 1px 8px;
+.em-panelmenu .p-panelmenu-content .p-menuitem-link {
+  padding: 8px 14px 8px 40px;
   border-radius: var(--radius-md);
   color: var(--sidebar-text);
   font-size: 12.5px;
   font-weight: 400;
-  cursor: pointer;
   transition: all 0.15s ease;
-  border: none;
-  background: transparent;
-  width: calc(100% - 16px);
-  text-align: left;
-  text-decoration: none;
-  opacity: 0.85;
+  margin: 1px 0;
 }
 
-.em-nav-subitem:hover {
+.em-panelmenu .p-panelmenu-content .p-menuitem-link:hover {
   background: var(--sidebar-hover-bg);
-  color: var(--sidebar-text-active);
-  opacity: 1;
 }
 
-.em-nav-subitem.active {
-  background: var(--sidebar-active-bg);
-  color: var(--sidebar-text-active);
-  font-weight: 500;
-  opacity: 1;
+.em-panelmenu .p-panelmenu-content .p-menuitem-link .p-menuitem-icon,
+.em-panelmenu .p-panelmenu-content .p-menuitem-link .p-menuitem-text {
+  color: var(--sidebar-text);
+}
+
+/* Active menu item (top-level leaf or submenu leaf) */
+.em-panelmenu .em-menu-active > .p-panelmenu-header-content,
+.em-panelmenu .em-menu-active > .p-menuitem-content,
+.em-panelmenu .p-menuitem.em-menu-active > .p-menuitem-content .p-menuitem-link,
+.em-panelmenu .em-menu-active .p-menuitem-link,
+.em-panelmenu .em-menu-active .p-panelmenu-header-link {
+  background: var(--sidebar-active-bg) !important;
+  color: var(--sidebar-text-active) !important;
+  font-weight: 600;
+}
+
+.em-panelmenu .em-menu-active .p-menuitem-icon,
+.em-panelmenu .em-menu-active .p-menuitem-text {
+  color: var(--sidebar-text-active) !important;
 }
 
 /* ─── Top Bar ─── */

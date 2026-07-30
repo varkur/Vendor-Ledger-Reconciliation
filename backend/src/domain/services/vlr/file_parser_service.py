@@ -43,12 +43,22 @@ DEFAULT_FIELD_MAPPING: dict[str, list[str]] = {
     "document_number": [
         "document_number", "doc_number", "doc_no", "belnr",
         "document number", "vch no.", "vch no", "voucher no",
+        "inv no", "inv no.", "invoice no", "invoice no.", "invoice number",
+        "inv number", "trx number", "transaction number", "bill no",
         "supplier",
     ],
     "amount": [
         "amount", "amt", "dmbtr", "value",
         "amount in doc. curr.", "amount in doc curr", "amount in local currency",
         "amount in doc. curr",
+    ],
+    # Split debit/credit columns (SAP / Tally "Dr Amt" / "Cr Amt" style).
+    # When present, the signed amount is computed as debit - credit.
+    "debit_amount": [
+        "dr amt", "dr amount", "debit amount", "debit amt", "debit", "dr",
+    ],
+    "credit_amount": [
+        "cr amt", "cr amount", "credit amount", "credit amt", "credit", "cr",
     ],
     "posting_date": [
         "posting_date", "post_date", "budat", "date",
@@ -101,6 +111,9 @@ class ParsedLedgerEntry:
     assignment_number: str | None = None
     currency: str = "INR"
     description: str | None = None
+    # Full original row (header -> value) so every uploaded column is preserved
+    # for the formatted export, even columns the engine doesn't use.
+    raw_data: dict | None = None
 
 
 @dataclass
@@ -521,48 +534,55 @@ class FileParserService:
                 return ""
             return row.get(header, "")
 
+        def clean_number(raw: str) -> str:
+            """Strip currency noise / placeholders from a numeric cell."""
+            if not raw:
+                return ""
+            v = raw.strip()
+            if v in ("None", "-", "--", "N/A", "NA"):
+                return ""
+            # Remove commas (thousands), currency symbols and spaces
+            for ch in (",", "\u20b9", "$", " "):
+                v = v.replace(ch, "")
+            # Parentheses denote negatives: (1,234) -> -1234
+            if v.startswith("(") and v.endswith(")"):
+                v = "-" + v[1:-1]
+            return v
+
         # Parse mandatory fields
         document_number = get_value("document_number")
-        amount_str = get_value("amount")
         posting_date_str = get_value("posting_date")
         reference_number = get_value("reference_number")
 
+        # ── Resolve amount ──────────────────────────────────────────────
+        # Prefer explicit split debit/credit columns (Dr Amt / Cr Amt).
+        # Signed convention: debit positive, credit negative.
+        # This must take priority over the generic "amount" field, which can
+        # loosely substring-match "Dr Amt" and silently drop "Cr Amt".
+        debit_str = clean_number(get_value("debit_amount"))
+        credit_str = clean_number(get_value("credit_amount"))
+        has_split_cols = (
+            column_mapping.get("debit_amount") is not None
+            or column_mapping.get("credit_amount") is not None
+        )
+
+        amount_str = ""
+        if has_split_cols and (debit_str or credit_str):
+            try:
+                debit_val = Decimal(debit_str) if debit_str else Decimal(0)
+                credit_val = Decimal(credit_str) if credit_str else Decimal(0)
+                amount_str = str(debit_val - credit_val)
+            except (InvalidOperation, ValueError):
+                return f"Row {row_number}: Invalid debit/credit value (Dr='{debit_str}', Cr='{credit_str}')"
+        else:
+            amount_str = clean_number(get_value("amount"))
+
         # If document_number is empty but there's an amount, use a placeholder
         if not document_number:
-            # Check if there's any amount in this row at all
-            has_any_amount = bool(amount_str)
-            if not has_any_amount:
-                # Check debit/credit columns directly
-                for key in row:
-                    if key and ("debit" in key or "credit" in key):
-                        val = row[key].strip() if row[key] else ""
-                        if val and val not in ("None", "0", ""):
-                            has_any_amount = True
-                            break
-            if has_any_amount:
+            if amount_str:
                 document_number = f"BAL_ROW_{row_number}"
             else:
                 return None  # Truly empty row
-
-        # Resolve amount: direct amount field OR debit/credit columns
-        if not amount_str or amount_str == "None":
-            # Scan for debit/credit columns
-            debit_val = ""
-            credit_val = ""
-            for key in row:
-                if not key:
-                    continue
-                cell_val = row[key].strip() if row[key] else ""
-                if cell_val and cell_val != "None":
-                    if "debit" in key:
-                        debit_val = cell_val
-                    elif "credit" in key:
-                        credit_val = cell_val
-
-            if debit_val:
-                amount_str = debit_val
-            elif credit_val:
-                amount_str = f"-{credit_val}"
 
         if not amount_str or amount_str == "None":
             return None  # No amount — skip
@@ -595,6 +615,10 @@ class FileParserService:
         currency = get_value("currency") or "INR"
         description = get_value("description") or None
 
+        # Preserve the entire original row so the export can reproduce every
+        # column the user uploaded (SAP fields we don't otherwise model).
+        raw_data = {k: v for k, v in row.items() if k and v not in ("", "None")}
+
         return ParsedLedgerEntry(
             document_number=document_number,
             amount=amount,
@@ -606,6 +630,7 @@ class FileParserService:
             assignment_number=assignment_number,
             currency=currency,
             description=description,
+            raw_data=raw_data or None,
         )
 
     def _parse_date(self, date_str: str) -> date | None:

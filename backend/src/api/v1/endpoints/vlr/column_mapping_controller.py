@@ -14,6 +14,7 @@ Routes:
 
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -27,6 +28,7 @@ from src.api.v1.dependencies import get_current_active_user
 from src.domain.entities.user import User
 from src.domain.services.vlr.doc_type_mapping import DEFAULT_DOC_TYPE_MAP
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
+from src.infrastructure.database.models.vlr.ledger_file_model import LedgerFileModel
 from src.infrastructure.database.models.vlr.reconciliation_case_model import (
     ReconciliationCaseModel,
 )
@@ -243,6 +245,153 @@ def _auto_detect_mappings(headers: list[str]) -> ColumnMappingConfig | None:
 def _setting_key(case_id: str, side: str) -> str:
     """Generate the vlr_settings key for a column mapping."""
     return f"column_mapping.{case_id}.{side}"
+
+
+def _clean_number(raw: Any) -> str:
+    """Strip currency noise / placeholders from a numeric cell value."""
+    if raw is None:
+        return ""
+    v = str(raw).strip()
+    if v in ("None", "-", "--", "N/A", "NA", ""):
+        return ""
+    for ch in (",", "\u20b9", "$", " "):
+        v = v.replace(ch, "")
+    if v.startswith("(") and v.endswith(")"):
+        v = "-" + v[1:-1]
+    return v
+
+
+def _lookup_raw(raw_data: dict | None, header: str | None) -> Any:
+    """
+    Fetch a value from the stored raw_data row by header, tolerant of
+    case/whitespace differences between the mapping header and stored keys.
+    """
+    if not raw_data or not header:
+        return None
+    target = header.strip().lower()
+    for k, v in raw_data.items():
+        if k is not None and str(k).strip().lower() == target:
+            return v
+    return None
+
+
+def _parse_date_value(value: Any):
+    """
+    Parse a date from a raw cell value using the same formats the file parser
+    supports (incl. Excel serial numbers). Returns a datetime.date or None.
+    """
+    from datetime import date as _date
+    from datetime import datetime as _datetime
+    from datetime import timedelta as _timedelta
+
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "none":
+        return None
+    if " " in s:
+        s = s.split(" ")[0]
+
+    # Excel serial number
+    try:
+        serial = int(float(s))
+        if 30000 < serial < 60000:
+            return _date(1899, 12, 30) + _timedelta(days=serial)
+    except (ValueError, OverflowError):
+        pass
+
+    for fmt in (
+        "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%d.%m.%Y",
+        "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y", "%b %d, %Y",
+    ):
+        try:
+            return _datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _amount_from_mapping(entry: LedgerEntryModel, mappings: "ColumnMappingConfig") -> Decimal | None:
+    """
+    Recompute the signed amount for a ledger entry from the columns the user
+    mapped, reading the original values out of entry.raw_data.
+
+    - single: use amount_field directly.
+    - double: debit_field - credit_field (debit positive, credit negative).
+
+    Returns the computed Decimal, or None if it can't be determined (so the
+    caller can leave the existing amount untouched).
+    """
+    raw = entry.raw_data
+    if not raw:
+        return None
+
+    if mappings.amount_format == "double":
+        debit_str = _clean_number(_lookup_raw(raw, mappings.debit_field))
+        credit_str = _clean_number(_lookup_raw(raw, mappings.credit_field))
+        if not debit_str and not credit_str:
+            return None
+        try:
+            debit_val = Decimal(debit_str) if debit_str else Decimal(0)
+            credit_val = Decimal(credit_str) if credit_str else Decimal(0)
+            return debit_val - credit_val
+        except (InvalidOperation, ValueError):
+            return None
+
+    # single
+    amount_str = _clean_number(_lookup_raw(raw, mappings.amount_field))
+    if not amount_str:
+        return None
+    try:
+        return Decimal(amount_str)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _guess_content_type(filename: str) -> str:
+    """Map a filename extension to a content type for downloads."""
+    name = (filename or "").lower()
+    if name.endswith(".xlsx"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if name.endswith(".xls"):
+        return "application/vnd.ms-excel"
+    if name.endswith(".csv"):
+        return "text/csv"
+    return "application/octet-stream"
+
+
+async def store_original_ledger_file(
+    session: AsyncSession,
+    case_id,
+    side: str,
+    filename: str,
+    content: bytes,
+    modified_by: str = "system",
+) -> None:
+    """
+    Persist (or replace) the ORIGINAL uploaded ledger file bytes for a case+side
+    so downloads can return the exact file the user uploaded, unchanged.
+    """
+    from sqlalchemy import delete as _sql_delete
+
+    # Replace any existing original for this case+side (re-upload).
+    await session.execute(
+        _sql_delete(LedgerFileModel).where(
+            and_(
+                LedgerFileModel.case_id == str(case_id),
+                LedgerFileModel.side == side,
+            )
+        )
+    )
+    session.add(LedgerFileModel(
+        case_id=str(case_id),
+        side=side,
+        filename=filename or f"{side}_ledger",
+        content_type=_guess_content_type(filename or ""),
+        content=content,
+        created_by=modified_by,
+        modified_by=modified_by,
+    ))
 
 
 async def _get_case(session: AsyncSession, case_id: UUID) -> ReconciliationCaseModel:
@@ -642,39 +791,105 @@ async def apply_column_mapping(
                 entry.document_category = category
                 updated = True
 
-        # Derive invoice number from the mapped field.
-        # invoice_no is the file header the user selected — map it to a DB field.
-        invoice_source = (mappings.invoice_no or "").lower().strip()
-        if invoice_source:
-            # Determine which stored field best matches the selected header
-            if any(k in invoice_source for k in ["reference", "particulars", "supplier"]):
-                model_field = "reference_number"
-            elif "assignment" in invoice_source:
-                model_field = "assignment_number"
-            else:
-                model_field = "document_number"
+        # Derive invoice number from the mapped header, reading the ORIGINAL
+        # value out of raw_data. The parser may have stored a placeholder
+        # (e.g. "BAL_ROW_13") in document_number when it couldn't recognise the
+        # file's invoice column, so reading raw_data by the header the user
+        # actually selected is what makes the mapping authoritative.
+        invoice_header = (mappings.invoice_no or "").strip()
+        if invoice_header:
+            raw_val = _lookup_raw(entry.raw_data, invoice_header)
+            if raw_val is None or str(raw_val).strip() == "":
+                # Fallback for entries without raw_data (pre-existing uploads):
+                # map the header to the closest stored DB column.
+                inv_lower = invoice_header.lower()
+                if any(k in inv_lower for k in ["reference", "particulars", "supplier"]):
+                    model_field = "reference_number"
+                elif "assignment" in inv_lower:
+                    model_field = "assignment_number"
+                else:
+                    model_field = "document_number"
+                raw_val = getattr(entry, model_field, None)
 
-            source_value = getattr(entry, model_field, None)
-            if source_value and source_value != entry.derived_invoice_number:
-                entry.derived_invoice_number = str(source_value).strip()
-                entry.invoice_source_field = model_field[:10]
+            if raw_val is not None and str(raw_val).strip():
+                new_invoice = str(raw_val).strip()
+                if new_invoice != entry.derived_invoice_number:
+                    entry.derived_invoice_number = new_invoice
+                    entry.invoice_source_field = "mapped"
+                    updated = True
+                # Replace the placeholder document_number so the output/export
+                # and unmatched screens show the real invoice number, not BAL_ROW_*.
+                if (entry.document_number or "").startswith("BAL_ROW_"):
+                    entry.document_number = new_invoice[:50]
+                    updated = True
+
+        # Derive document type from the mapped header if present in raw_data.
+        dtype_header = (mappings.document_type or "").strip()
+        if dtype_header:
+            raw_dtype = _lookup_raw(entry.raw_data, dtype_header)
+            if raw_dtype is not None and str(raw_dtype).strip():
+                new_dtype = str(raw_dtype).strip()[:20]
+                if new_dtype != entry.document_type:
+                    entry.document_type = new_dtype
+                    updated = True
+                    # Re-apply category mapping for the corrected type
+                    if doc_type_mappings:
+                        cat = doc_type_mappings.get(new_dtype)
+                        if cat:
+                            entry.document_category = cat
+
+        # Derive invoice/posting date from the mapped header. The mapping page's
+        # "Invoice Date" (invoice_date) is the primary date; an optional separate
+        # "Posting Date" header overrides it when provided.
+        date_header = (mappings.posting_date or mappings.invoice_date or "").strip()
+        if date_header:
+            raw_date = _lookup_raw(entry.raw_data, date_header)
+            parsed_date = _parse_date_value(raw_date)
+            if parsed_date is not None and parsed_date != entry.posting_date:
+                entry.posting_date = parsed_date
                 updated = True
 
-        # Handle amount mapping for double format (debit/credit)
-        if mappings.amount_format == "double" and entry.original_amount is not None:
-            # If we have debit/credit indicators, apply sign
-            if entry.shkzg_indicator == "H":
-                # Credit side (H = Haben)
-                adjusted = -abs(entry.original_amount)
-            elif entry.shkzg_indicator == "S":
-                # Debit side (S = Soll)
-                adjusted = abs(entry.original_amount)
-            else:
-                adjusted = entry.original_amount
+        # Derive narration/description from the mapped header (optional field).
+        narration_header = (mappings.narration or "").strip()
+        if narration_header:
+            raw_narr = _lookup_raw(entry.raw_data, narration_header)
+            if raw_narr is not None and str(raw_narr).strip():
+                new_narr = str(raw_narr).strip()
+                if new_narr != entry.description:
+                    entry.description = new_narr
+                    updated = True
 
-            if adjusted != entry.adjusted_amount:
-                entry.adjusted_amount = adjusted
+        # Derive clearing document number / clearing date (optional fields).
+        clr_doc_header = (mappings.clearing_doc_number or "").strip()
+        if clr_doc_header:
+            raw_clr = _lookup_raw(entry.raw_data, clr_doc_header)
+            if raw_clr is not None and str(raw_clr).strip():
+                new_clr = str(raw_clr).strip()[:50]
+                if new_clr != entry.clearing_document:
+                    entry.clearing_document = new_clr
+                    updated = True
+
+        clr_date_header = (mappings.clearing_date or "").strip()
+        if clr_date_header:
+            raw_clr_date = _lookup_raw(entry.raw_data, clr_date_header)
+            parsed_clr_date = _parse_date_value(raw_clr_date)
+            if parsed_clr_date is not None and parsed_clr_date != entry.clearing_date:
+                entry.clearing_date = parsed_clr_date
                 updated = True
+
+        # Recompute the amount from the mapped column(s), reading the original
+        # values from raw_data. This is what actually feeds the reconciliation
+        # engine (it matches on entry.amount), so the mapping the user chooses
+        # on this page — single amount column, or Dr/Cr split — takes effect here.
+        computed = _amount_from_mapping(entry, mappings)
+        if computed is not None:
+            computed_f = float(computed)
+            if entry.amount is None or float(entry.amount) != computed_f:
+                entry.amount = computed_f
+                updated = True
+            # Keep the transformation columns consistent for the export/audit.
+            entry.original_amount = abs(computed)
+            entry.adjusted_amount = computed
 
         if updated:
             entries_updated += 1
@@ -707,7 +922,7 @@ async def apply_column_mapping(
 
 @router.get(
     "/{case_id}/download",
-    summary="Download a ledger side as CSV",
+    summary="Download the original uploaded ledger file (verbatim)",
     dependencies=[Depends(require_permission("vlr.cases.read"))],
 )
 async def download_ledger(
@@ -720,7 +935,9 @@ async def download_ledger(
     """
     GET /api/v1/vlr/column-mapping/{case_id}/download?side=company|vendor
 
-    Exports the stored ledger entries for the given side as a CSV file.
+    Returns the EXACT original file the user uploaded (same format, same data).
+    Falls back to a reconstructed CSV only for legacy cases uploaded before the
+    original bytes were stored.
     """
     import csv
     import io as _io
@@ -732,6 +949,26 @@ async def download_ledger(
 
     await _get_case(session, case_id)
 
+    # Preferred: return the original uploaded file, byte-for-byte.
+    file_stmt = select(LedgerFileModel).where(
+        and_(
+            LedgerFileModel.case_id == str(case_id),
+            LedgerFileModel.side == side,
+        )
+    )
+    original = (await session.execute(file_stmt)).scalar_one_or_none()
+    if original is not None and original.content:
+        from urllib.parse import quote
+        safe_name = quote(original.filename or f"{side}_ledger")
+        return Response(
+            content=original.content,
+            media_type=original.content_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_name}",
+            },
+        )
+
+    # ── Legacy fallback: reconstruct a CSV from stored entries ──
     stmt = (
         select(LedgerEntryModel)
         .where(
@@ -748,7 +985,7 @@ async def download_ledger(
     if not entries:
         raise HTTPException(
             status_code=404,
-            detail=f"No {side} ledger entries found for this case.",
+            detail=f"No {side} ledger found for this case.",
         )
 
     buffer = _io.StringIO()
@@ -830,6 +1067,16 @@ async def delete_ledger(
             and_(
                 LedgerEntryModel.case_id == str(case_id),
                 LedgerEntryModel.side == side,
+            )
+        )
+    )
+
+    # Remove the stored original file for this side too.
+    await session.execute(
+        sql_delete(LedgerFileModel).where(
+            and_(
+                LedgerFileModel.case_id == str(case_id),
+                LedgerFileModel.side == side,
             )
         )
     )
@@ -949,10 +1196,16 @@ async def reupload_ledger(
             currency=entry.currency,
             assignment_number=entry.assignment_number,
             description=entry.description,
+            raw_data=getattr(entry, "raw_data", None),
             source="upload",
             created_by=current_user.username,
             modified_by=current_user.username,
         ))
+
+    # Store the ORIGINAL uploaded file bytes so downloads return it verbatim.
+    await store_original_ledger_file(
+        session, case_id, side, filename, content, modified_by=current_user.username,
+    )
 
     # Save raw headers for the column-mapping UI.
     if result.raw_headers:

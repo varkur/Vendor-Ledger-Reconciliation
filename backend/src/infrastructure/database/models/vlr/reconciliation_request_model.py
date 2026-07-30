@@ -33,6 +33,13 @@ class ReconciliationRequestModel(BaseModel):
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    # Human-friendly request identifier: "{company_code}-{5-digit serial}"
+    # e.g. EPL-00094. Generated on create, unique per company code.
+    request_number: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    # User-provided title/name for the request (shown in Track Reconciliation).
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When vendor invites were sent (null = "Not Sent").
+    sent_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tolerance_amount: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
     tds_percentage: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     gst_percentage: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)

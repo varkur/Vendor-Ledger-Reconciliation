@@ -32,6 +32,7 @@ export interface MatchingPreferences {
 export interface CreateStatementRequest {
   company_code: string;
   fiscal_year: string;
+  title?: string;
   period_start: string; // ISO date string (YYYY-MM-DD)
   period_end: string; // ISO date string (YYYY-MM-DD)
   vendor_ids: string[];

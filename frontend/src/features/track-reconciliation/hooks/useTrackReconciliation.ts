@@ -10,9 +10,12 @@ import { useQuery, keepPreviousData } from '@tanstack/react-query';
 import {
   listCases,
   getCaseById,
+  listRequests,
   type CaseListParams,
   type PaginatedCaseResponse,
   type ReconciliationCase,
+  type RequestListParams,
+  type PaginatedRequestResponse,
 } from '../api/trackReconciliationApi';
 
 /**
@@ -23,6 +26,21 @@ export function useCaseList(params: CaseListParams) {
   return useQuery<PaginatedCaseResponse, Error>({
     queryKey: ['vlr', 'cases', params],
     queryFn: () => listCases(params),
+    enabled: !!params.company_code,
+    placeholderData: keepPreviousData,
+    retry: 2,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+  });
+}
+
+/**
+ * Hook to list reconciliation requests (one row per statement) with
+ * server-side pagination. Used by the Track Reconciliation list page.
+ */
+export function useRequestList(params: RequestListParams) {
+  return useQuery<PaginatedRequestResponse, Error>({
+    queryKey: ['vlr', 'requests', params],
+    queryFn: () => listRequests(params),
     enabled: !!params.company_code,
     placeholderData: keepPreviousData,
     retry: 2,

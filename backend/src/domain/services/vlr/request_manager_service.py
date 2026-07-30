@@ -127,6 +127,7 @@ class RequestCreateDTO:
     period_start: date
     period_end: date
     vendor_ids: list[UUID]
+    title: str | None = None
     tolerance_amount: Decimal = Decimal("0")
     tds_percentage: Decimal = Decimal("0")
     gst_percentage: Decimal = Decimal("0")
@@ -162,6 +163,22 @@ class RequestManagerService:
         self._request_repo = request_repository
         self._case_repo = case_repository
         self._vendor_repo = vendor_repository
+
+    async def _next_request_number(self, company_code: str) -> str:
+        """
+        Build the next sequential request number for an entity:
+        "{company_code}-{5-digit serial}" (e.g. EPL-00094).
+
+        The serial is the max existing serial for this company_code + 1,
+        zero-padded to 5 digits.
+        """
+        prefix = (company_code or "REQ").strip().upper()
+        try:
+            max_serial = await self._request_repo.get_max_request_serial(prefix)
+        except AttributeError:
+            # Repository doesn't implement the helper (e.g. in tests) — start at 0.
+            max_serial = 0
+        return f"{prefix}-{max_serial + 1:05d}"
 
     # ──────────────────────────────────────────────────────────────────────
     # Request Creation
@@ -218,6 +235,9 @@ class RequestManagerService:
                 "many_to_one_enabled": data.matching_preferences.many_to_one_enabled,
             }
 
+        # Generate the human-friendly request number: "{company_code}-{5-digit serial}"
+        request_number = await self._next_request_number(data.company_code)
+
         # Create the request in Draft status
         request_data = {
             "company_code": data.company_code,
@@ -225,6 +245,8 @@ class RequestManagerService:
             "period_start": data.period_start,
             "period_end": data.period_end,
             "status": RequestStatus.DRAFT.value,
+            "request_number": request_number,
+            "title": data.title,
             "tolerance_amount": data.tolerance_amount,
             "tds_percentage": data.tds_percentage,
             "gst_percentage": data.gst_percentage,

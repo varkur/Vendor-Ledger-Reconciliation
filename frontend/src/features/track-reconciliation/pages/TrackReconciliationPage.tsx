@@ -15,8 +15,8 @@ import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
 import { useNavigate } from 'react-router-dom';
 
-import { useCaseList } from '../hooks/useTrackReconciliation';
-import type { ReconciliationCase } from '../api/trackReconciliationApi';
+import { useRequestList } from '../hooks/useTrackReconciliation';
+import type { ReconciliationRequest } from '../api/trackReconciliationApi';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
 /** Available status options for the filter dropdown. */
@@ -54,15 +54,13 @@ export const TrackReconciliationPage = () => {
   const [sortBy, setSortBy] = useState<string | undefined>(undefined);
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
 
-  // Query hook — lazy server-side pagination
-  const { data, isLoading, isError, error, refetch } = useCaseList({
+  // Query hook — lazy server-side pagination. One row per REQUEST (statement),
+  // each containing N parties (vendors).
+  const { data, isLoading, isError, error, refetch } = useRequestList({
     company_code: companyCode,
     page,
     page_size: pageSize,
     status: statusFilter || undefined,
-    search: appliedSearch || undefined,
-    sort_by: sortBy,
-    sort_order: sortOrder,
   });
 
   // Handlers
@@ -98,39 +96,52 @@ export const TrackReconciliationPage = () => {
   }, []);
 
   // Column templates
-  const statusTemplate = (rowData: ReconciliationCase) => {
+  const statusTemplate = (rowData: ReconciliationRequest) => {
     const statusClass = rowData.status === 'closed' ? 'closed' : rowData.status === 'open' || rowData.status === 'active' ? 'open' : 'in-progress';
     return (
       <span className={`status-badge ${statusClass}`}>
-        {rowData.status.replace(/_/g, ' ')}
+        {(rowData.status || '').replace(/_/g, ' ')}
       </span>
     );
   };
 
-  const caseTypeTemplate = (rowData: ReconciliationCase) => (
-    <span style={{ textTransform: 'capitalize' }}>
-      {rowData.case_type || 'batch'}
-    </span>
-  );
-
-  const dateTemplate = (rowData: ReconciliationCase) => {
-    if (!rowData.created_date) return '—';
+  const fmtDate = (value?: string | null) => {
+    if (!value) return '—';
     try {
-      return new Date(rowData.created_date).toLocaleDateString('en-IN', {
+      return new Date(value).toLocaleDateString('en-IN', {
         day: '2-digit',
         month: 'short',
         year: 'numeric',
       });
     } catch {
-      return rowData.created_date;
+      return value;
     }
   };
 
-  const actionTemplate = (rowData: ReconciliationCase) => (
+  const periodTemplate = (rowData: ReconciliationRequest) => (
+    <span>{fmtDate(rowData.period_start)} to {fmtDate(rowData.period_end)}</span>
+  );
+
+  const partyCountTemplate = (rowData: ReconciliationRequest) => (
+    <span>{rowData.party_count ?? 0}</span>
+  );
+
+  const requestIdTemplate = (rowData: ReconciliationRequest) => (
+    <span>{rowData.request_number || rowData.id.substring(0, 8) + '...'}</span>
+  );
+
+  const titleTemplate = (rowData: ReconciliationRequest) => (
+    <span>{rowData.title || '—'}</span>
+  );
+
+  const sendDateTemplate = (rowData: ReconciliationRequest) =>
+    rowData.sent_date ? fmtDate(rowData.sent_date) : <span style={{ color: 'var(--color-text-muted)' }}>Not Sent</span>;
+
+  const actionTemplate = (rowData: ReconciliationRequest) => (
     <div className="flex align-items-center gap-2">
       <span
         className="link-view"
-        onClick={() => navigate(`/track-reconciliation/${rowData.request_id}`)}
+        onClick={() => navigate(`/track-reconciliation/${rowData.id}`)}
         style={{ cursor: 'pointer' }}
       >
         View
@@ -171,7 +182,7 @@ export const TrackReconciliationPage = () => {
     );
   }
 
-  const cases = data?.items ?? [];
+  const requests = data?.items ?? [];
   const totalRecords = data?.total ?? 0;
 
   return (
@@ -203,17 +214,17 @@ export const TrackReconciliationPage = () => {
 
       {/* Data Table with lazy pagination */}
       <div className="em-card" style={{ padding: 0 }}>
-        {cases.length === 0 && !isLoading ? (
+        {requests.length === 0 && !isLoading ? (
           <div className="flex flex-column align-items-center gap-3 p-5">
             <i className="pi pi-inbox" style={{ fontSize: '2rem', color: 'var(--color-text-muted)' }} />
             <p style={{ color: 'var(--color-text-muted)' }}>
-              No reconciliation cases found.
+              No reconciliation requests found.
               {appliedSearch && ' Try adjusting your search or filters.'}
             </p>
           </div>
         ) : (
           <DataTable
-            value={cases}
+            value={requests}
             lazy
             paginator
             first={(page - 1) * pageSize}
@@ -225,20 +236,17 @@ export const TrackReconciliationPage = () => {
             sortField={sortBy}
             sortOrder={sortOrder === 'asc' ? 1 : -1}
             loading={isLoading}
-            emptyMessage="No cases found."
+            emptyMessage="No requests found."
             dataKey="id"
           >
-            <Column field="id" header="Case ID" sortable style={{ width: '18%' }}
-              body={(row: ReconciliationCase) => row.id.substring(0, 8) + '...'}
-            />
-            <Column field="case_type" header="Type" sortable style={{ width: '10%' }} body={caseTypeTemplate} />
-            <Column field="vendor_id" header="Vendor ID" sortable style={{ width: '18%' }}
-              body={(row: ReconciliationCase) => row.vendor_id.substring(0, 8) + '...'}
-            />
-            <Column field="upload_count" header="Uploads" sortable style={{ width: '8%', textAlign: 'center' }} />
-            <Column field="created_date" header="Created" sortable style={{ width: '14%' }} body={dateTemplate} />
-            <Column field="status" header="Status" sortable style={{ width: '14%' }} body={statusTemplate} />
-            <Column header="Action" body={actionTemplate} style={{ width: '10%' }} />
+            <Column header="Request ID" sortable field="request_number" style={{ width: '12%' }} body={requestIdTemplate} />
+            <Column header="Reco Type" style={{ width: '9%' }} body={() => <span>Ledger</span>} />
+            <Column header="Request Title" field="title" sortable style={{ width: '22%' }} body={titleTemplate} />
+            <Column header="Number of Parties" style={{ width: '11%', textAlign: 'center' }} body={partyCountTemplate} />
+            <Column header="Reco Period" style={{ width: '16%' }} body={periodTemplate} />
+            <Column header="Send Date" field="sent_date" sortable style={{ width: '11%' }} body={sendDateTemplate} />
+            <Column field="status" header="Status" sortable style={{ width: '9%' }} body={statusTemplate} />
+            <Column header="Action" body={actionTemplate} style={{ width: '9%' }} />
           </DataTable>
         )}
       </div>

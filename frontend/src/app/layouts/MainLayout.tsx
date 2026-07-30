@@ -1,34 +1,37 @@
 /**
- * Main application layout — Sakai-style with Emcure Red branding.
- * Dark sidebar with nested navigation matching Firmway's structure:
+ * Main application layout — Emcure light theme (Sakai-style).
+ * Light sidebar using PrimeReact PanelMenu for nested navigation:
  * - Dashboard
- * - Confirmation (submenu)
- * - Account Reco (submenu with Manage Party, Request Statement, etc.)
- * - Data Management
- * - Settings (submenu with sub-pages)
- * - Utilities
+ * - Account Reco (Manage Party, Request Statement, ...)
+ * - Settings (Manage Users, Company Profile, ...)
+ * - Utilities (Audit Logs, ERP Integration, Automation)
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { PanelMenu } from 'primereact/panelmenu';
+import { Menu } from 'primereact/menu';
+import { Avatar } from 'primereact/avatar';
+import type { MenuItem } from 'primereact/menuitem';
 import { useAppSelector, useAppDispatch } from '@app/store';
 import { fetchEntities, selectEntity, type CompanyEntity } from '@app/store/entitySlice';
+import { logout } from '@features/authentication/store/authSlice';
 import { useQueryClient } from '@tanstack/react-query';
 
-interface SubNavItem {
+interface NavLeaf {
   label: string;
   icon?: string;
   path: string;
 }
 
-interface NavItem {
+interface NavGroup {
   label: string;
   icon: string;
   path?: string;
-  children?: SubNavItem[];
+  children?: NavLeaf[];
 }
 
-const navItems: NavItem[] = [
+const navModel: NavGroup[] = [
   {
     label: 'Dashboard',
     icon: 'pi pi-home',
@@ -79,45 +82,85 @@ export const MainLayout = () => {
   const queryClient = useQueryClient();
   const { user } = useAppSelector((state) => state.auth);
   const { entities, selectedEntity } = useAppSelector((state) => state.entity);
-  const [expandedMenus, setExpandedMenus] = useState<string[]>(['Account Reco']);
-  const [entityDropdownOpen, setEntityDropdownOpen] = useState(false);
-  const entityDropdownRef = useRef<HTMLDivElement>(null);
+
+  const userMenu = useRef<Menu>(null);
+  const entityMenu = useRef<Menu>(null);
 
   // Load entities on mount
   useEffect(() => {
     dispatch(fetchEntities());
   }, [dispatch]);
 
-  // Close dropdown when clicking outside
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (entityDropdownRef.current && !entityDropdownRef.current.contains(event.target as Node)) {
-        setEntityDropdownOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  const isActive = (path: string) =>
+    location.pathname === path || location.pathname.startsWith(path + '/');
 
   const handleEntityChange = (entity: CompanyEntity) => {
     dispatch(selectEntity(entity));
-    setEntityDropdownOpen(false);
-    // Invalidate all queries so data refetches for the new entity
     queryClient.invalidateQueries();
   };
 
-  const isActive = (path: string) => location.pathname === path || location.pathname.startsWith(path + '/');
+  // Controlled expansion so clicking a sub-item doesn't collapse/re-open the
+  // panel. Initialise with the group that contains the current route expanded.
+  const [expandedKeys, setExpandedKeys] = useState<Record<string, boolean>>(() => {
+    const initial: Record<string, boolean> = {};
+    navModel.forEach((group) => {
+      if (group.children?.some((c) => isActive(c.path))) {
+        initial[group.label] = true;
+      }
+    });
+    return initial;
+  });
 
-  const isParentActive = (item: NavItem) => {
-    if (item.path) return isActive(item.path);
-    return item.children?.some((child) => isActive(child.path)) ?? false;
-  };
+  // Build PanelMenu model. Stable except for the active-highlight className,
+  // which depends on the current path. Expansion is controlled separately via
+  // expandedKeys, so re-rendering the model does not re-animate the panels.
+  const panelModel: MenuItem[] = useMemo(
+    () =>
+      navModel.map((group) => {
+        if (!group.children) {
+          return {
+            key: group.label,
+            label: group.label,
+            icon: group.icon,
+            className: isActive(group.path!) ? 'em-menu-active' : undefined,
+            command: () => navigate(group.path!),
+          };
+        }
+        return {
+          key: group.label,
+          label: group.label,
+          icon: group.icon,
+          items: group.children.map((child) => ({
+            key: child.path,
+            label: child.label,
+            icon: child.icon,
+            className: isActive(child.path) ? 'em-menu-active' : undefined,
+            command: () => navigate(child.path),
+          })),
+        };
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [location.pathname]
+  );
 
-  const toggleSubmenu = (label: string) => {
-    setExpandedMenus((prev) =>
-      prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label]
-    );
-  };
+  const userMenuItems: MenuItem[] = [
+    { label: user?.username || 'User', icon: 'pi pi-user', disabled: true },
+    { separator: true },
+    {
+      label: 'Logout',
+      icon: 'pi pi-sign-out',
+      command: () => {
+        dispatch(logout());
+        navigate('/login');
+      },
+    },
+  ];
+
+  const entityMenuItems: MenuItem[] = entities.map((entity) => ({
+    label: entity.name,
+    icon: entity.id === selectedEntity?.id ? 'pi pi-check' : undefined,
+    command: () => handleEntityChange(entity),
+  }));
 
   return (
     <div className="min-h-screen flex" style={{ background: 'var(--color-surface-ground)' }}>
@@ -141,149 +184,66 @@ export const MainLayout = () => {
           <span className="logo-text">EMCURE VLR</span>
         </div>
 
-        {/* Navigation */}
+        {/* Navigation — PrimeReact PanelMenu (controlled expansion) */}
         <nav className="em-sidebar-nav">
-          {navItems.map((item) => (
-            <div key={item.label}>
-              {/* Parent item */}
-              <button
-                className={`em-nav-item ${isParentActive(item) ? 'active' : ''}`}
-                onClick={() => {
-                  if (item.children) {
-                    toggleSubmenu(item.label);
-                  } else if (item.path) {
-                    navigate(item.path);
-                  }
-                }}
-                aria-label={item.label}
-                aria-expanded={item.children ? expandedMenus.includes(item.label) : undefined}
-              >
-                <i className={item.icon} />
-                <span style={{ flex: 1 }}>{item.label}</span>
-                {item.children && (
-                  <i
-                    className={`pi ${expandedMenus.includes(item.label) ? 'pi-chevron-down' : 'pi-chevron-right'}`}
-                    style={{ fontSize: 10 }}
-                  />
-                )}
-              </button>
-
-              {/* Children submenu */}
-              {item.children && expandedMenus.includes(item.label) && (
-                <div className="em-submenu">
-                  {item.children.map((child) => (
-                    <button
-                      key={child.path + child.label}
-                      className={`em-nav-subitem ${isActive(child.path) ? 'active' : ''}`}
-                      onClick={() => navigate(child.path)}
-                      aria-label={child.label}
-                      aria-current={isActive(child.path) ? 'page' : undefined}
-                    >
-                      {child.icon && <i className={child.icon} />}
-                      <span>{child.label}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
+          <PanelMenu
+            model={panelModel}
+            multiple
+            className="em-panelmenu"
+            expandedKeys={expandedKeys}
+            onExpandedKeysChange={(keys) => setExpandedKeys(keys as Record<string, boolean>)}
+          />
         </nav>
       </aside>
 
       {/* ─── Main Content ─── */}
-      <div className="flex-1 flex flex-column" style={{ minWidth: 0 }}>
+      <div className="flex-1 flex flex-column em-main-content" style={{ minWidth: 0 }}>
         {/* Top Bar */}
         <header className="em-topbar" aria-label="Top bar">
           <div className="em-topbar-left">
             <i className="pi pi-question-circle" style={{ fontSize: 18, color: 'var(--color-text-muted)' }} />
-            <div className="em-company-selector" ref={entityDropdownRef} style={{ position: 'relative' }}>
-              <button
-                onClick={() => setEntityDropdownOpen(!entityDropdownOpen)}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '6px 10px',
-                  borderRadius: 4,
-                  fontSize: 14,
-                  color: 'inherit',
-                }}
-                aria-haspopup="listbox"
-                aria-expanded={entityDropdownOpen}
-              >
-                <span>{selectedEntity?.name || 'Select Entity'}</span>
-                <i className={`pi ${entityDropdownOpen ? 'pi-chevron-up' : 'pi-chevron-down'}`} style={{ fontSize: 10 }} />
-              </button>
-              {entityDropdownOpen && entities.length > 0 && (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: '100%',
-                    left: 0,
-                    minWidth: 280,
-                    background: '#fff',
-                    border: '1px solid var(--color-border)',
-                    borderRadius: 6,
-                    boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-                    zIndex: 1000,
-                    marginTop: 4,
-                  }}
-                  role="listbox"
-                  aria-label="Select company entity"
-                >
-                  {entities.map((entity) => (
-                    <button
-                      key={entity.id}
-                      role="option"
-                      aria-selected={entity.id === selectedEntity?.id}
-                      onClick={() => handleEntityChange(entity)}
-                      style={{
-                        display: 'block',
-                        width: '100%',
-                        textAlign: 'left',
-                        padding: '10px 16px',
-                        border: 'none',
-                        background: entity.id === selectedEntity?.id ? 'var(--color-primary-50, #f0f0f0)' : 'transparent',
-                        cursor: 'pointer',
-                        fontSize: 14,
-                        fontWeight: entity.id === selectedEntity?.id ? 600 : 400,
-                      }}
-                    >
-                      {entity.name}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+
+            {/* Entity selector */}
+            <Menu model={entityMenuItems} popup ref={entityMenu} />
+            <button
+              className="em-company-selector"
+              style={{ cursor: 'pointer', background: 'var(--color-surface)' }}
+              onClick={(e) => entityMenu.current?.toggle(e)}
+              aria-haspopup="true"
+            >
+              <span>{selectedEntity?.name || 'Select Entity'}</span>
+              <i className="pi pi-chevron-down" style={{ fontSize: 10 }} />
+            </button>
           </div>
 
           <div className="em-topbar-right">
-            <span className="em-user-info">
-              {user?.username || 'User'}
-            </span>
-            <div
+            <Menu model={userMenuItems} popup ref={userMenu} />
+            <button
+              onClick={(e) => userMenu.current?.toggle(e)}
+              aria-label="User menu"
               style={{
-                width: 32,
-                height: 32,
-                borderRadius: '50%',
-                background: 'var(--color-primary-50)',
-                border: '1px solid var(--color-primary-100)',
                 display: 'flex',
                 alignItems: 'center',
-                justifyContent: 'center',
+                gap: 8,
+                background: 'none',
+                border: 'none',
                 cursor: 'pointer',
               }}
-              onClick={() => {
-                dispatch({ type: 'auth/logout' });
-                navigate('/login');
-              }}
-              title="Logout"
             >
-              <i className="pi pi-sign-out" style={{ fontSize: 14, color: 'var(--color-primary)' }} />
-            </div>
+              <span className="em-user-info">{user?.username || 'User'}</span>
+              <Avatar
+                label={(user?.username?.charAt(0) || 'U').toUpperCase()}
+                shape="circle"
+                size="normal"
+                style={{
+                  background: 'var(--color-primary)',
+                  color: '#fff',
+                  width: '2rem',
+                  height: '2rem',
+                  fontSize: '0.8rem',
+                }}
+              />
+            </button>
           </div>
         </header>
 

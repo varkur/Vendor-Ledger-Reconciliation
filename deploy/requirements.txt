@@ -1,0 +1,21 @@
+# Runtime dependencies for the Vendor Ledger Reconciliation backend.
+# Mirrors backend/pyproject.toml [project.dependencies].
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.13.2
+PyJWT==2.9.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.0
+structlog==24.4.0
+httpx==0.27.2
+celery[redis]==5.4.0
+redis==5.1.1
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+cryptography==43.0.1
+Jinja2==3.1.4

@@ -167,6 +167,30 @@ class RequestRepositoryImpl(IRequestRepository):
         result = await self._session.execute(stmt)
         return result.scalar_one()
 
+    async def get_max_request_serial(self, code_prefix: str) -> int:
+        """
+        Return the highest numeric serial used in request_number values that
+        start with "{code_prefix}-". Used to generate the next sequential
+        request number per entity. Returns 0 if none exist.
+        """
+        like_pattern = f"{code_prefix}-%"
+        stmt = select(ReconciliationRequestModel.request_number).where(
+            ReconciliationRequestModel.request_number.like(like_pattern)
+        )
+        result = await self._session.execute(stmt)
+        max_serial = 0
+        for (rn,) in result.all():
+            if not rn:
+                continue
+            tail = rn.rsplit("-", 1)[-1]
+            try:
+                val = int(tail)
+                if val > max_serial:
+                    max_serial = val
+            except ValueError:
+                continue
+        return max_serial
+
     @staticmethod
     def _build_filter_conditions(filters: RequestFilters | None) -> list:
         """Build SQLAlchemy filter conditions from RequestFilters."""

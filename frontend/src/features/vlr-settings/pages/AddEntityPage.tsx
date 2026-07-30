@@ -39,6 +39,7 @@ export const AddEntityPage = () => {
   const [entityType, setEntityType] = useState<string | null>(null);
   const [entityName, setEntityName] = useState('');
   const [entityPan, setEntityPan] = useState('');
+  const [companyCode, setCompanyCode] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleReset = () => {
@@ -46,10 +47,11 @@ export const AddEntityPage = () => {
     setEntityType(null);
     setEntityName('');
     setEntityPan('');
+    setCompanyCode('');
   };
 
   const handleCreate = async () => {
-    if (!country || !entityType || !entityName.trim() || !entityPan.trim()) {
+    if (!country || !entityType || !entityName.trim() || !entityPan.trim() || !companyCode.trim()) {
       toast.current?.show({
         severity: 'warn',
         summary: 'Validation',
@@ -65,6 +67,7 @@ export const AddEntityPage = () => {
         entity_type: entityType,
         name: entityName.trim(),
         pan_card: entityPan.trim().toUpperCase(),
+        company_code: companyCode.trim().toUpperCase(),
       });
 
       toast.current?.show({
@@ -178,6 +181,30 @@ export const AddEntityPage = () => {
             />
           </div>
 
+          {/* Company Code */}
+          <div className="flex align-items-center gap-3">
+            <label
+              htmlFor="entity-code"
+              className="font-bold text-sm text-right"
+              style={{ width: 140, flexShrink: 0 }}
+            >
+              Company Code <span style={{ color: 'var(--color-error, red)' }}>*</span>
+            </label>
+            <div className="flex-1" style={{ minWidth: 300 }}>
+              <InputText
+                id="entity-code"
+                value={companyCode}
+                onChange={(e) => setCompanyCode(e.target.value.toUpperCase())}
+                placeholder="e.g. EPL, GBL, ZHL, EBL"
+                className="w-full"
+                style={{ textTransform: 'uppercase' }}
+              />
+              <small className="block mt-1" style={{ color: 'var(--color-text-muted)' }}>
+                Used as the prefix for request IDs (e.g. EPL-00094).
+              </small>
+            </div>
+          </div>
+
           {/* Action Buttons */}
           <div className="flex justify-content-end gap-2 mt-3">
             <Button
@@ -185,6 +212,7 @@ export const AddEntityPage = () => {
               icon="pi pi-check"
               onClick={handleCreate}
               loading={isSubmitting}
+              disabled={!country || !entityType || !entityName.trim() || !entityPan.trim() || !companyCode.trim()}
             />
             <Button
               label="Reset"

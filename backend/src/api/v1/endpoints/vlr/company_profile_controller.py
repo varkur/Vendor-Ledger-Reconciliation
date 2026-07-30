@@ -318,6 +318,38 @@ async def update_company_profile(
                 repo, key, value, description=description, modified_by=modifier
             )
 
+    # When editing a specific entity (company_code provided), keep the entities
+    # list in sync so the switcher and profile GET reflect the edited core
+    # details (name/type/pan) — these are read from the entities list, not the
+    # global keys.
+    if request.company_code:
+        import json as _json
+
+        entities_json = await _get_setting_value(repo, "entities.list", "")
+        entities: list[dict] = []
+        if entities_json:
+            try:
+                entities = _json.loads(entities_json)
+            except (ValueError, TypeError):
+                entities = []
+
+        code = request.company_code.strip().upper()
+        match = next(
+            (e for e in entities if (e.get("company_code") or "").upper() == code),
+            None,
+        )
+        if match is not None:
+            if request.entity_name is not None:
+                match["name"] = request.entity_name
+            if request.entity_type is not None:
+                match["entity_type"] = request.entity_type
+            if request.pan_card is not None:
+                match["pan_card"] = request.pan_card.upper()
+            await _upsert_setting(
+                repo, "entities.list", _json.dumps(entities),
+                description="List of company entities", modified_by=modifier,
+            )
+
     logger.info("Company profile updated by user=%s", current_user.username)
     return await _load_company_profile(repo)
 
@@ -326,9 +358,10 @@ class CreateEntityRequest(BaseModel):
     """Request to create a new company entity."""
 
     country: str = Field(..., description="Country of the entity")
-    entity_type: str = Field(..., description="Entity type (Public company, Private, etc.)")
+    entity_type: str = Field(..., min_length=1, description="Entity type (Public company, Private, etc.)")
     name: str = Field(..., min_length=1, description="Entity name")
     pan_card: str = Field(..., min_length=1, description="Entity PAN card")
+    company_code: str = Field(..., min_length=1, max_length=20, description="Company code (used as request ID prefix, e.g. EPL)")
 
 
 @router.post(
@@ -369,9 +402,17 @@ async def create_entity(
             {"id": "4", "company_code": "4000", "name": "EMCUTIX BIOPHARMACEUTICALS LTD", "entity_type": "Private company", "pan_card": "AABCE9012C", "is_active": True},
         ]
 
+    # Company code is user-provided and mandatory; must be unique.
+    new_code = request.company_code.strip().upper()
+    if any((e.get("company_code") or "").upper() == new_code for e in entities):
+        from fastapi import HTTPException, status as _status
+        raise HTTPException(
+            status_code=_status.HTTP_409_CONFLICT,
+            detail=f"An entity with company code '{new_code}' already exists.",
+        )
+
     # Generate new entity
     new_id = str(uuid.uuid4())[:8]
-    new_code = str((len(entities) + 1) * 1000)
     new_entity = {
         "id": new_id,
         "company_code": new_code,

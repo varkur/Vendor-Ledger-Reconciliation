@@ -76,6 +76,12 @@ class LedgerEntryData:
     reference_number: str
     document_number: str = ""
     side: str = ""
+    document_type: str = ""
+
+
+# Pass number for the company-side reversal (knock-off) pass. Kept outside the
+# 1–7 MatchPassType range so it doesn't disturb the standard pass statistics.
+REVERSAL_PASS = 9
 
 
 @dataclass
@@ -209,6 +215,16 @@ class ReconciliationEngineService:
         result = ReconciliationResult(case_id=case_id)
         result.statistics.total_company_entries = len(company_entries)
         result.statistics.total_vendor_entries = len(vendor_entries)
+
+        # ─── Pass 0: Company-side Reversal (knock-off) ───────────────────
+        # Net offsetting AB reversal entries within the company ledger before
+        # any cross-side matching, so they don't surface as differences.
+        reversal_pairs = self._reversal_match(company_entries)
+        for pair in reversal_pairs:
+            # Both entries are company-side for reversals.
+            matched_company_ids.add(pair.company_entry_id)
+            matched_company_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
 
         # ─── Pass 1: Exact Match ─────────────────────────────────────────
         available_company = [
@@ -483,6 +499,67 @@ class ReconciliationEngineService:
 
         if update_data:
             await self._case_repo.update(case_id, update_data)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Company-side Reversal (knock-off) Match
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _reversal_match(
+        self, company: list[LedgerEntryData]
+    ) -> list[MatchPair]:
+        """
+        Knock off company-side reversal entries against each other.
+
+        A reversal pair is two COMPANY entries with:
+          - document type "AB" (SAP reversal document type), and
+          - equal magnitude, opposite sign (they net to zero).
+
+        These offset within the company ledger itself (e.g. an entry posted and
+        later reversed), so they should be removed from the reconciliation
+        difference rather than reported as unmatched. Each pair is returned as a
+        MatchPair whose two entries are both on the company side.
+        """
+        pairs: list[MatchPair] = []
+        used: set[UUID] = set()
+
+        # Only AB-type company entries participate.
+        ab_entries = [
+            e for e in company
+            if (e.document_type or "").strip().upper() == "AB"
+        ]
+
+        # Bucket by absolute amount so we can find opposite-sign counterparts.
+        by_abs: dict[Decimal, list[LedgerEntryData]] = {}
+        for e in ab_entries:
+            by_abs.setdefault(abs(e.amount), []).append(e)
+
+        for abs_amt, group in by_abs.items():
+            if abs_amt == 0:
+                continue
+            debits = [e for e in group if e.amount > 0]
+            credits = [e for e in group if e.amount < 0]
+            # Pair each debit with a credit of the same magnitude.
+            for d in debits:
+                if d.id in used:
+                    continue
+                for cr in credits:
+                    if cr.id in used:
+                        continue
+                    used.add(d.id)
+                    used.add(cr.id)
+                    pairs.append(
+                        MatchPair(
+                            company_entry_id=d.id,
+                            vendor_entry_id=cr.id,  # both are company-side here
+                            confidence_score=1.0,
+                            pass_number=REVERSAL_PASS,
+                            matched_amount=abs_amt,
+                            difference_amount=Decimal("0"),
+                        )
+                    )
+                    break
+
+        return pairs
 
     # ──────────────────────────────────────────────────────────────────────
     # Pass 1: Exact Match
@@ -1201,9 +1278,13 @@ class ReconciliationEngineService:
         for pass_num in range(1, 8):
             pass_data[pass_num] = PassStatistics(pass_number=pass_num)
 
-        # Count from pairs (passes 1, 2, 3, 6)
+        # Count from pairs (passes 1, 2, 3, 6; plus reversal pass 9)
         for pair in result.match_pairs:
-            ps = pass_data[pair.pass_number]
+            ps = pass_data.get(pair.pass_number)
+            if ps is None:
+                # Non-standard pass (e.g. reversal=9): track it dynamically.
+                ps = PassStatistics(pass_number=pair.pass_number)
+                pass_data[pair.pass_number] = ps
             ps.match_count += 1
             ps.matched_amount += pair.matched_amount
 
@@ -1289,25 +1370,35 @@ class ReconciliationEngineService:
         # Persist match pairs (passes 1, 2, 3, 6)
         for pair in result.match_pairs:
             match_id = uuid4()
-            # BRD: Auto-Accept for Pass 1 (Exact) and Pass 2 (Tolerance)
-            is_auto_accepted = pair.pass_number in (
+            is_reversal = pair.pass_number == REVERSAL_PASS
+            # BRD: Auto-Accept for Pass 1 (Exact) and Pass 2 (Tolerance).
+            # Reversals net to zero within the company ledger, so auto-accept them.
+            is_auto_accepted = is_reversal or pair.pass_number in (
                 MatchPassType.EXACT, MatchPassType.TOLERANCE
             )
+            # For reversal pairs BOTH entries are company-side; record them both
+            # under company_entry_ids (no vendor counterpart).
+            if is_reversal:
+                company_ids = [str(pair.company_entry_id), str(pair.vendor_entry_id)]
+                vendor_ids: list[str] = []
+            else:
+                company_ids = [str(pair.company_entry_id)]
+                vendor_ids = [str(pair.vendor_entry_id)]
             match_data = {
                 "id": match_id,
                 "case_id": case_id,
                 "pass_number": pair.pass_number,
-                "match_type": "pair",
+                "match_type": "reversal" if is_reversal else "pair",
                 "confidence_score": pair.confidence_score,
                 "is_confirmed": is_auto_accepted,
-                "company_entry_ids": [str(pair.company_entry_id)],
-                "vendor_entry_ids": [str(pair.vendor_entry_id)],
+                "company_entry_ids": company_ids,
+                "vendor_entry_ids": vendor_ids,
                 "matched_amount": float(pair.matched_amount),
                 "difference_amount": float(pair.difference_amount),
             }
             await self._match_repo.create(match_data)
 
-            # Update ledger entries with match metadata
+            # Update ledger entries with match metadata (both IDs regardless of side)
             await self._ledger_repo.bulk_update_match(
                 entry_ids=[pair.company_entry_id, pair.vendor_entry_id],
                 match_id=match_id,
@@ -1402,6 +1493,7 @@ class ReconciliationEngineService:
                     reference_number=getattr(entry, "reference_number", "") or "",
                     document_number=getattr(entry, "document_number", "") or "",
                     side=getattr(entry, "side", ""),
+                    document_type=(getattr(entry, "document_type", "") or ""),
                 )
             )
         return result

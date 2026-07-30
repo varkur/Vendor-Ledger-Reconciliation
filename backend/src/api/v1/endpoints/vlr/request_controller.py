@@ -118,8 +118,38 @@ async def list_requests(
         pagination=pagination,
     )
 
+    # Enrich each request with its party (case) count so the Track
+    # Reconciliation list can show one row per request with N parties.
+    from sqlalchemy import func as _func, select as _select
+    from src.infrastructure.database.models.vlr.reconciliation_case_model import (
+        ReconciliationCaseModel as _CaseModel,
+    )
+
+    request_ids = [r.id for r in result.items]
+    counts_by_request: dict = {}
+    if request_ids:
+        count_stmt = (
+            _select(
+                _CaseModel.request_id,
+                _func.count(_CaseModel.id),
+            )
+            .where(
+                _CaseModel.request_id.in_(request_ids),
+                _CaseModel.is_deleted == False,  # noqa: E712
+            )
+            .group_by(_CaseModel.request_id)
+        )
+        count_result = await repo._session.execute(count_stmt)
+        counts_by_request = {row[0]: row[1] for row in count_result.all()}
+
+    items = []
+    for r in result.items:
+        resp = ReconciliationRequestResponse.model_validate(r)
+        resp.party_count = int(counts_by_request.get(r.id, 0))
+        items.append(resp)
+
     return RequestListResponse(
-        items=[ReconciliationRequestResponse.model_validate(r) for r in result.items],
+        items=items,
         total=result.total,
         page=result.page,
         page_size=result.page_size,
@@ -156,6 +186,7 @@ async def create_request(
         period_start=request.period_start,
         period_end=request.period_end,
         vendor_ids=request.vendor_ids,
+        title=request.title,
         tolerance_amount=request.tolerance_amount,
         tds_percentage=request.tds_percentage,
         gst_percentage=request.gst_percentage,
@@ -889,11 +920,21 @@ async def upload_company_ledger(
             currency=entry.currency,
             assignment_number=entry.assignment_number,
             description=entry.description,
+            raw_data=getattr(entry, "raw_data", None),
             source="upload",
             created_by=current_user.username,
             modified_by=current_user.username,
         )
         session.add(ledger_entry)
+
+    # ─── Store the ORIGINAL uploaded file bytes (verbatim download) ───────
+    from src.api.v1.endpoints.vlr.column_mapping_controller import (
+        store_original_ledger_file as _store_original,
+    )
+    await _store_original(
+        session, case.id, "company", filename, file_content,
+        modified_by=current_user.username,
+    )
 
     await session.flush()
 
@@ -960,9 +1001,12 @@ class SendInviteRequest(BaseModel):
     `cc_emails` are additional recipients (e.g. the contact person selected in
     the UI dropdown) that get CC'd on every invite email alongside the vendor's
     primary contact.
+
+    `remarks` is an optional free-text message included in each invite email.
     """
 
     cc_emails: list[str] = Field(default_factory=list)
+    remarks: str = Field(default="", description="Optional remarks/message shown in the invite email")
 
 
 @reconciliation_requests_router.post(
@@ -1034,12 +1078,30 @@ async def send_vendor_invites(
     # Additional CC recipients selected in the UI (contact person dropdown).
     cc_emails = [e.strip() for e in (body.cc_emails if body else []) if e and e.strip()]
 
-    # Base URL for the vendor portal link. Configurable via the PORTAL_BASE_URL
-    # setting (or env) so emails point at the real server, not localhost.
+    # Optional free-text remarks/message included in each invite email.
+    remarks = (body.remarks if body else "").strip()
+
+    # Base URL for the vendor portal link. Resolution order:
+    #   1. portal_base_url DB setting
+    #   2. PORTAL_BASE_URL env var
+    #   3. first configured CORS origin (the real frontend URL, e.g.
+    #      http://10.21.191.52:8085) — avoids needing extra .env config
+    #   4. localhost fallback (dev only)
     portal_base_url = (await _get_setting("portal_base_url")).rstrip("/")
     if not portal_base_url:
         import os
-        portal_base_url = os.getenv("PORTAL_BASE_URL", "http://localhost:3000").rstrip("/")
+        portal_base_url = os.getenv("PORTAL_BASE_URL", "").rstrip("/")
+    if not portal_base_url:
+        from src.config.settings import settings as _app_settings
+        cors_origins = [
+            o.rstrip("/")
+            for o in (_app_settings.CORS_ORIGINS or [])
+            if o and "localhost" not in o and "127.0.0.1" not in o
+        ]
+        if cors_origins:
+            portal_base_url = cors_origins[0]
+    if not portal_base_url:
+        portal_base_url = "http://localhost:3000"
 
     if not smtp_host or not sender_email:
         raise HTTPException(
@@ -1136,9 +1198,24 @@ async def send_vendor_invites(
         # Build portal URL (uses configurable base so it works off-localhost)
         portal_url = f"{portal_base_url}/portal/access/{case.portal_token}"
 
-        # Build email body
-        period_start = str(request_obj.period_start) if request_obj.period_start else ""
-        period_end = str(request_obj.period_end) if request_obj.period_end else ""
+        # Build email body. Format the period as dd-Mon-yyyy to match the UI.
+        def _fmt_period(d) -> str:
+            try:
+                return d.strftime("%d-%b-%Y")
+            except AttributeError:
+                return str(d) if d else ""
+
+        period_start = _fmt_period(request_obj.period_start)
+        period_end = _fmt_period(request_obj.period_end)
+
+        # Optional remarks block (only rendered when remarks were provided).
+        remarks_block = (
+            f"""<p style="margin: 16px 0; padding: 12px; background:#f8f8f8;
+                    border-left: 3px solid #C41E3A;">
+                    <strong>Remarks:</strong> {remarks}
+                </p>"""
+            if remarks else ""
+        )
 
         body_html = f"""
         <html>
@@ -1150,7 +1227,9 @@ async def send_vendor_invites(
                     You have been invited to participate in a ledger reconciliation by
                     <strong>Emcure Pharmaceuticals Limited</strong>.
                 </p>
+                <p><strong>Vendor:</strong> {vendor.name} ({vendor.vendor_code})</p>
                 <p><strong>Reconciliation Period:</strong> {period_start} to {period_end}</p>
+                {remarks_block}
                 <p>
                     Please click the link below to access the portal and upload your
                     ledger statement:
@@ -1205,6 +1284,14 @@ async def send_vendor_invites(
                 "status": "failed",
                 "reason": "SMTP delivery failed",
             })
+
+    # Stamp the request's sent_date on first successful send so the Track
+    # Reconciliation list can show the Send Date (and "Not Sent" until then).
+    if emails_sent > 0 and getattr(request_obj, "sent_date", None) is None:
+        request_obj.sent_date = datetime.now(timezone.utc)
+        await session.flush()
+
+    await session.commit()
 
     logger.info(
         "Vendor invites sent: request_id=%s, sent=%d, failed=%d",

@@ -13,6 +13,7 @@ import { Toast } from 'primereact/toast';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
+import { downloadBlob, filenameFromDisposition } from '@shared/utils/downloadBlob';
 import { ReconciliationOutputPanel } from '../components/ReconciliationOutput';
 
 export const ReconciliationOutputPage = () => {
@@ -22,6 +23,35 @@ export const ReconciliationOutputPage = () => {
   const toast = useRef<Toast>(null);
   const queryClient = useQueryClient();
   const [isActing, setIsActing] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const handleExport = async () => {
+    if (!caseId) return;
+    setIsExporting(true);
+    try {
+      const response = await apiClient.get(`/vlr/reconciliation/${caseId}/export`, {
+        responseType: 'blob',
+      });
+      const filename = filenameFromDisposition(
+        response.headers['content-disposition'],
+        `Reconciliation-${caseId}.xlsx`,
+      );
+      downloadBlob(
+        response.data,
+        filename,
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+    } catch (error: any) {
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Export Failed',
+        detail: error.response?.data?.detail || 'Could not generate the Excel file.',
+        life: 6000,
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   // Fetch case status to gate reviewer-only actions
   const { data: caseData } = useQuery({
@@ -38,6 +68,10 @@ export const ReconciliationOutputPage = () => {
   const caseStatus = (caseData as any)?.status || '';
   const isUnderReview = caseStatus === 'review_pending';
   const isReviewed = caseStatus === 'reviewed';
+  const isStatementMapped = caseStatus === 'statement_mapped';
+  // Link/unlink is allowed both while under review and at the statement_mapped
+  // stage (the step before review).
+  const canEditLinks = isUnderReview || isStatementMapped;
 
   const handleReviewDone = async () => {
     setIsActing(true);
@@ -115,22 +149,30 @@ export const ReconciliationOutputPage = () => {
           onClick={() => navigate(`/track-reconciliation/${requestId}`)}
         />
         <div className="flex align-items-center gap-2">
+          <Button
+            icon={isExporting ? 'pi pi-spin pi-spinner' : 'pi pi-file-excel'}
+            label="Download Excel"
+            className="p-button-sm p-button-success"
+            style={{ color: '#fff' }}
+            disabled={isExporting}
+            onClick={handleExport}
+          />
+          {canEditLinks && (
+            <Button
+              icon="pi pi-link"
+              label="Link Unmatched"
+              className="p-button-sm p-button-outlined"
+              onClick={() => navigate(`/track-reconciliation/${requestId}/case/${caseId}/link`)}
+            />
+          )}
           {isUnderReview && (
-            <>
-              <Button
-                icon="pi pi-link"
-                label="Link Unmatched"
-                className="p-button-sm p-button-outlined"
-                onClick={() => navigate(`/track-reconciliation/${requestId}/case/${caseId}/link`)}
-              />
-              <Button
-                icon="pi pi-check"
-                label="Review Completed"
-                className="p-button-sm"
-                loading={isActing}
-                onClick={handleReviewDone}
-              />
-            </>
+            <Button
+              icon="pi pi-check"
+              label="Review Completed"
+              className="p-button-sm"
+              loading={isActing}
+              onClick={handleReviewDone}
+            />
           )}
           {isReviewed && (
             <Button
@@ -147,7 +189,7 @@ export const ReconciliationOutputPage = () => {
       <Toast ref={toast} />
 
       {/* Reconciliation Output Panel */}
-      <ReconciliationOutputPanel caseId={caseId} editable={isUnderReview} />
+      <ReconciliationOutputPanel caseId={caseId} editable={canEditLinks} />
     </div>
   );
 };

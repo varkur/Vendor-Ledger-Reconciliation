@@ -275,6 +275,7 @@ async def upload_vendor_statement(
             "currency": entry.currency,
             "assignment_number": entry.assignment_number,
             "description": entry.description,
+            "raw_data": getattr(entry, "raw_data", None),
             "source": "portal_upload",
             "created_by": "vendor_portal",
             "modified_by": "vendor_portal",
@@ -283,6 +284,15 @@ async def upload_vendor_statement(
     ]
 
     await ledger_repo.bulk_create(entries_data)
+
+    # Store the ORIGINAL uploaded file bytes so downloads return it verbatim.
+    from src.api.v1.endpoints.vlr.column_mapping_controller import (
+        store_original_ledger_file as _store_original,
+    )
+    await _store_original(
+        session, case.id, "vendor", file.filename or "vendor_ledger",
+        file_content, modified_by="vendor_portal",
+    )
 
     # Increment upload count
     case_repo = CaseRepositoryImpl(session)
