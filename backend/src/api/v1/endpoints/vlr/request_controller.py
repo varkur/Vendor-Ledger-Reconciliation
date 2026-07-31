@@ -95,6 +95,7 @@ async def list_requests(
     company_code: str = Query(..., min_length=1, description="Company code filter"),
     request_status: str | None = Query(default=None, alias="status", description="Filter by request status"),
     fiscal_year: str | None = Query(default=None, description="Filter by fiscal year"),
+    reco_type: str | None = Query(default=None, description="Filter by reco type: 'bulk' or 'direct'"),
     date_from: date | None = Query(default=None, description="Filter by creation date from"),
     date_to: date | None = Query(default=None, description="Filter by creation date to"),
     assigned_manager_id: UUID | None = Query(default=None, description="Filter by assigned manager"),
@@ -106,6 +107,7 @@ async def list_requests(
     filters = RequestFilters(
         status=request_status,
         fiscal_year=fiscal_year,
+        reco_type=reco_type,
         date_from=date_from,
         date_to=date_to,
         assigned_manager_id=assigned_manager_id,
@@ -938,31 +940,11 @@ async def upload_company_ledger(
 
     await session.flush()
 
-    # ─── Trigger transformation pipeline (async, best-effort) ─────────────
-    try:
-        from src.infrastructure.tasks.vlr.reconciliation_tasks import transformation_task
-
-        transformation_task.delay(
-            case_id=str(case.id),
-            company_code=company_code,
-            triggered_by=current_user.username,
-        )
-        pipeline_status = "processing"
-        message = (
-            f"Successfully uploaded {len(result.entries)} entries from '{filename}'. "
-            f"Transformation pipeline has been triggered."
-        )
-    except (ImportError, Exception) as exc:
-        logger.warning(
-            "Failed to trigger transformation pipeline: request_id=%s, error=%s",
-            request_id,
-            str(exc),
-        )
-        pipeline_status = "uploaded"
-        message = (
-            f"Successfully uploaded {len(result.entries)} entries from '{filename}'. "
-            f"Transformation pipeline could not be triggered automatically."
-        )
+    # Reconciliation runs synchronously when the user clicks "Start
+    # Reconciliation" (or on vendor portal upload), so no async transformation
+    # task is triggered here. The upload itself is complete at this point.
+    pipeline_status = "uploaded"
+    message = f"Successfully uploaded {len(result.entries)} entries from '{filename}'."
 
     logger.info(
         "Company ledger uploaded: request_id=%s, case_id=%s, entries=%d, file=%s",

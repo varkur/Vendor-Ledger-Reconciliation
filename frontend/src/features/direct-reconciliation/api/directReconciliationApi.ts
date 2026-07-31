@@ -67,6 +67,7 @@ export interface ListRequestsParams {
   company_code: string;
   status?: string;
   fiscal_year?: string;
+  reco_type?: string;
   date_from?: string;
   date_to?: string;
   assigned_manager_id?: string;

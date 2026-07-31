@@ -702,6 +702,7 @@ async def create_direct_reconciliation(
         "period_start": recon_config.period_start,
         "period_end": recon_config.period_end,
         "status": "active",
+        "reco_type": "direct",
         "tolerance_amount": recon_config.tolerance_amount,
         "tds_percentage": recon_config.tds_percentage,
         "gst_percentage": recon_config.gst_percentage,

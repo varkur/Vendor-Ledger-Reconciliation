@@ -260,20 +260,24 @@ async def upload_vendor_statement(
         )
 
     # Create new vendor ledger entries from parsed data
+    # Clip string fields to their DB column limits so a single over-length
+    # value in the vendor's file can't fail the whole upload.
+    from src.api.v1.endpoints.vlr.column_mapping_controller import _clip as _clip_field
+
     entries_data = [
         {
             "id": uuid4(),
             "case_id": case.id,
             "side": "vendor",
-            "document_number": entry.document_number,
-            "document_type": entry.document_type,
-            "reference_number": entry.reference_number,
+            "document_number": _clip_field(entry.document_number, 50),
+            "document_type": _clip_field(entry.document_type, 20),
+            "reference_number": _clip_field(entry.reference_number, 100),
             "posting_date": entry.posting_date,
             "clearing_date": entry.clearing_date,
-            "clearing_document": entry.clearing_document,
+            "clearing_document": _clip_field(entry.clearing_document, 50),
             "amount": float(entry.amount),
-            "currency": entry.currency,
-            "assignment_number": entry.assignment_number,
+            "currency": _clip_field(entry.currency, 10),
+            "assignment_number": _clip_field(entry.assignment_number, 100),
             "description": entry.description,
             "raw_data": getattr(entry, "raw_data", None),
             "source": "portal_upload",

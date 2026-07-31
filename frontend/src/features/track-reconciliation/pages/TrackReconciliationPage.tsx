@@ -134,8 +134,9 @@ export const TrackReconciliationPage = () => {
     <span>{rowData.title || '—'}</span>
   );
 
+  // "Send Date" shows the date the request was raised (creation date).
   const sendDateTemplate = (rowData: ReconciliationRequest) =>
-    rowData.sent_date ? fmtDate(rowData.sent_date) : <span style={{ color: 'var(--color-text-muted)' }}>Not Sent</span>;
+    rowData.created_date ? fmtDate(rowData.created_date) : '—';
 
   const actionTemplate = (rowData: ReconciliationRequest) => (
     <div className="flex align-items-center gap-2">
@@ -244,7 +245,7 @@ export const TrackReconciliationPage = () => {
             <Column header="Request Title" field="title" sortable style={{ width: '22%' }} body={titleTemplate} />
             <Column header="Number of Parties" style={{ width: '11%', textAlign: 'center' }} body={partyCountTemplate} />
             <Column header="Reco Period" style={{ width: '16%' }} body={periodTemplate} />
-            <Column header="Send Date" field="sent_date" sortable style={{ width: '11%' }} body={sendDateTemplate} />
+            <Column header="Send Date" field="created_date" sortable style={{ width: '11%' }} body={sendDateTemplate} />
             <Column field="status" header="Status" sortable style={{ width: '9%' }} body={statusTemplate} />
             <Column header="Action" body={actionTemplate} style={{ width: '9%' }} />
           </DataTable>

@@ -210,5 +210,7 @@ class RequestRepositoryImpl(IRequestRepository):
             )
         if filters.fiscal_year:
             conditions.append(ReconciliationRequestModel.fiscal_year == filters.fiscal_year)
+        if filters.reco_type:
+            conditions.append(ReconciliationRequestModel.reco_type == filters.reco_type)
 
         return conditions

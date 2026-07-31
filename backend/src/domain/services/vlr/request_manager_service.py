@@ -245,6 +245,7 @@ class RequestManagerService:
             "period_start": data.period_start,
             "period_end": data.period_end,
             "status": RequestStatus.DRAFT.value,
+            "reco_type": "bulk",
             "request_number": request_number,
             "title": data.title,
             "tolerance_amount": data.tolerance_amount,

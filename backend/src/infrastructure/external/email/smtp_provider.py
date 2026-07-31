@@ -97,8 +97,19 @@ class SmtpEmailSender(IEmailSender):
         else:
             server = smtplib.SMTP(self._host, self._port, timeout=30)
 
+        # Only attempt SMTP AUTH when credentials are configured AND the server
+        # actually advertises the AUTH extension. Internal relays (e.g. an open
+        # port-25 relay) often don't support AUTH; calling login() there raises
+        # "SMTP AUTH extension not supported by server" and blocks all mail.
         if self._username and self._password:
-            server.login(self._username, self._password)
+            if server.has_extn("auth"):
+                server.login(self._username, self._password)
+            else:
+                logger.warning(
+                    "SMTP server %s:%s does not advertise AUTH; sending without "
+                    "authentication (credentials ignored).",
+                    self._host, self._port,
+                )
 
         # All recipients (To + Cc) must be passed to sendmail's envelope.
         recipients = [to_email] + cc_list

@@ -348,6 +348,15 @@ def _amount_from_mapping(entry: LedgerEntryModel, mappings: "ColumnMappingConfig
         return None
 
 
+def _clip(value, limit: int):
+    """Truncate a string value to the DB column limit (None-safe). Prevents
+    StringDataRightTruncation 500s when a source file has an over-length value."""
+    if value is None:
+        return None
+    s = str(value)
+    return s[:limit] if len(s) > limit else s
+
+
 def _guess_content_type(filename: str) -> str:
     """Map a filename extension to a content type for downloads."""
     name = (filename or "").lower()
@@ -371,27 +380,40 @@ async def store_original_ledger_file(
     """
     Persist (or replace) the ORIGINAL uploaded ledger file bytes for a case+side
     so downloads can return the exact file the user uploaded, unchanged.
+
+    Best-effort: storing the original is a convenience for downloads and must
+    never fail the actual ledger upload. Runs inside a SAVEPOINT so any error
+    (e.g. the vlr_ledger_files table not yet migrated on this environment)
+    rolls back only this sub-operation, leaving the upload transaction intact.
     """
     from sqlalchemy import delete as _sql_delete
 
-    # Replace any existing original for this case+side (re-upload).
-    await session.execute(
-        _sql_delete(LedgerFileModel).where(
-            and_(
-                LedgerFileModel.case_id == str(case_id),
-                LedgerFileModel.side == side,
+    try:
+        async with session.begin_nested():
+            # Replace any existing original for this case+side (re-upload).
+            await session.execute(
+                _sql_delete(LedgerFileModel).where(
+                    and_(
+                        LedgerFileModel.case_id == str(case_id),
+                        LedgerFileModel.side == side,
+                    )
+                )
             )
+            session.add(LedgerFileModel(
+                case_id=str(case_id),
+                side=side,
+                filename=filename or f"{side}_ledger",
+                content_type=_guess_content_type(filename or ""),
+                content=content,
+                created_by=modified_by,
+                modified_by=modified_by,
+            ))
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Could not store original ledger file for case=%s side=%s "
+            "(continuing; download will use the reconstructed fallback).",
+            case_id, side, exc_info=True,
         )
-    )
-    session.add(LedgerFileModel(
-        case_id=str(case_id),
-        side=side,
-        filename=filename or f"{side}_ledger",
-        content_type=_guess_content_type(filename or ""),
-        content=content,
-        created_by=modified_by,
-        modified_by=modified_by,
-    ))
 
 
 async def _get_case(session: AsyncSession, case_id: UUID) -> ReconciliationCaseModel:
@@ -1181,20 +1203,21 @@ async def reupload_ledger(
         )
     )
 
-    # Store new entries.
+    # Store new entries. Clip string fields to their DB column limits so a
+    # single over-length value in the source file can't 500 the whole upload.
     for entry in result.entries:
         session.add(LedgerEntryModel(
             case_id=str(case_id),
             side=side,
-            document_number=entry.document_number,
-            document_type=entry.document_type,
-            reference_number=entry.reference_number,
+            document_number=_clip(entry.document_number, 50),
+            document_type=_clip(entry.document_type, 20),
+            reference_number=_clip(entry.reference_number, 100),
             posting_date=entry.posting_date,
             clearing_date=entry.clearing_date,
-            clearing_document=entry.clearing_document,
+            clearing_document=_clip(entry.clearing_document, 50),
             amount=float(entry.amount),
-            currency=entry.currency,
-            assignment_number=entry.assignment_number,
+            currency=_clip(entry.currency, 10),
+            assignment_number=_clip(entry.assignment_number, 100),
             description=entry.description,
             raw_data=getattr(entry, "raw_data", None),
             source="upload",
@@ -1223,7 +1246,21 @@ async def reupload_ledger(
     case.match_statistics = None
     case.modified_by = current_user.username
 
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        await session.rollback()
+        logger.exception(
+            "Failed to save re-uploaded ledger: case_id=%s, side=%s, file=%s",
+            case_id, side, filename,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not save the uploaded ledger. The file may contain a value "
+                f"the system cannot store. Details: {type(exc).__name__}: {str(exc)[:300]}"
+            ),
+        )
 
     logger.info(
         "Ledger re-uploaded: case_id=%s, side=%s, entries=%d, file=%s, user=%s",

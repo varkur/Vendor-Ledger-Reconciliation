@@ -33,6 +33,12 @@ class ReconciliationRequestModel(BaseModel):
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    # Reconciliation type: 'bulk' (request-statement flow) or 'direct'
+    # (single-vendor dual-upload). Track Reconciliation shows both; Direct
+    # Reconciliation shows only 'direct'.
+    reco_type: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="bulk", server_default="bulk", index=True
+    )
     # Human-friendly request identifier: "{company_code}-{5-digit serial}"
     # e.g. EPL-00094. Generated on create, unique per company code.
     request_number: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)

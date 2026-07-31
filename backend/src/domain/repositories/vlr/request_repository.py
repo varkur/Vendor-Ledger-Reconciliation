@@ -20,6 +20,7 @@ class RequestFilters:
     date_to: date | None = None
     assigned_manager_id: UUID | None = None
     fiscal_year: str | None = None
+    reco_type: str | None = None
 
 
 class IRequestRepository(ABC):

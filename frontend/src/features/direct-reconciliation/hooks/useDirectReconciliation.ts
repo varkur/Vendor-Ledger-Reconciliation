@@ -28,9 +28,11 @@ export const DIRECT_RECO_QUERY_KEY = 'vlr-direct-reconciliation';
  * Implements retry (2 attempts) and exponential backoff per design spec.
  */
 export function useReconciliationRequests(params: ListRequestsParams) {
+  // Direct Reconciliation must only show direct-type reconciliations.
+  const directParams: ListRequestsParams = { ...params, reco_type: 'direct' };
   return useQuery<ReconciliationRequestListResponse, Error>({
-    queryKey: [DIRECT_RECO_QUERY_KEY, params],
-    queryFn: () => listReconciliationRequests(params),
+    queryKey: [DIRECT_RECO_QUERY_KEY, directParams],
+    queryFn: () => listReconciliationRequests(directParams),
     enabled: !!params.company_code,
     retry: 2,
     retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
