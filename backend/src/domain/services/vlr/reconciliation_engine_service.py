@@ -471,15 +471,45 @@ class ReconciliationEngineService:
                         return Decimal(str(amt))
             return None
 
+        def _sum_non_balance(entries: list) -> Decimal:
+            """Total of a side's transactional entries, excluding opening/closing
+            balance rows (used as a closing-balance fallback)."""
+            total = Decimal("0")
+            for e in entries:
+                cat = (getattr(e, "document_category", "") or "").lower()
+                if "opening" in cat or "closing" in cat:
+                    continue
+                amt = getattr(e, "amount", None)
+                if amt is not None:
+                    total += Decimal(str(amt))
+            return total
+
         company_opening = _find_balance(company_entries_raw, "opening")
         company_closing = _find_balance(company_entries_raw, "closing")
         vendor_opening = _find_balance(vendor_entries_raw, "opening")
         vendor_closing = _find_balance(vendor_entries_raw, "closing")
 
-        # Net difference = company closing - vendor closing (if both present)
+        # Not every ledger carries an explicit closing-balance row. When it's
+        # missing, derive the closing position as opening + sum(entries) so the
+        # net difference is still computed instead of being left NULL (which the
+        # UI would render as a misleading "0.00 / Reconciled").
+        effective_company_closing = company_closing
+        if effective_company_closing is None and company_entries_raw:
+            effective_company_closing = (company_opening or Decimal("0")) + _sum_non_balance(
+                company_entries_raw
+            )
+
+        effective_vendor_closing = vendor_closing
+        if effective_vendor_closing is None and vendor_entries_raw:
+            effective_vendor_closing = (vendor_opening or Decimal("0")) + _sum_non_balance(
+                vendor_entries_raw
+            )
+
+        # Net difference = company closing - vendor closing. Computed whenever
+        # both sides have entries (using derived closings when needed).
         net_difference = None
-        if company_closing is not None and vendor_closing is not None:
-            net_difference = company_closing - vendor_closing
+        if effective_company_closing is not None and effective_vendor_closing is not None:
+            net_difference = effective_company_closing - effective_vendor_closing
 
         # Persist balance/category updates via the ledger repo's session
         await self._ledger_repo._session.flush()

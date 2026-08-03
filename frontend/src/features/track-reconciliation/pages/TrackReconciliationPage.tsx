@@ -96,19 +96,36 @@ export const TrackReconciliationPage = () => {
   }, []);
 
   // Column templates
+  // Status reflects whether vendor invites have gone out for this request:
+  //   sent_date set  -> "open"      (request is live with the parties)
+  //   sent_date null -> "Not Sent"  (created but invites not yet emailed)
+  // The stored request.status ('draft'/'active'/...) is not used here — that
+  // lifecycle is never advanced, so it always read "draft" and was misleading.
   const statusTemplate = (rowData: ReconciliationRequest) => {
-    const statusClass = rowData.status === 'closed' ? 'closed' : rowData.status === 'open' || rowData.status === 'active' ? 'open' : 'in-progress';
-    return (
-      <span className={`status-badge ${statusClass}`}>
-        {(rowData.status || '').replace(/_/g, ' ')}
-      </span>
+    const isSent = !!rowData.sent_date;
+    if (rowData.status === 'closed') {
+      return <span className="status-badge closed">closed</span>;
+    }
+    return isSent ? (
+      <span className="status-badge open">open</span>
+    ) : (
+      <span style={{ color: 'var(--color-text-muted)' }}>Not Sent</span>
     );
+  };
+
+  // A bare "YYYY-MM-DD" is parsed as UTC midnight by JS, which can shift the
+  // calendar day when rendered locally. Parse date-only values as local.
+  const parseLocal = (value: string): Date => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.slice(0, 10));
+    return m
+      ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+      : new Date(value);
   };
 
   const fmtDate = (value?: string | null) => {
     if (!value) return '—';
     try {
-      return new Date(value).toLocaleDateString('en-IN', {
+      return parseLocal(value).toLocaleDateString('en-IN', {
         day: '2-digit',
         month: 'short',
         year: 'numeric',
@@ -246,7 +263,7 @@ export const TrackReconciliationPage = () => {
             <Column header="Number of Parties" style={{ width: '11%', textAlign: 'center' }} body={partyCountTemplate} />
             <Column header="Reco Period" style={{ width: '16%' }} body={periodTemplate} />
             <Column header="Send Date" field="created_date" sortable style={{ width: '11%' }} body={sendDateTemplate} />
-            <Column field="status" header="Status" sortable style={{ width: '9%' }} body={statusTemplate} />
+            <Column field="sent_date" header="Status" sortable style={{ width: '9%' }} body={statusTemplate} />
             <Column header="Action" body={actionTemplate} style={{ width: '9%' }} />
           </DataTable>
         )}

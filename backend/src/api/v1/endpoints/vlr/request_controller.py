@@ -701,12 +701,29 @@ async def get_batch_cases(
         created = case_model.created_date
         days = (now - created).days if created else 0
 
-        # Get company amount (sum of company-side ledger entries)
-        amt_stmt = select(func.coalesce(func.sum(LedgerEntryModel.amount), 0)).where(
-            LedgerEntryModel.case_id == case_model.id,
-            LedgerEntryModel.side == "company",
-        )
-        company_amount = float((await session.execute(amt_stmt)).scalar_one())
+        # Company Amount = amount owed by the company to this vendor, i.e. the
+        # company ledger's CLOSING BALANCE for the period.
+        #
+        # Do NOT sum every entry: invoices are positive and payments negative,
+        # so a full-period sum nets to ~0 and is meaningless as an outstanding
+        # amount. Prefer the closing balance computed by the reconciliation
+        # engine; fall back to (opening + sum of transactional entries) when the
+        # engine hasn't run yet or the ledger has no explicit closing row.
+        if case_model.company_closing_balance is not None:
+            company_amount = float(case_model.company_closing_balance)
+        else:
+            bal_stmt = select(
+                func.coalesce(func.sum(LedgerEntryModel.amount), 0)
+            ).where(
+                LedgerEntryModel.case_id == case_model.id,
+                LedgerEntryModel.side == "company",
+                func.coalesce(LedgerEntryModel.document_category, "").notin_(
+                    ["Opening Balance", "Closing Balance"]
+                ),
+            )
+            derived = float((await session.execute(bal_stmt)).scalar_one())
+            opening = float(case_model.company_opening_balance or 0)
+            company_amount = opening + derived
 
         # Get difference amount (net_difference from case or compute)
         difference = float(case_model.net_difference or 0)

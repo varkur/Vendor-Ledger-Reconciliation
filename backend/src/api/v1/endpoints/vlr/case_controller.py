@@ -1393,6 +1393,12 @@ async def start_reconciliation(
         has_unmatched = len(reco_result.unmatched_company_ids) > 0 or len(reco_result.unmatched_vendor_ids) > 0
         final_status = "statement_mapped" if has_unmatched else "auto_completed"
 
+        # The engine persisted balances + net_difference via the case repository.
+        # Our `case` instance was loaded BEFORE that, so it still holds the old
+        # (NULL) values — flushing it as-is would overwrite the freshly computed
+        # figures. Refresh from the DB first so we only change the status.
+        await session.refresh(case)
+
         case.status = final_status
         case.modified_by = current_user.username
         await session.flush()

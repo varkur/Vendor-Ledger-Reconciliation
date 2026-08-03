@@ -33,10 +33,19 @@ import {
 } from '../hooks/useReconciliationDetail';
 import type { BatchCaseRow } from '../api/reconciliationDetailApi';
 
-/** Format an ISO date (YYYY-MM-DD) as dd-Mon-yyyy for display. */
+/**
+ * Format an ISO date (YYYY-MM-DD) as dd-Mon-yyyy for display.
+ *
+ * A bare "YYYY-MM-DD" is parsed by JS as UTC midnight, so rendering it in a
+ * local timezone can shift the calendar day. Parse the date parts explicitly
+ * and build a local Date so the day is always exactly what was stored.
+ */
 function formatRecoDate(iso?: string | null): string {
   if (!iso) return '';
-  const d = new Date(iso);
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso).slice(0, 10));
+  const d = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(iso);
   if (isNaN(d.getTime())) return String(iso);
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).replace(/ /g, '-');
 }

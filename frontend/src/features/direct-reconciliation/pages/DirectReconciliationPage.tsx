@@ -91,9 +91,17 @@ function formatDate(isoDate: string | null): string {
   }
 }
 
-/** Format a Date object to ISO date string (YYYY-MM-DD). */
+/**
+ * Format a Date object to a YYYY-MM-DD string using its LOCAL calendar date.
+ *
+ * toISOString() converts to UTC first, which shifts the date back a day for
+ * timezones ahead of UTC (IST +5:30 turns 01-Apr into 31-Mar).
+ */
 function toISODateString(date: Date): string {
-  return date.toISOString().split('T')[0] ?? '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

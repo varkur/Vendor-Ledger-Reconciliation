@@ -284,10 +284,15 @@ export const RequestStatementPage = () => {
   }, [title, startDate, endDate, selectedVendorIds]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────────
+  // Build YYYY-MM-DD from the LOCAL calendar date. Using toISOString() here
+  // would convert to UTC first, which shifts the date back a day for
+  // timezones ahead of UTC (e.g. IST +5:30 turns 01-Apr into 31-Mar).
   const formatDateToISO = (d: Date | null): string => {
     if (!d) return '';
-    const iso = d.toISOString();
-    return iso.substring(0, iso.indexOf('T'));
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
   };
 
   const handleSubmit = useCallback(() => {
