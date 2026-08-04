@@ -630,6 +630,13 @@ class ReconciliationExportService:
                 cat = (getattr(e, "document_category", "") or "").strip()
                 if cat in ("Opening Balance", "Closing Balance"):
                     continue
+                # Balance and reversal (knock-off) entries are entry-intrinsic
+                # classifications, not a cross-ledger "not booked" gap. A
+                # knock-off nets within one side, so it must not surface as a
+                # difference "not booked by" the other side.
+                special = _special_classification(e)
+                if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
+                    continue
                 info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
                 label = info["company_missing"] if side == "company" else info["party_missing"]
                 action = info["company_action"] if side == "company" else info["party_action"]

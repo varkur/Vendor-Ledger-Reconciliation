@@ -14,6 +14,7 @@ import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
 
 import { useUnmatchedCompany, useConfirmMatch } from './useReconciliationOutput';
+import { LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
 import type { ListParams, UnmatchedCompanyAction, UnmatchedCompanyItem } from './reconciliationOutputApi';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,15 +207,22 @@ export const UnmatchedCompanyTab = ({ caseId }: UnmatchedCompanyTabProps) => {
           sortField={params.sort_by}
           sortOrder={params.sort_order === 'asc' ? 1 : -1}
           lazy
+          scrollable
           rowsPerPageOptions={[10, 25, 50]}
           emptyMessage="No unmatched company entries found."
           aria-label="Unmatched company ledger entries table"
         >
-          <Column field="reference" header="Reference" sortable style={{ width: '15%' }} />
-          <Column field="document_type" header="Document Type" sortable style={{ width: '13%' }} />
-          <Column field="amount" header="Amount" sortable body={amountTemplate} style={{ width: '15%', textAlign: 'right' }} />
-          <Column field="posting_date" header="Posting Date" sortable style={{ width: '13%' }} />
-          <Column field="description" header="Description" sortable style={{ width: '25%' }} />
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={c.field}
+              header={c.header}
+              body={(row: UnmatchedCompanyItem) => {
+                const v = row.columns ? (row.columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
         </DataTable>
       </div>
     </div>

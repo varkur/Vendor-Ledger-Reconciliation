@@ -770,3 +770,12 @@ h2 {
 .bg-primary {
   background-color: var(--color-primary) !important;
 }
+
+
+/* Reconciliation Particulars statement — highlight parent/summary rows */
+.particulars-group-row {
+  background: var(--color-surface-hover, #fbfaf2) !important;
+}
+.particulars-group-row > td {
+  background: var(--color-surface-hover, #fbfaf2) !important;
+}

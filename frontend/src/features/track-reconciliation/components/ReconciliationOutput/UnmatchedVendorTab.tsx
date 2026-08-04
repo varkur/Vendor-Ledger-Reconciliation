@@ -14,6 +14,7 @@ import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
 
 import { useUnmatchedVendor, useConfirmMatch } from './useReconciliationOutput';
+import { LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
 import type { ListParams, UnmatchedVendorAction, UnmatchedVendorItem } from './reconciliationOutputApi';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,15 +207,22 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
           sortField={params.sort_by}
           sortOrder={params.sort_order === 'asc' ? 1 : -1}
           lazy
+          scrollable
           rowsPerPageOptions={[10, 25, 50]}
           emptyMessage="No unmatched vendor entries found."
           aria-label="Unmatched vendor ledger entries table"
         >
-          <Column field="reference" header="Reference" sortable style={{ width: '14%' }} />
-          <Column field="transaction_type" header="Transaction Type" sortable style={{ width: '14%' }} />
-          <Column field="amount" header="Amount" sortable body={amountTemplate} style={{ width: '14%', textAlign: 'right' }} />
-          <Column field="date" header="Date" sortable style={{ width: '12%' }} />
-          <Column field="description" header="Description" sortable style={{ width: '28%' }} />
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={c.field}
+              header={c.header}
+              body={(row: UnmatchedVendorItem) => {
+                const v = row.columns ? (row.columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
         </DataTable>
       </div>
     </div>

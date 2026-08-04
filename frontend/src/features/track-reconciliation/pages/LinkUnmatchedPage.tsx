@@ -19,27 +19,34 @@ import { Tag } from 'primereact/tag';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
-import { manualLink } from '../components/ReconciliationOutput/reconciliationOutputApi';
+import { manualLink, LEDGER_COLUMN_DEFS } from '../components/ReconciliationOutput/reconciliationOutputApi';
+import type { EntryColumns } from '../components/ReconciliationOutput/reconciliationOutputApi';
+
+type LedgerSource = 'Company' | 'Party';
 
 interface UnmatchedRow {
   id: string;
+  source: LedgerSource;
   document_number: string;
   reference: string;
   amount: number;
   posting_date: string;
   document_type: string;
   description?: string;
+  columns?: EntryColumns;
 }
 
-function normalizeRows(raw: any): UnmatchedRow[] {
+function normalizeRows(raw: any, source: LedgerSource): UnmatchedRow[] {
   return (raw?.items ?? []).map((it: any) => ({
     id: it.entry_id ?? it.id,
+    source,
     document_number: it.document_number ?? '',
     reference: it.reference_number ?? it.document_number ?? '',
     amount: Number(it.amount ?? 0),
     posting_date: it.posting_date ?? '',
     document_type: it.document_category ?? it.document_type ?? '',
     description: it.description ?? '',
+    columns: it.columns ?? undefined,
   }));
 }
 
@@ -50,17 +57,16 @@ export const LinkUnmatchedPage = () => {
   const queryClient = useQueryClient();
   const { companyCode } = useSelectedEntity();
 
-  const [companySelection, setCompanySelection] = useState<UnmatchedRow[]>([]);
-  const [vendorSelection, setVendorSelection] = useState<UnmatchedRow[]>([]);
+  const [selection, setSelection] = useState<UnmatchedRow[]>([]);
   const [isLinking, setIsLinking] = useState(false);
 
   const { data: companyData, isLoading: companyLoading, refetch: refetchCompany } = useQuery({
     queryKey: ['unmatched-company-link', caseId],
     queryFn: async () => {
       const { data } = await apiClient.get(`/vlr/reconciliation/${caseId}/unmatched-company`, {
-        params: { page: 1, page_size: 100 },
+        params: { page: 1, page_size: 500 },
       });
-      return normalizeRows(data);
+      return normalizeRows(data, 'Company');
     },
     enabled: !!caseId,
   });
@@ -69,12 +75,27 @@ export const LinkUnmatchedPage = () => {
     queryKey: ['unmatched-vendor-link', caseId],
     queryFn: async () => {
       const { data } = await apiClient.get(`/vlr/reconciliation/${caseId}/unmatched-vendor`, {
-        params: { page: 1, page_size: 100 },
+        params: { page: 1, page_size: 500 },
       });
-      return normalizeRows(data);
+      return normalizeRows(data, 'Party');
     },
     enabled: !!caseId,
   });
+
+  // Merge both sides into one list; Source column distinguishes them.
+  const allRows = useMemo(
+    () => [...(companyData ?? []), ...(vendorData ?? [])],
+    [companyData, vendorData]
+  );
+
+  const companySelection = useMemo(
+    () => selection.filter((r) => r.source === 'Company'),
+    [selection]
+  );
+  const vendorSelection = useMemo(
+    () => selection.filter((r) => r.source === 'Party'),
+    [selection]
+  );
 
   const companySum = useMemo(
     () => companySelection.reduce((s, r) => s + r.amount, 0),
@@ -87,8 +108,8 @@ export const LinkUnmatchedPage = () => {
   const netDiff = companySum + vendorSum; // opposite signs
 
   const handleLink = async () => {
-    if (companySelection.length === 0 && vendorSelection.length === 0) {
-      toast.current?.show({ severity: 'warn', summary: 'Nothing selected', detail: 'Select entries on at least one side to link.', life: 4000 });
+    if (selection.length === 0) {
+      toast.current?.show({ severity: 'warn', summary: 'Nothing selected', detail: 'Select at least one entry to link.', life: 4000 });
       return;
     }
     setIsLinking(true);
@@ -99,8 +120,7 @@ export const LinkUnmatchedPage = () => {
         vendorSelection.map((r) => r.id)
       );
       toast.current?.show({ severity: 'success', summary: 'Linked', detail: res.message, life: 5000 });
-      setCompanySelection([]);
-      setVendorSelection([]);
+      setSelection([]);
       refetchCompany();
       refetchVendor();
       queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
@@ -111,12 +131,6 @@ export const LinkUnmatchedPage = () => {
       setIsLinking(false);
     }
   };
-
-  const amountBody = (r: UnmatchedRow) => (
-    <span className={r.amount < 0 ? 'text-red-500' : ''}>
-      {r.amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-    </span>
-  );
 
   const fmt = (n: number) => n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
@@ -159,7 +173,7 @@ export const LinkUnmatchedPage = () => {
         </div>
       </div>
 
-      {Math.abs(netDiff) >= 0.01 && (companySelection.length > 0 || vendorSelection.length > 0) && (
+      {Math.abs(netDiff) >= 0.01 && selection.length > 0 && (
         <Message
           severity="warn"
           className="w-full mb-3"
@@ -167,62 +181,53 @@ export const LinkUnmatchedPage = () => {
         />
       )}
 
-      <div className="grid">
-        {/* Company (Source 1) */}
-        <div className="col-12 md:col-6">
-          <div className="em-card" style={{ padding: 0, borderTop: '3px solid #10b981' }}>
-            <div className="p-3 flex align-items-center justify-content-between">
-              <h4 className="m-0">Company Ledger (Source 1)</h4>
-              <Tag value={`${companySelection.length} selected`} />
-            </div>
-            <DataTable
-              value={companyData ?? []}
-              selection={companySelection}
-              onSelectionChange={(e) => setCompanySelection(e.value as UnmatchedRow[])}
-              dataKey="id"
-              size="small"
-              scrollable
-              scrollHeight="440px"
-              paginator
-              rows={25}
-              emptyMessage="No unmatched company entries"
-            >
-              <Column selectionMode="multiple" headerStyle={{ width: '3rem' }} />
-              <Column field="document_number" header="Doc No" />
-              <Column field="posting_date" header="Date" />
-              <Column field="document_type" header="Type" />
-              <Column field="amount" header="Amount" body={amountBody} style={{ textAlign: 'right' }} />
-            </DataTable>
+      {/* Single unified table — all unmatched entries (company + party),
+          distinguished by the Source column. */}
+      <div className="em-card" style={{ padding: 0 }}>
+        <div className="p-3 flex align-items-center justify-content-between">
+          <h4 className="m-0">Unmatched Data</h4>
+          <div className="flex align-items-center gap-2">
+            <Tag value={`${companySelection.length} company`} />
+            <Tag value={`${vendorSelection.length} party`} severity="warning" />
           </div>
         </div>
-
-        {/* Vendor (Source 2) */}
-        <div className="col-12 md:col-6">
-          <div className="em-card" style={{ padding: 0, borderTop: '3px solid #f59e0b' }}>
-            <div className="p-3 flex align-items-center justify-content-between">
-              <h4 className="m-0">Party Ledger (Source 2)</h4>
-              <Tag value={`${vendorSelection.length} selected`} severity="warning" />
-            </div>
-            <DataTable
-              value={vendorData ?? []}
-              selection={vendorSelection}
-              onSelectionChange={(e) => setVendorSelection(e.value as UnmatchedRow[])}
-              dataKey="id"
-              size="small"
-              scrollable
-              scrollHeight="440px"
-              paginator
-              rows={25}
-              emptyMessage="No unmatched vendor entries"
-            >
-              <Column selectionMode="multiple" headerStyle={{ width: '3rem' }} />
-              <Column field="document_number" header="Doc No" />
-              <Column field="posting_date" header="Date" />
-              <Column field="document_type" header="Type" />
-              <Column field="amount" header="Amount" body={amountBody} style={{ textAlign: 'right' }} />
-            </DataTable>
-          </div>
-        </div>
+        <DataTable
+          value={allRows}
+          selection={selection}
+          onSelectionChange={(e) => setSelection(e.value as UnmatchedRow[])}
+          dataKey="id"
+          size="small"
+          scrollable
+          scrollHeight="560px"
+          paginator
+          rows={100}
+          rowsPerPageOptions={[25, 50, 100, 200]}
+          emptyMessage="No unmatched entries"
+        >
+          <Column selectionMode="multiple" headerStyle={{ width: '3rem' }} frozen />
+          <Column
+            header="Source"
+            frozen
+            style={{ minWidth: '7rem' }}
+            body={(row: UnmatchedRow) => (
+              <Tag
+                value={row.source}
+                severity={row.source === 'Company' ? 'info' : 'warning'}
+              />
+            )}
+          />
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={c.field}
+              header={c.header}
+              body={(row: UnmatchedRow) => {
+                const v = row.columns ? (row.columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap', textAlign: c.field === 'amount' || c.field === 'amount_in_doc_curr' ? 'right' : 'left' }}
+            />
+          ))}
+        </DataTable>
       </div>
     </div>
   );

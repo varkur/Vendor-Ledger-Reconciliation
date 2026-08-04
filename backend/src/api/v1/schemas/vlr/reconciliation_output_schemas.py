@@ -66,6 +66,43 @@ class PaginationMeta(BaseModel):
     total_pages: int = Field(..., description="Total number of pages")
 
 
+class EntryColumns(BaseModel):
+    """
+    Full ledger-entry column set (matches the Excel export). Derived from the
+    original uploaded row (raw_data) with modelled fields as fallback, via
+    domain.services.vlr.entry_columns.build_entry_columns.
+    """
+
+    statement_type: str = ""
+    invoice_date: str = ""
+    invoice_number: str = ""
+    doctype: str = ""
+    original_doctype: str = ""
+    narration: str = ""
+    amount: float = 0.0
+    daybook_name: str = ""
+    clearing_document_number: str = ""
+    clearing_date: str = ""
+    tds_amount: str = ""
+    posting_date: str = ""
+    company_code: str = ""
+    supplier: str = ""
+    document_number: str = ""
+    business_area: str = ""
+    assignment: str = ""
+    document_header_text: str = ""
+    tax_code: str = ""
+    year_month: str = ""
+    reference: str = ""
+    profit_center: str = ""
+    amount_in_doc_curr: float = 0.0
+    document_currency: str = ""
+    local_currency: str = ""
+    entry_date: str = ""
+    withhldg_tax_base_amount: str = ""
+    payment_date: str = ""
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Tab 1: Matched Items
 # ──────────────────────────────────────────────────────────────────────
@@ -84,6 +121,9 @@ class MatchedEntryResponse(BaseModel):
     match_score: float = Field(..., description="Confidence score of the match [0.0, 1.0]")
     pass_number: int = Field(..., description="Pass number that produced the match")
     matched_amount: Decimal = Field(..., description="The matched amount")
+    company_columns: EntryColumns | None = Field(None, description="Full company-side column set")
+    party_columns: EntryColumns | None = Field(None, description="Full party-side column set")
+    matched_rule: str | None = Field(None, description="Derived rule code for the match")
 
     model_config = {"from_attributes": True}
 
@@ -144,6 +184,7 @@ class UnmatchedCompanyEntryResponse(BaseModel):
     amount: Decimal = Field(..., description="Entry amount")
     currency: str = Field(..., description="Currency code")
     description: str | None = Field(None, description="Entry description")
+    columns: EntryColumns | None = Field(None, description="Full column set (matches export)")
 
     model_config = {"from_attributes": True}
 
@@ -174,6 +215,7 @@ class UnmatchedVendorEntryResponse(BaseModel):
     amount: Decimal = Field(..., description="Entry amount")
     currency: str = Field(..., description="Currency code")
     description: str | None = Field(None, description="Entry description")
+    columns: EntryColumns | None = Field(None, description="Full column set (matches export)")
 
     model_config = {"from_attributes": True}
 
@@ -268,5 +310,82 @@ class ConfirmMatchResponse(BaseModel):
     action: ConfirmAction = Field(..., description="Action that was taken")
     success: bool = Field(..., description="Whether the action was successful")
     message: str = Field(..., description="Status message")
+
+    model_config = {"from_attributes": True}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reconciliation Analytics (Firmway-style summary view)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class AnalyticsRow(BaseModel):
+    """One row of the Reconciliation Analytics table."""
+
+    particulars: str = Field(..., description="Row label (Matched, Unmatched, etc.)")
+    company_numbers: int = Field(0, description="Count on the company side")
+    company_percentage: float = Field(0.0, description="Company count as % of company total")
+    party_numbers: int = Field(0, description="Count on the party side")
+    party_percentage: float = Field(0.0, description="Party count as % of party total")
+    # Drill-in key so the UI knows which tab/filter to open on "View".
+    view_key: str = Field("", description="Identifier for the drill-in view")
+
+
+class ReconciliationAnalyticsResponse(BaseModel):
+    """Response for the Reconciliation Analytics summary table."""
+
+    case_id: UUID
+    party_code: str = ""
+    party_name: str = ""
+    party_type: str = "Vendor"
+    reco_type: str = "Ledger"
+    reco_status: str = ""
+    period_start: date | None = None
+    period_end: date | None = None
+    updated_at: datetime | None = None
+    rows: list[AnalyticsRow] = Field(default_factory=list)
+    total_company_numbers: int = 0
+    total_party_numbers: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reconciliation Particulars (Firmway-style reconciliation statement)
+# ──────────────────────────────────────────────────────────────────────
+
+
+class ParticularsChild(BaseModel):
+    """A child (leaf) row under a Particulars group."""
+
+    label: str = Field(..., description="Row label, e.g. 'Invoice not booked by Company'")
+    amount: Decimal = Field(Decimal("0"), description="Signed amount for this line")
+    no_of_entries: int = Field(0, description="Number of ledger entries in this line")
+    side: str = Field("", description="Which side the entries belong to (company/vendor)")
+    document_category: str = Field("", description="Document category filter for drill-in")
+    view_key: str = Field("", description="Drill-in identifier for the 'View' action")
+
+
+class ParticularsGroup(BaseModel):
+    """A parent group in the reconciliation statement (sum of its children)."""
+
+    label: str = Field(..., description="Group label, e.g. 'Invoice Difference'")
+    amount: Decimal = Field(Decimal("0"), description="Net signed amount of the group")
+    no_of_entries: int = Field(0, description="Total entries across all children")
+    children: list[ParticularsChild] = Field(default_factory=list)
+    view_key: str = Field("", description="Drill-in identifier for the 'View' action")
+
+
+class ParticularsSummaryResponse(BaseModel):
+    """Response for the reconciliation Particulars statement table."""
+
+    case_id: UUID
+    closing_balance_company: Decimal | None = None
+    closing_balance_party: Decimal | None = None
+    groups: list[ParticularsGroup] = Field(default_factory=list)
+    calculated_balance: Decimal = Field(
+        Decimal("0"),
+        description="Closing balance difference reconciled by the transaction differences",
+    )
 
     model_config = {"from_attributes": True}

@@ -4,6 +4,8 @@ export { MatchedItemsTab } from './MatchedItemsTab';
 export { ConfirmationTab } from './ConfirmationTab';
 export { UnmatchedCompanyTab } from './UnmatchedCompanyTab';
 export { UnmatchedVendorTab } from './UnmatchedVendorTab';
+export { UnmatchedAllTab } from './UnmatchedAllTab';
+export { KnockingTab } from './KnockingTab';
 export { DifferencesSummaryTab } from './DifferencesSummaryTab';
 export {
   useMatchedItems,

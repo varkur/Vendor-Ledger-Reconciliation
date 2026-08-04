@@ -19,7 +19,7 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user
@@ -30,10 +30,16 @@ from src.api.v1.schemas.vlr.reconciliation_output_schemas import (
     ConfirmMatchResponse,
     ConfirmationEntryResponse,
     ConfirmationItemsResponse,
+    AnalyticsRow,
     DifferencesSummaryResponse,
+    EntryColumns,
     MatchedEntryResponse,
     MatchedItemsResponse,
     PaginationMeta,
+    ParticularsChild,
+    ParticularsGroup,
+    ParticularsSummaryResponse,
+    ReconciliationAnalyticsResponse,
     SortOrder,
     TypeTotal,
     UnmatchedCompanyEntryResponse,
@@ -42,6 +48,7 @@ from src.api.v1.schemas.vlr.reconciliation_output_schemas import (
     UnmatchedVendorResponse,
 )
 from src.domain.entities.user import User
+from src.domain.services.vlr.entry_columns import build_entry_columns, invoice_number
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
 from src.infrastructure.database.models.vlr.match_result_model import MatchResultModel
 from src.infrastructure.database.models.vlr.reconciliation_case_model import (
@@ -90,6 +97,39 @@ async def _verify_case_exists(
     return case
 
 
+# Document categories that are NOT genuine cross-ledger differences: balance
+# markers and knock-off / reversal (SAP "AB") entries. These net within a
+# single ledger and are excluded from the "unmatched" definition everywhere so
+# the unmatched list, the analytics count, and the reconciliation statement all
+# agree. Kept in sync with reconciliation_export_service._special_classification.
+_NON_DIFFERENCE_CATEGORIES = ["Opening Balance", "Closing Balance", "Knocking Off"]
+_NON_DIFFERENCE_DOC_TYPES = ["AB"]
+
+
+def _genuine_unmatched_conditions(case_id: UUID, side: str) -> list:
+    """
+    SQL conditions selecting *genuine* unmatched entries for one side:
+      • no match (match_id IS NULL),
+      • not an Opening/Closing Balance row,
+      • not a knock-off / reversal (category "Knocking Off" or doc type "AB").
+
+    This is the single source of truth for "unmatched" so the unmatched
+    screens, analytics counts, and the reconciliation statement stay in lock-step.
+    """
+    conds = [
+        LedgerEntryModel.case_id == str(case_id),
+        LedgerEntryModel.side == side,
+        LedgerEntryModel.match_id.is_(None),
+        func.coalesce(LedgerEntryModel.document_category, "").notin_(
+            _NON_DIFFERENCE_CATEGORIES
+        ),
+        func.coalesce(LedgerEntryModel.document_type, "").notin_(
+            _NON_DIFFERENCE_DOC_TYPES
+        ),
+    ]
+    return conds
+
+
 def _build_pagination(page: int, page_size: int, total: int) -> PaginationMeta:
     """Build pagination metadata."""
     return PaginationMeta(
@@ -100,21 +140,30 @@ def _build_pagination(page: int, page_size: int, total: int) -> PaginationMeta:
     )
 
 
+async def _get_first_entry(
+    entry_ids: list | None, session: AsyncSession
+) -> LedgerEntryModel | None:
+    """Load the first ledger entry from a list of entry IDs."""
+    if not entry_ids:
+        return None
+    first_id = entry_ids[0]
+    if first_id is None:
+        return None
+    stmt = select(LedgerEntryModel).where(LedgerEntryModel.id == str(first_id))
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 async def _get_entry_reference(
     entry_ids: list | None, session: AsyncSession
 ) -> tuple[str | None, Decimal | None]:
     """Get first entry's reference and amount from a list of entry IDs."""
-    if not entry_ids:
-        return None, None
-    first_id = entry_ids[0] if entry_ids else None
-    if first_id is None:
-        return None, None
-    stmt = select(LedgerEntryModel).where(LedgerEntryModel.id == str(first_id))
-    result = await session.execute(stmt)
-    entry = result.scalar_one_or_none()
+    entry = await _get_first_entry(entry_ids, session)
     if entry is None:
         return None, None
-    ref = entry.derived_invoice_number or entry.reference_number or entry.document_number
+    # Use the shared invoice_number helper so synthetic BAL_ROW_* placeholders
+    # are never surfaced (recovers the real number from raw_data instead).
+    ref = invoice_number(entry) or entry.reference_number
     amount = Decimal(str(entry.amount)) if entry.amount is not None else None
     return ref, amount
 
@@ -134,7 +183,7 @@ async def _get_entry_reference(
 async def get_matched_items(
     case_id: UUID,
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    page_size: int = Query(20, ge=1, le=1000, description="Items per page"),
     sort_by: str = Query("pass_number", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     match_type_filter: str | None = Query(None, description="Filter by match type"),
@@ -185,14 +234,26 @@ async def get_matched_items(
     matches = list(result.scalars().all())
 
     # Build response items
+    from src.domain.services.vlr.reconciliation_export_service import _rule_code
+
     items: list[MatchedEntryResponse] = []
     for match in matches:
-        cl_ref, cl_amount = await _get_entry_reference(
-            match.company_entry_ids, session
+        company_entry = await _get_first_entry(match.company_entry_ids, session)
+        vendor_entry = await _get_first_entry(match.vendor_entry_ids, session)
+
+        cl_ref = (
+            invoice_number(company_entry) or company_entry.reference_number
+        ) if company_entry else None
+        cl_amount = (
+            Decimal(str(company_entry.amount)) if company_entry and company_entry.amount is not None else None
         )
-        vl_ref, vl_amount = await _get_entry_reference(
-            match.vendor_entry_ids, session
+        vl_ref = (
+            invoice_number(vendor_entry) or vendor_entry.reference_number
+        ) if vendor_entry else None
+        vl_amount = (
+            Decimal(str(vendor_entry.amount)) if vendor_entry and vendor_entry.amount is not None else None
         )
+
         difference = match.difference_amount
         if difference is None and cl_amount is not None and vl_amount is not None:
             difference = cl_amount - vl_amount
@@ -209,6 +270,9 @@ async def get_matched_items(
                 match_score=float(match.confidence_score),
                 pass_number=match.pass_number,
                 matched_amount=Decimal(str(match.matched_amount)),
+                company_columns=EntryColumns(**build_entry_columns(company_entry)) if company_entry else None,
+                party_columns=EntryColumns(**build_entry_columns(vendor_entry)) if vendor_entry else None,
+                matched_rule=_rule_code(match.pass_number),
             )
         )
 
@@ -233,7 +297,7 @@ async def get_matched_items(
 async def get_confirmation_items(
     case_id: UUID,
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    page_size: int = Query(20, ge=1, le=1000, description="Items per page"),
     sort_by: str = Query("pass_number", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     match_type_filter: str | None = Query(None, description="Filter by match type"),
@@ -329,7 +393,7 @@ async def get_confirmation_items(
 async def get_unmatched_company(
     case_id: UUID,
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    page_size: int = Query(20, ge=1, le=1000, description="Items per page"),
     sort_by: str = Query("posting_date", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     document_type_filter: str | None = Query(
@@ -349,11 +413,7 @@ async def get_unmatched_company(
     await _verify_case_exists(case_id, session)
 
     base_query = select(LedgerEntryModel).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "company",
-            LedgerEntryModel.match_id.is_(None),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "company"))
     )
 
     if document_type_filter:
@@ -383,7 +443,7 @@ async def get_unmatched_company(
     items = [
         UnmatchedCompanyEntryResponse(
             entry_id=entry.id,
-            document_number=entry.document_number,
+            document_number=invoice_number(entry),
             document_type=entry.document_type,
             document_category=entry.document_category,
             reference_number=entry.reference_number,
@@ -391,6 +451,7 @@ async def get_unmatched_company(
             amount=Decimal(str(entry.amount)),
             currency=entry.currency,
             description=entry.description,
+            columns=EntryColumns(**build_entry_columns(entry)),
         )
         for entry in entries
     ]
@@ -416,7 +477,7 @@ async def get_unmatched_company(
 async def get_unmatched_vendor(
     case_id: UUID,
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    page_size: int = Query(20, ge=1, le=1000, description="Items per page"),
     sort_by: str = Query("posting_date", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     document_type_filter: str | None = Query(
@@ -436,11 +497,7 @@ async def get_unmatched_vendor(
     await _verify_case_exists(case_id, session)
 
     base_query = select(LedgerEntryModel).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "vendor",
-            LedgerEntryModel.match_id.is_(None),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "vendor"))
     )
 
     if document_type_filter:
@@ -470,7 +527,7 @@ async def get_unmatched_vendor(
     items = [
         UnmatchedVendorEntryResponse(
             entry_id=entry.id,
-            document_number=entry.document_number,
+            document_number=invoice_number(entry),
             document_type=entry.document_type,
             document_category=entry.document_category,
             reference_number=entry.reference_number,
@@ -478,6 +535,75 @@ async def get_unmatched_vendor(
             amount=Decimal(str(entry.amount)),
             currency=entry.currency,
             description=entry.description,
+            columns=EntryColumns(**build_entry_columns(entry)),
+        )
+        for entry in entries
+    ]
+
+    return UnmatchedVendorResponse(
+        items=items,
+        pagination=_build_pagination(page, page_size, total),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Knocking Off (reversal / AB) entries — informational list
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{case_id}/knocking",
+    response_model=UnmatchedVendorResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get knock-off / reversal (AB) entries for review",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def get_knocking_entries(
+    case_id: UUID,
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=1000, description="Items per page"),
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> UnmatchedVendorResponse:
+    """
+    GET /api/v1/vlr/reconciliation/{case_id}/knocking
+
+    Returns all knock-off / reversal entries (SAP doc type "AB" or category
+    "Knocking Off") from BOTH sides, so users can inspect them and verify the
+    residue nets to zero. These are excluded from the unmatched difference
+    screens because they offset within a single ledger.
+    """
+    await _verify_case_exists(case_id, session)
+
+    base_query = select(LedgerEntryModel).where(
+        and_(
+            LedgerEntryModel.case_id == str(case_id),
+            or_(
+                func.upper(func.coalesce(LedgerEntryModel.document_type, "")) == "AB",
+                func.lower(func.coalesce(LedgerEntryModel.document_category, "")) == "knocking off",
+            ),
+        )
+    ).order_by(LedgerEntryModel.posting_date.asc())
+
+    count_stmt = select(func.count()).select_from(base_query.subquery())
+    total = (await session.execute(count_stmt)).scalar() or 0
+
+    offset = (page - 1) * page_size
+    result = await session.execute(base_query.offset(offset).limit(page_size))
+    entries = list(result.scalars().all())
+
+    items = [
+        UnmatchedVendorEntryResponse(
+            entry_id=entry.id,
+            document_number=invoice_number(entry),
+            document_type=entry.document_type,
+            document_category=entry.document_category,
+            reference_number=entry.reference_number,
+            posting_date=entry.posting_date,
+            amount=Decimal(str(entry.amount)),
+            currency=entry.currency,
+            description=entry.description,
+            columns=EntryColumns(**build_entry_columns(entry)),
         )
         for entry in entries
     ]
@@ -616,24 +742,16 @@ async def get_differences_summary(
     matched_result = await session.execute(matched_count_stmt)
     total_matched = matched_result.scalar() or 0
 
-    # Count unmatched company entries
+    # Count unmatched company entries (genuine differences only)
     unmatched_company_stmt = select(func.count()).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "company",
-            LedgerEntryModel.match_id.is_(None),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "company"))
     )
     unmatched_company_result = await session.execute(unmatched_company_stmt)
     total_unmatched_company = unmatched_company_result.scalar() or 0
 
-    # Count unmatched vendor entries
+    # Count unmatched vendor entries (genuine differences only)
     unmatched_vendor_stmt = select(func.count()).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "vendor",
-            LedgerEntryModel.match_id.is_(None),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "vendor"))
     )
     unmatched_vendor_result = await session.execute(unmatched_vendor_stmt)
     total_unmatched_vendor = unmatched_vendor_result.scalar() or 0
@@ -660,12 +778,7 @@ async def get_differences_summary(
     unmatched_company_amt_stmt = select(
         func.coalesce(func.sum(LedgerEntryModel.amount), 0)
     ).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "company",
-            LedgerEntryModel.match_id.is_(None),
-            LedgerEntryModel.document_category.notin_(["Opening Balance", "Closing Balance"]),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "company"))
     )
     unmatched_company_amount = Decimal(
         str((await session.execute(unmatched_company_amt_stmt)).scalar() or 0)
@@ -674,12 +787,7 @@ async def get_differences_summary(
     unmatched_vendor_amt_stmt = select(
         func.coalesce(func.sum(LedgerEntryModel.amount), 0)
     ).where(
-        and_(
-            LedgerEntryModel.case_id == str(case_id),
-            LedgerEntryModel.side == "vendor",
-            LedgerEntryModel.match_id.is_(None),
-            LedgerEntryModel.document_category.notin_(["Opening Balance", "Closing Balance"]),
-        )
+        and_(*_genuine_unmatched_conditions(case_id, "vendor"))
     )
     unmatched_vendor_amount = Decimal(
         str((await session.execute(unmatched_vendor_amt_stmt)).scalar() or 0)
@@ -702,6 +810,375 @@ async def get_differences_summary(
         unmatched_company_amount=unmatched_company_amount,
         unmatched_vendor_amount=unmatched_vendor_amount,
         residual_difference=residual_difference,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reconciliation Analytics (Firmway-style summary table)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{case_id}/analytics",
+    response_model=ReconciliationAnalyticsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reconciliation analytics summary (matched/unmatched counts by side)",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def get_reconciliation_analytics(
+    case_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ReconciliationAnalyticsResponse:
+    """
+    GET /api/v1/vlr/reconciliation/{case_id}/analytics
+
+    Returns the Reconciliation Analytics table: per-side counts and percentages
+    for Matched / Unmatched / Recommended Matched / Amount Mismatch, plus header
+    metadata (party, period, status). Drives the summary-first View page.
+    """
+    case = await _verify_case_exists(case_id, session)
+
+    async def _count(side: str, matched: bool | None, passes: list[int] | None = None) -> int:
+        conds = [
+            LedgerEntryModel.case_id == str(case_id),
+            LedgerEntryModel.side == side,
+            # Exclude balance markers and knock-off / reversal entries from all
+            # analytics counts so they never inflate the totals or "unmatched".
+            func.coalesce(LedgerEntryModel.document_category, "").notin_(
+                _NON_DIFFERENCE_CATEGORIES
+            ),
+            func.coalesce(LedgerEntryModel.document_type, "").notin_(
+                _NON_DIFFERENCE_DOC_TYPES
+            ),
+        ]
+        if matched is True:
+            conds.append(LedgerEntryModel.match_id.isnot(None))
+        elif matched is False:
+            conds.append(LedgerEntryModel.match_id.is_(None))
+        if passes is not None:
+            conds.append(LedgerEntryModel.pass_number.in_(passes))
+        stmt = select(func.count()).where(and_(*conds))
+        return int((await session.execute(stmt)).scalar() or 0)
+
+    # Totals per side (all transactional entries)
+    company_total = await _count("company", None)
+    party_total = await _count("vendor", None)
+
+    # Exact/tolerance auto matches (passes 1,2) = "Matched"
+    comp_matched = await _count("company", True, [1, 2, 8])
+    party_matched = await _count("vendor", True, [1, 2, 8])
+    # Recommended (needs-confirmation passes 3,4,5,6)
+    comp_recommended = await _count("company", True, [3, 4, 5, 6])
+    party_recommended = await _count("vendor", True, [3, 4, 5, 6])
+    # Unmatched
+    comp_unmatched = await _count("company", False)
+    party_unmatched = await _count("vendor", False)
+
+    def _pct(n: int, total: int) -> float:
+        return round((n / total) * 100, 0) if total else 0.0
+
+    rows = [
+        AnalyticsRow(
+            particulars="Matched",
+            company_numbers=comp_matched, company_percentage=_pct(comp_matched, company_total),
+            party_numbers=party_matched, party_percentage=_pct(party_matched, party_total),
+            view_key="matched",
+        ),
+        AnalyticsRow(
+            particulars="Unmatched",
+            company_numbers=comp_unmatched, company_percentage=_pct(comp_unmatched, company_total),
+            party_numbers=party_unmatched, party_percentage=_pct(party_unmatched, party_total),
+            view_key="unmatched",
+        ),
+        AnalyticsRow(
+            particulars="Recommended Matched",
+            company_numbers=comp_recommended, company_percentage=_pct(comp_recommended, company_total),
+            party_numbers=party_recommended, party_percentage=_pct(party_recommended, party_total),
+            view_key="recommended",
+        ),
+    ]
+
+    # Party metadata
+    party_code = ""
+    party_name = ""
+    if case.vendor_id:
+        from src.infrastructure.database.models.vlr.vendor_model import VendorModel
+        vres = await session.execute(
+            select(VendorModel).where(VendorModel.id == str(case.vendor_id))
+        )
+        vendor = vres.scalar_one_or_none()
+        if vendor:
+            party_code = vendor.vendor_code or ""
+            party_name = vendor.name or ""
+
+    # Period from parent request
+    period_start = None
+    period_end = None
+    if case.request_id:
+        from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+            ReconciliationRequestModel,
+        )
+        pres = await session.execute(
+            select(ReconciliationRequestModel).where(
+                ReconciliationRequestModel.id == str(case.request_id)
+            )
+        )
+        parent = pres.scalar_one_or_none()
+        if parent:
+            period_start = parent.period_start
+            period_end = parent.period_end
+
+    return ReconciliationAnalyticsResponse(
+        case_id=case_id,
+        party_code=party_code,
+        party_name=party_name,
+        party_type="Vendor",
+        reco_type="Ledger",
+        reco_status=case.status or "",
+        period_start=period_start,
+        period_end=period_end,
+        updated_at=getattr(case, "modified_date", None),
+        rows=rows,
+        total_company_numbers=company_total,
+        total_party_numbers=party_total,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Reconciliation Particulars (reconciliation statement table)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@router.get(
+    "/{case_id}/particulars",
+    response_model=ParticularsSummaryResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Reconciliation statement (Particulars: closing-balance & transaction differences)",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def get_reconciliation_particulars(
+    case_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> ParticularsSummaryResponse:
+    """
+    GET /api/v1/vlr/reconciliation/{case_id}/particulars
+
+    Builds the Firmway-style reconciliation statement:
+      • Closing Balance Difference (company vs party closing balances)
+      • One "<Category> Difference" group per document category that has
+        unmatched entries, with children split by which side did not book
+        the entry ("not booked by Company" / "not booked by Party")
+      • Calculated Balance = sum of all transaction-difference groups, which
+        reconciles the closing-balance gap.
+    """
+    await _verify_case_exists(case_id, session)
+    cid = str(case_id)
+
+    # Reuse the SAME classification logic as the Excel export so the on-screen
+    # statement and the downloaded workbook never disagree.
+    from src.domain.services.vlr.reconciliation_export_service import (
+        CATEGORY_TO_SUMMARY,
+        DEFAULT_SUMMARY,
+        _closing,
+        _closing_count,
+        _company_closing,
+        _num,
+        _special_classification,
+    )
+
+    # Load full ledgers (ORM entries) for both sides.
+    comp_res = await session.execute(
+        select(LedgerEntryModel).where(
+            and_(LedgerEntryModel.case_id == cid, LedgerEntryModel.side == "company")
+        )
+    )
+    company_entries = list(comp_res.scalars().all())
+    party_res = await session.execute(
+        select(LedgerEntryModel).where(
+            and_(LedgerEntryModel.case_id == cid, LedgerEntryModel.side == "vendor")
+        )
+    )
+    vendor_entries = list(party_res.scalars().all())
+
+    groups: list[ParticularsGroup] = []
+
+    # ── Closing Balance Difference (from the actual closing-balance rows) ──
+    # Party amounts are stored with the opposite sign, so the difference is the
+    # SUM of the two sides (mirrors the export service).
+    company_closing = _company_closing(company_entries)
+    party_closing = _closing(vendor_entries)
+    n_company_closing = _closing_count(company_entries)
+    n_party_closing = _closing_count(vendor_entries)
+    closing_diff = company_closing + party_closing
+
+    if n_company_closing or n_party_closing:
+        groups.append(
+            ParticularsGroup(
+                label="Closing Balance Difference",
+                amount=closing_diff,
+                no_of_entries=n_company_closing + n_party_closing,
+                view_key="closing_balance",
+                children=[
+                    ParticularsChild(
+                        label="Closing Balance as per Company",
+                        amount=company_closing,
+                        no_of_entries=n_company_closing,
+                        side="company",
+                        document_category="Closing Balance",
+                        view_key="closing_company",
+                    ),
+                    ParticularsChild(
+                        label="Closing Balance as per Party",
+                        amount=party_closing,
+                        no_of_entries=n_party_closing,
+                        side="vendor",
+                        document_category="Closing Balance",
+                        view_key="closing_party",
+                    ),
+                ],
+            )
+        )
+
+    # ── Difference buckets (unmatched, excluding balances & knock-offs) ──
+    # An entry is a genuine cross-ledger difference only when it is unmatched
+    # AND is not an entry-intrinsic class (Opening/Closing Balance, Reversal).
+    def _bucket(entries, side: str):
+        """Returns {(group, label): [amount, count]} for one side."""
+        out: dict[tuple[str, str], list] = {}
+        for e in entries:
+            if getattr(e, "match_id", None):
+                continue
+            cat = (getattr(e, "document_category", "") or "").strip()
+            if cat in ("Opening Balance", "Closing Balance"):
+                continue
+            special = _special_classification(e)
+            if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
+                continue
+            info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
+            label = info["company_missing"] if side == "company" else info["party_missing"]
+            grp = info["group"]
+            agg = out.setdefault((grp, label), [Decimal("0"), 0])
+            agg[0] += Decimal(str(_num(getattr(e, "amount", 0))))
+            agg[1] += 1
+        return out
+
+    comp_buckets = _bucket(company_entries, "company")
+    party_buckets = _bucket(vendor_entries, "party")
+
+    # Reference display order for the difference groups.
+    group_order = [
+        "Invoice Difference",
+        "Debit Note / Credit Note Difference",
+        "Payment / receipt Difference",
+        "Other Differences",
+    ]
+    lines_by_group: dict[str, list[ParticularsChild]] = {}
+    for (grp, label), (amt, cnt) in {**comp_buckets, **party_buckets}.items():
+        side = "company" if "by Company" in label else "vendor"
+        lines_by_group.setdefault(grp, []).append(
+            ParticularsChild(
+                label=label,
+                amount=amt,
+                no_of_entries=cnt,
+                side=side,
+                document_category="",
+                view_key="unmatched",
+            )
+        )
+
+    calculated_balance = Decimal("0")
+    ordered = group_order + [g for g in lines_by_group if g not in group_order]
+    for grp in ordered:
+        children = lines_by_group.get(grp)
+        if not children:
+            continue
+        grp_amount = sum((c.amount for c in children), Decimal("0"))
+        grp_count = sum((c.no_of_entries for c in children), 0)
+        groups.append(
+            ParticularsGroup(
+                label=grp,
+                amount=grp_amount,
+                no_of_entries=grp_count,
+                view_key="unmatched",
+                children=children,
+            )
+        )
+        calculated_balance += grp_amount
+
+    # ── Knocking Off section (informational) ──
+    # Reversal / knock-off entries (SAP doc type "AB" / category "Knocking Off")
+    # net within the company ledger. They aren't a cross-ledger difference, but
+    # users want to inspect them and confirm the residue is zero. Shown as its
+    # own group with a "Knocking Residue" total; it does NOT feed the Calculated
+    # Balance because a fully-paired knock-off nets to zero.
+    def _is_knockoff(e) -> bool:
+        cat = (getattr(e, "document_category", "") or "").strip().lower()
+        dtype = (getattr(e, "document_type", "") or "").strip().upper()
+        return cat == "knocking off" or dtype == "AB" or _special_classification(e) == "Reversal Entries"
+
+    knock_company = [e for e in company_entries if _is_knockoff(e)]
+    knock_party = [e for e in vendor_entries if _is_knockoff(e)]
+
+    if knock_company or knock_party:
+        knock_company_amt = sum(
+            (Decimal(str(_num(getattr(e, "amount", 0)))) for e in knock_company), Decimal("0")
+        )
+        knock_party_amt = sum(
+            (Decimal(str(_num(getattr(e, "amount", 0)))) for e in knock_party), Decimal("0")
+        )
+        knock_children: list[ParticularsChild] = []
+        if knock_company:
+            knock_children.append(
+                ParticularsChild(
+                    label="Knocking Off as per Company",
+                    amount=knock_company_amt,
+                    no_of_entries=len(knock_company),
+                    side="company",
+                    document_category="Knocking Off",
+                    view_key="knocking",
+                )
+            )
+        if knock_party:
+            knock_children.append(
+                ParticularsChild(
+                    label="Knocking Off as per Party",
+                    amount=knock_party_amt,
+                    no_of_entries=len(knock_party),
+                    side="vendor",
+                    document_category="Knocking Off",
+                    view_key="knocking",
+                )
+            )
+        # Residue: sum of all knock-off amounts. Should be 0 when fully paired.
+        knock_residue = knock_company_amt + knock_party_amt
+        knock_children.append(
+            ParticularsChild(
+                label="Knocking Residue",
+                amount=knock_residue,
+                no_of_entries=len(knock_company) + len(knock_party),
+                side="",
+                document_category="Knocking Off",
+                view_key="knocking",
+            )
+        )
+        groups.append(
+            ParticularsGroup(
+                label="Knocking Off",
+                amount=knock_residue,
+                no_of_entries=len(knock_company) + len(knock_party),
+                view_key="knocking",
+                children=knock_children,
+            )
+        )
+
+    return ParticularsSummaryResponse(
+        case_id=case_id,
+        closing_balance_company=company_closing,
+        closing_balance_party=party_closing,
+        groups=groups,
+        calculated_balance=calculated_balance,
     )
 
 
@@ -1109,3 +1586,4 @@ async def manual_unlink(
     await session.commit()
 
     return {"success": True, "message": "Match unlinked. Entries returned to unmatched pool."}
+

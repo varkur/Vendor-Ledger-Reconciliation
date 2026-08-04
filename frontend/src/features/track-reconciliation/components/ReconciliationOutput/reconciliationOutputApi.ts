@@ -25,6 +25,74 @@ export type MatchType =
 /** Confirmation action type. */
 export type ConfirmAction = 'accept' | 'reject' | 'clarify';
 
+/**
+ * Full ledger-entry column set (mirrors the Excel export). Returned by the
+ * backend under `columns` (unmatched) or `company_columns`/`party_columns`
+ * (matched). Keys are snake_case as sent by the API.
+ */
+export interface EntryColumns {
+  statement_type: string;
+  invoice_date: string;
+  invoice_number: string;
+  doctype: string;
+  original_doctype: string;
+  narration: string;
+  amount: number;
+  daybook_name: string;
+  clearing_document_number: string;
+  clearing_date: string;
+  tds_amount: string;
+  posting_date: string;
+  company_code: string;
+  supplier: string;
+  document_number: string;
+  business_area: string;
+  assignment: string;
+  document_header_text: string;
+  tax_code: string;
+  year_month: string;
+  reference: string;
+  profit_center: string;
+  amount_in_doc_curr: number;
+  document_currency: string;
+  local_currency: string;
+  entry_date: string;
+  withhldg_tax_base_amount: string;
+  payment_date: string;
+}
+
+/** Ordered column definitions for rendering the full ledger tables. */
+export const LEDGER_COLUMN_DEFS: { field: keyof EntryColumns; header: string }[] = [
+  { field: 'statement_type', header: 'Statement Type' },
+  { field: 'invoice_date', header: 'Invoice Date' },
+  { field: 'invoice_number', header: 'Invoice Number' },
+  { field: 'doctype', header: 'DocType' },
+  { field: 'original_doctype', header: 'Original DocType' },
+  { field: 'narration', header: 'Narration' },
+  { field: 'amount', header: 'Amount' },
+  { field: 'daybook_name', header: 'Daybook Name' },
+  { field: 'clearing_document_number', header: 'Clearing Document Number' },
+  { field: 'clearing_date', header: 'Clearing Date' },
+  { field: 'tds_amount', header: 'TDS Amount' },
+  { field: 'posting_date', header: 'Posting Date' },
+  { field: 'company_code', header: 'Company Code' },
+  { field: 'supplier', header: 'Supplier' },
+  { field: 'document_number', header: 'Document Number' },
+  { field: 'business_area', header: 'Business Area' },
+  { field: 'assignment', header: 'Assignment' },
+  { field: 'document_header_text', header: 'Document Header Text' },
+  { field: 'tax_code', header: 'Tax Code' },
+  { field: 'year_month', header: 'Year/Month' },
+  { field: 'reference', header: 'Reference' },
+  { field: 'profit_center', header: 'Profit Center' },
+  { field: 'amount_in_doc_curr', header: 'Amount in Doc. Curr.' },
+  { field: 'document_currency', header: 'Document Currency' },
+  { field: 'local_currency', header: 'Local Currency' },
+  { field: 'entry_date', header: 'Entry Date' },
+  { field: 'withhldg_tax_base_amount', header: 'Withhldg Tax Base Amount' },
+  { field: 'payment_date', header: 'Payment Date' },
+];
+
 /** Unmatched company action type. */
 export type UnmatchedCompanyAction = 'accept' | 'dispute' | 'request';
 
@@ -62,6 +130,9 @@ export interface MatchedItem {
   posting_date: string;
   document_type: string;
   currency: string;
+  matched_rule?: string;
+  company_columns?: EntryColumns;
+  party_columns?: EntryColumns;
 }
 
 /** A single confirmation item entry (Tab 2). */
@@ -88,6 +159,7 @@ export interface UnmatchedCompanyItem {
   posting_date: string;
   description: string;
   currency: string;
+  columns?: EntryColumns;
 }
 
 /** A single unmatched vendor entry (Tab 4). */
@@ -99,6 +171,7 @@ export interface UnmatchedVendorItem {
   date: string;
   description: string;
   currency: string;
+  columns?: EntryColumns;
 }
 
 /** Balance comparison entry for differences summary (Tab 5). */
@@ -196,6 +269,9 @@ export async function getMatchedItems(
     posting_date: it.posting_date ?? '',
     document_type: it.document_type ?? '',
     currency: it.currency ?? 'INR',
+    matched_rule: it.matched_rule ?? '',
+    company_columns: it.company_columns ?? undefined,
+    party_columns: it.party_columns ?? undefined,
   }));
   return normalizePagination(response.data, items);
 }
@@ -241,6 +317,7 @@ export async function getUnmatchedCompany(
     document_type: it.document_category ?? it.document_type ?? '',
     currency: it.currency ?? 'INR',
     description: it.description ?? '',
+    columns: it.columns ?? undefined,
   })) as any;
   return normalizePagination(response.data, items);
 }
@@ -262,6 +339,7 @@ export async function getUnmatchedVendor(
     document_type: it.document_category ?? it.document_type ?? '',
     currency: it.currency ?? 'INR',
     description: it.description ?? '',
+    columns: it.columns ?? undefined,
   })) as any;
   return normalizePagination(response.data, items);
 }

@@ -19,7 +19,7 @@ import { Button } from 'primereact/button';
 import { Toast } from 'primereact/toast';
 import { useQueryClient } from '@tanstack/react-query';
 import { useMatchedItems } from './useReconciliationOutput';
-import { manualUnlink } from './reconciliationOutputApi';
+import { manualUnlink, LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
 import type { ListParams, MatchedItem, MatchType } from './reconciliationOutputApi';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,18 +228,36 @@ export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabPro
           sortField={params.sort_by}
           sortOrder={params.sort_order === 'asc' ? 1 : -1}
           lazy
+          scrollable
           rowsPerPageOptions={[10, 25, 50]}
           emptyMessage="No matched items found."
           aria-label="Matched items table"
         >
-          <Column field="company_reference" header="Company Ref" sortable style={{ width: '14%' }} />
-          <Column field="vendor_reference" header="Vendor Ref" sortable style={{ width: '14%' }} />
-          <Column field="company_amount" header="Company Amount" sortable body={amountTemplate('company_amount')} style={{ width: '13%', textAlign: 'right' }} />
-          <Column field="vendor_amount" header="Vendor Amount" sortable body={amountTemplate('vendor_amount')} style={{ width: '13%', textAlign: 'right' }} />
-          <Column field="match_type" header="Match Type" sortable body={matchTypeTemplate} style={{ width: '12%' }} />
-          <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ width: '10%', textAlign: 'center' }} />
-          <Column field="posting_date" header="Posting Date" sortable style={{ width: '12%' }} />
-          <Column field="document_type" header="Doc Type" sortable style={{ width: '10%' }} />
+          <Column field="match_type" header="Match Type" sortable body={matchTypeTemplate} style={{ minWidth: '9rem' }} />
+          <Column field="matched_rule" header="Matched Rule" style={{ minWidth: '10rem' }} body={(row: MatchedItem) => row.matched_rule || '—'} />
+          <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ minWidth: '8rem', textAlign: 'center' }} />
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={`co_${c.field}`}
+              header={`Company ${c.header}`}
+              body={(row: MatchedItem) => {
+                const v = row.company_columns ? (row.company_columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={`pa_${c.field}`}
+              header={`Party ${c.header}`}
+              body={(row: MatchedItem) => {
+                const v = row.party_columns ? (row.party_columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
           {editable && (
             <Column
               header="Action"
