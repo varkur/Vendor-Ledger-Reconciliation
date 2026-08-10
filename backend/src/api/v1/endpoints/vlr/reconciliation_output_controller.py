@@ -49,6 +49,7 @@ from src.api.v1.schemas.vlr.reconciliation_output_schemas import (
 )
 from src.domain.entities.user import User
 from src.domain.services.vlr.entry_columns import build_entry_columns, invoice_number
+from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
 from src.infrastructure.database.models.vlr.match_result_model import MatchResultModel
 from src.infrastructure.database.models.vlr.reconciliation_case_model import (
@@ -98,12 +99,38 @@ async def _verify_case_exists(
 
 
 # Document categories that are NOT genuine cross-ledger differences: balance
-# markers and knock-off / reversal (SAP "AB") entries. These net within a
-# single ledger and are excluded from the "unmatched" definition everywhere so
-# the unmatched list, the analytics count, and the reconciliation statement all
-# agree. Kept in sync with reconciliation_export_service._special_classification.
-_NON_DIFFERENCE_CATEGORIES = ["Opening Balance", "Closing Balance", "Knocking Off"]
-_NON_DIFFERENCE_DOC_TYPES = ["AB"]
+# markers, knock-off / reversal (SAP "AB") entries, and "Other entry"
+# (SA / Adjusted) rows. Knock-off and SA entries each net ONLY within their
+# own side (per the Vendor Ledger Mapping Rules doc) — they are excluded from
+# the "unmatched" definition everywhere so the unmatched list, the analytics
+# count, and the reconciliation statement all agree. Kept in sync with
+# reconciliation_export_service._special_classification.
+_NON_DIFFERENCE_CATEGORIES = ["Opening Balance", "Closing Balance", "Knocking Off", "Adjusted"]
+_NON_DIFFERENCE_DOC_TYPES = ["AB", "SA"]
+
+# Pass-number groups for "auto-accepted" vs "needs finance confirmation",
+# mirroring the engine's is_auto_accepted logic in
+# ReconciliationEngineService._persist_results. AMOUNT_DATE (1.5) and
+# TDS_GST (2.5) are high-confidence sub-passes that auto-accept alongside
+# EXACT/TOLERANCE; TOLERANCE_DATE (6.5) is the weakest tier and always needs
+# review alongside FUZZY_REFERENCE/ONE_TO_MANY/MANY_TO_ONE/DATE_PROXIMITY.
+# Same-side netting passes (9=Knocking Off, 13=Other entry/SA) are their own
+# entry-intrinsic category — excluded from BOTH lists via
+# _NON_DIFFERENCE_CATEGORIES/_NON_DIFFERENCE_DOC_TYPES above rather than
+# counted as "Matched", so they don't inflate the Matched-rate KPI.
+# Defined once here so every "Matched" / "Recommended" count across the
+# dashboard, analytics, and tab endpoints stays in sync — previously these
+# were hardcoded as raw [1, 2] / [3, 4, 5, 6] lists that silently excluded
+# any entry matched by a newly added pass number.
+_AUTO_ACCEPTED_PASSES = [
+    MatchPassType.EXACT, MatchPassType.TOLERANCE,
+    MatchPassType.AMOUNT_DATE, MatchPassType.TDS_GST,
+]
+_NEEDS_CONFIRMATION_PASSES = [
+    MatchPassType.FUZZY_REFERENCE, MatchPassType.ONE_TO_MANY,
+    MatchPassType.MANY_TO_ONE, MatchPassType.DATE_PROXIMITY,
+    MatchPassType.TOLERANCE_DATE,
+]
 
 
 def _genuine_unmatched_conditions(case_id: UUID, side: str) -> list:
@@ -200,12 +227,12 @@ async def get_matched_items(
     """
     await _verify_case_exists(case_id, session)
 
-    # Build base query: confirmed matches (Pass 1 & 2) OR all confirmed
+    # Build base query: confirmed / auto-accepted matches
     base_query = select(MatchResultModel).where(
         and_(
             MatchResultModel.case_id == str(case_id),
             MatchResultModel.is_confirmed == True,  # noqa: E712
-            MatchResultModel.pass_number.in_([1, 2]),
+            MatchResultModel.pass_number.in_(_AUTO_ACCEPTED_PASSES),
         )
     )
 
@@ -318,7 +345,7 @@ async def get_confirmation_items(
         and_(
             MatchResultModel.case_id == str(case_id),
             MatchResultModel.is_confirmed == False,  # noqa: E712
-            MatchResultModel.pass_number.in_([3, 4, 5, 6]),
+            MatchResultModel.pass_number.in_(_NEEDS_CONFIRMATION_PASSES),
         )
     )
 
@@ -731,12 +758,12 @@ async def get_differences_summary(
             )
         )
 
-    # Count matched entries (confirmed, pass 1 & 2)
+    # Count matched entries (confirmed / auto-accepted)
     matched_count_stmt = select(func.count()).where(
         and_(
             MatchResultModel.case_id == str(case_id),
             MatchResultModel.is_confirmed == True,  # noqa: E712
-            MatchResultModel.pass_number.in_([1, 2]),
+            MatchResultModel.pass_number.in_(_AUTO_ACCEPTED_PASSES),
         )
     )
     matched_result = await session.execute(matched_count_stmt)
@@ -761,7 +788,7 @@ async def get_differences_summary(
         and_(
             MatchResultModel.case_id == str(case_id),
             MatchResultModel.is_confirmed == False,  # noqa: E712
-            MatchResultModel.pass_number.in_([3, 4, 5, 6]),
+            MatchResultModel.pass_number.in_(_NEEDS_CONFIRMATION_PASSES),
         )
     )
     pending_result = await session.execute(pending_stmt)
@@ -865,12 +892,12 @@ async def get_reconciliation_analytics(
     company_total = await _count("company", None)
     party_total = await _count("vendor", None)
 
-    # Exact/tolerance auto matches (passes 1,2) = "Matched"
-    comp_matched = await _count("company", True, [1, 2, 8])
-    party_matched = await _count("vendor", True, [1, 2, 8])
-    # Recommended (needs-confirmation passes 3,4,5,6)
-    comp_recommended = await _count("company", True, [3, 4, 5, 6])
-    party_recommended = await _count("vendor", True, [3, 4, 5, 6])
+    # Auto-accepted matches (Exact/Tolerance/Amount+Date/TDS-GST + manual) = "Matched"
+    comp_matched = await _count("company", True, _AUTO_ACCEPTED_PASSES + [8])
+    party_matched = await _count("vendor", True, _AUTO_ACCEPTED_PASSES + [8])
+    # Recommended (needs-confirmation passes)
+    comp_recommended = await _count("company", True, _NEEDS_CONFIRMATION_PASSES)
+    party_recommended = await _count("vendor", True, _NEEDS_CONFIRMATION_PASSES)
     # Unmatched
     comp_unmatched = await _count("company", False)
     party_unmatched = await _count("vendor", False)
@@ -1057,7 +1084,9 @@ async def get_reconciliation_particulars(
             if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                 continue
             info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
-            label = info["company_missing"] if side == "company" else info["party_missing"]
+            # An entry open on the company side is missing on the party side,
+            # and vice versa (see Emcure mapping rules doc + export service).
+            label = info["party_missing"] if side == "company" else info["company_missing"]
             grp = info["group"]
             agg = out.setdefault((grp, label), [Decimal("0"), 0])
             agg[0] += Decimal(str(_num(getattr(e, "amount", 0))))

@@ -20,6 +20,7 @@ from src.api.v1.schemas.vlr.dashboard_schemas import (
     RecentConfirmationItem,
     RecentConfirmationsResponse,
 )
+from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
 from src.infrastructure.database.models.vlr.match_result_model import MatchResultModel
 from src.infrastructure.database.models.vlr.portal_sign_off_model import PortalSignOffModel
@@ -177,10 +178,16 @@ async def get_dashboard_widgets(
 
     auto_match_rate: float | None = None
     if total_entries > 0:
+        # Auto-accepted passes: Exact/Tolerance (1,2) plus the high-confidence
+        # sub-passes Amount+Date (1.5) and TDS/GST (2.5) — see
+        # ReconciliationEngineService._persist_results.is_auto_accepted.
         auto_matched_stmt = select(func.count(LedgerEntryModel.id)).where(
             and_(
                 LedgerEntryModel.match_id.isnot(None),
-                LedgerEntryModel.pass_number.in_([1, 2]),
+                LedgerEntryModel.pass_number.in_([
+                    MatchPassType.EXACT, MatchPassType.TOLERANCE,
+                    MatchPassType.AMOUNT_DATE, MatchPassType.TDS_GST,
+                ]),
             )
         )
         if company_code:

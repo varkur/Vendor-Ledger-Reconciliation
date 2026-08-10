@@ -45,6 +45,13 @@ class MatchPassType(IntEnum):
     MANY_TO_ONE = 5
     DATE_PROXIMITY = 6
     UNMATCHED = 7
+    # Sub-passes kept outside the 1-7 BRD numbering but given their own
+    # identity (previously these mis-reported themselves as EXACT/TOLERANCE,
+    # which hid from users that the invoice/reference number was never
+    # compared — see AMOUNT_DATE below).
+    AMOUNT_DATE = 10
+    TDS_GST = 11
+    TOLERANCE_DATE = 12
 
 
 # BRD Section 5.6.10 - Matching Priority Rules confidence scores (normalized to 0.0-1.0)
@@ -55,6 +62,10 @@ class MatchPassType(IntEnum):
 # Pass 5 (Many-to-One): 75 → 0.75, Auto-Accept = No
 # Pass 6 (Date-proximity): 70 → 0.70, Auto-Accept = No
 # Pass 7 (Unmatched): 0 → 0.0
+# AMOUNT_DATE (1.5): 90 → 0.90, Auto-Accept = Yes (amount exact, no ref check)
+# TDS_GST (2.5): 85 → 0.85, Auto-Accept = Yes (ref similarity gate applied)
+# TOLERANCE_DATE (6.5): 70 → 0.70, Auto-Accept = No (neither ref nor exact
+#                        amount matched — weakest tier, always needs review)
 CONFIDENCE_SCORES: dict[int, float] = {
     MatchPassType.EXACT: 1.0,
     MatchPassType.TOLERANCE: 0.85,
@@ -63,6 +74,9 @@ CONFIDENCE_SCORES: dict[int, float] = {
     MatchPassType.MANY_TO_ONE: 0.75,
     MatchPassType.DATE_PROXIMITY: 0.70,
     MatchPassType.UNMATCHED: 0.0,
+    MatchPassType.AMOUNT_DATE: 0.90,
+    MatchPassType.TDS_GST: 0.85,
+    MatchPassType.TOLERANCE_DATE: 0.70,
 }
 
 
@@ -77,16 +91,206 @@ class LedgerEntryData:
     document_number: str = ""
     side: str = ""
     document_type: str = ""
+    assignment_number: str = ""
+    category: str = ""
+
+
+# ── Document-category matching rules (Vendor Ledger Mapping Rules doc) ────
+# Cross-side matching must respect the economic nature of each entry: an
+# invoice may only reconcile against an invoice, a debit note only against a
+# credit note, etc. Matching purely on amount/date produced false matches
+# such as an invoice knocking off against a vendor receipt, or a debit note
+# against an unrelated knock-off entry.
+
+# Categories that are entry-intrinsic and must NEVER cross-match with the
+# other side. Opening/closing balances are summary rows; knock-off (AB) and
+# "Other entry" (SA/Adjusted) rows are each side's own internal entries and,
+# per the mapping doc, only net against entries of the SAME category on the
+# SAME side ("Knocking entries... should be only map with their internal
+# entries"; "Other entry... therefore that only map with each other in both
+# side").
+NON_MATCHABLE_CATEGORIES: frozenset[str] = frozenset(
+    {"Opening Balance", "Closing Balance", "Knocking Off"}
+)
+
+# Explicit compatibility groups per the mapping doc:
+#   Invoice -> Invoice only
+#   Debit Note -> Credit Note only (and vice versa)
+#   Payment -> Receipt only (and vice versa)
+#   TDS Adjusted -> TDS Adjusted only
+# A category not listed here is a wildcard (matches anything) so we never
+# block a match we're unsure about — we only block pairings we KNOW are
+# economically incompatible.
+CATEGORY_COMPATIBILITY: dict[str, frozenset[str]] = {
+    "Invoice": frozenset({"Invoice"}),
+    "Debit Note": frozenset({"Debit Note", "Credit Note"}),
+    "Credit Note": frozenset({"Credit Note", "Debit Note"}),
+    "Payment": frozenset({"Payment", "Receipt"}),
+    "Receipt": frozenset({"Receipt", "Payment"}),
+    "TDS Adjusted": frozenset({"TDS Adjusted"}),
+}
+
+# "Adjusted" (SA / Other entry) is explicitly excluded from the wildcard set:
+# the mapping doc says SA entries only net with each other, never with real
+# invoices/payments. Unknown/uncategorized entries stay wildcard until the
+# user maps them via the Map Document Type screen.
+#
+# "Other" is included here because the data-transformation pipeline
+# (DataTransformationService.classify_document_type) runs BEFORE
+# reconciliation and writes a much narrower hardcoded category set
+# (RE/KR/DR->Invoice, ZP/KZ/ZV->Payment, KG->Credit Note, RV->Debit Note) —
+# any doc type outside that small set (e.g. MA, MI, most vendor Tally codes)
+# gets persisted as document_category="Other" on the entry BEFORE this
+# engine ever runs its own _derive_category fallback (_to_entry_data_list
+# always prefers a category already saved on the entry). Treating "Other" as
+# a real, mutually-exclusive category here caused a severe false-negative
+# regression: an Invoice-categorized entry could never match an
+# "Other"-categorized entry even though they were the same real invoice,
+# collapsing match counts from ~340 to ~18 on a real case. "Other" must be
+# wildcard, not a known category, until the user explicitly maps it via the
+# Map Document Type screen.
+WILDCARD_CATEGORIES: frozenset[str] = frozenset({"Journal", "Unknown", "Other", ""})
+
+
+def _derive_category(document_type: str) -> str:
+    """
+    Derive a standard document category from a raw document type code.
+
+    Tries the configurable SAP doc-type map first, then falls back to
+    keyword heuristics on the raw text (handles Tally-style / descriptive
+    doc types that aren't literal SAP codes).
+    """
+    from src.domain.services.vlr.doc_type_mapping import classify_document_type
+
+    dt = (document_type or "").strip()
+    if not dt:
+        return ""
+    category = classify_document_type(dt)
+    if category != "Unknown":
+        return category
+    lowered = dt.lower()
+    if "open" in lowered:
+        return "Opening Balance"
+    if "clos" in lowered:
+        return "Closing Balance"
+    if "debit" in lowered:
+        return "Debit Note"
+    if "credit" in lowered:
+        return "Credit Note"
+    if "sale" in lowered or "invoice" in lowered:
+        return "Invoice"
+    if "receipt" in lowered:
+        return "Receipt"
+    if "payment" in lowered:
+        return "Payment"
+    if "journal" in lowered:
+        return "Journal"
+    if "knock" in lowered or "revers" in lowered:
+        return "Knocking Off"
+    if "tds" in lowered:
+        return "TDS Adjusted"
+    # Unrecognized raw codes (e.g. Tally-style "RV"/"DZ" on the vendor side
+    # that have no SAP-doc-type equivalent) must be treated as a wildcard, NOT
+    # as a literal category. Returning the raw code here would make it a
+    # "known" category that fails compatibility checks against every side,
+    # blocking ALL matches until the user maps it via the Map Document Type
+    # screen.
+    return "Unknown"
+
+
+def _is_matchable(entry: "LedgerEntryData") -> bool:
+    """True when an entry may participate in cross-side matching."""
+    return entry.category not in NON_MATCHABLE_CATEGORIES and entry.category != "Adjusted"
+
+
+def _categories_compatible(cat_a: str, cat_b: str) -> bool:
+    """
+    True when two document categories may reconcile against each other.
+
+    - Non-matchable / self-only categories (balances, knock-offs, "Adjusted"
+      other-entries) never cross-match.
+    - Wildcard categories (journal/unknown) match anything else.
+    - Otherwise both sides must appear in each other's compatibility set.
+    """
+    if cat_a in NON_MATCHABLE_CATEGORIES or cat_b in NON_MATCHABLE_CATEGORIES:
+        return False
+    if cat_a == "Adjusted" or cat_b == "Adjusted":
+        return False
+    if cat_a in WILDCARD_CATEGORIES or cat_b in WILDCARD_CATEGORIES:
+        return True
+    allowed_a = CATEGORY_COMPATIBILITY.get(cat_a)
+    allowed_b = CATEGORY_COMPATIBILITY.get(cat_b)
+    if allowed_a is None and allowed_b is None:
+        return True
+    if allowed_a is not None and cat_b not in allowed_a:
+        return False
+    if allowed_b is not None and cat_a not in allowed_b:
+        return False
+    return True
+
+
+def _is_reversal(entry: "LedgerEntryData") -> bool:
+    """True when an entry is a knock-off / reversal entry (nets within a side)."""
+    if entry.category == "Knocking Off":
+        return True
+    return (entry.document_type or "").strip().upper() == "AB"
+
+
+def _is_other_entry(entry: "LedgerEntryData") -> bool:
+    """True when an entry is an "Other entry" (SA) that only nets within its own side."""
+    if entry.category == "Adjusted":
+        return True
+    return (entry.document_type or "").strip().upper() == "SA"
+
+
+def _date_diff_within_window(
+    c_category: str, c_date: object, v_date: object, window_days: int
+) -> int | None:
+    """
+    Compute the date gap between a company and vendor entry, respecting the
+    directional window the mapping doc specifies for Payments.
+
+    Per doc: "map with date range mapping, from the date of payment made
+    from Emcure to after 15 days of receipt amount of vendor" — i.e. for
+    Payment entries, the vendor's receipt date must fall ON OR AFTER the
+    company's payment date, within ``window_days`` days FORWARD only (not a
+    symmetric ± window). All other categories keep the previous symmetric
+    ±window_days behaviour since the doc doesn't specify directionality for
+    them.
+
+    Returns the (non-negative) day gap if within the allowed window, else
+    None.
+    """
+    if c_date is None or v_date is None:
+        return 0
+    try:
+        if c_category == "Payment":
+            delta = (v_date - c_date).days
+            if 0 <= delta <= window_days:
+                return delta
+            return None
+        date_diff = abs((c_date - v_date).days)
+        return date_diff if date_diff <= window_days else None
+    except (TypeError, AttributeError):
+        return 0
 
 
 # Pass number for the company-side reversal (knock-off) pass. Kept outside the
 # 1–7 MatchPassType range so it doesn't disturb the standard pass statistics.
 REVERSAL_PASS = 9
+# Pass number for "Other entry" (SA) same-side netting.
+OTHER_ENTRY_PASS = 13
 
 
 @dataclass
 class MatchPair:
-    """A matched pair of entries (1:1 match)."""
+    """A matched pair of entries (1:1 match).
+
+    For same-side netting pairs (reversal/knock-off, "Other entry" SA) both
+    entries live on the same ledger side; ``reversal_side`` records which
+    side ("company" or "vendor") so persistence can attribute both IDs to
+    the correct side.
+    """
 
     company_entry_id: UUID
     vendor_entry_id: UUID
@@ -94,6 +298,7 @@ class MatchPair:
     pass_number: int
     matched_amount: Decimal
     difference_amount: Decimal = Decimal("0")
+    reversal_side: str = "company"
 
 
 @dataclass
@@ -216,14 +421,38 @@ class ReconciliationEngineService:
         result.statistics.total_company_entries = len(company_entries)
         result.statistics.total_vendor_entries = len(vendor_entries)
 
-        # ─── Pass 0: Company-side Reversal (knock-off) ───────────────────
-        # Net offsetting AB reversal entries within the company ledger before
-        # any cross-side matching, so they don't surface as differences.
-        reversal_pairs = self._reversal_match(company_entries)
-        for pair in reversal_pairs:
-            # Both entries are company-side for reversals.
+        # ─── Pass 0: Reversal (knock-off) knock-out on BOTH sides ────────
+        # Net offsetting reversal/knock-off entries within EACH ledger before
+        # any cross-side matching, so they don't surface as differences or
+        # get falsely matched against real invoices on the opposite side.
+        # (Previously this only ran on the company side — vendor-side AB
+        # entries fell straight into the general matching pool.)
+        company_reversal_pairs = self._reversal_match(company_entries, side="company")
+        for pair in company_reversal_pairs:
             matched_company_ids.add(pair.company_entry_id)
             matched_company_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
+        vendor_reversal_pairs = self._reversal_match(vendor_entries, side="vendor")
+        for pair in vendor_reversal_pairs:
+            matched_vendor_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
+        # ─── Pass 0.5: "Other entry" (SA) knock-out on BOTH sides ────────
+        # Per mapping doc: SA entries are internal to each side and only net
+        # against other SA entries on the SAME side, never against real
+        # invoices/payments on the other side.
+        company_other_pairs = self._other_entry_match(company_entries, side="company")
+        for pair in company_other_pairs:
+            matched_company_ids.add(pair.company_entry_id)
+            matched_company_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
+        vendor_other_pairs = self._other_entry_match(vendor_entries, side="vendor")
+        for pair in vendor_other_pairs:
+            matched_vendor_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
 
         # ─── Pass 1: Exact Match ─────────────────────────────────────────
@@ -239,24 +468,15 @@ class ReconciliationEngineService:
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
 
-        # ─── Pass 1.5: Amount + Date Match (ignoring doc number) ──────────
-        # Most common scenario: company SAP doc numbers don't match vendor invoice numbers
-        # but amounts are exactly equal and dates are close
-        available_company = [
-            e for e in company_entries if e.id not in matched_company_ids
-        ]
-        available_vendor = [
-            e for e in vendor_entries if e.id not in matched_vendor_ids
-        ]
-        amount_date_pairs = self._amount_date_match(
-            available_company, available_vendor, date_tolerance_days
-        )
-        for pair in amount_date_pairs:
-            matched_company_ids.add(pair.company_entry_id)
-            matched_vendor_ids.add(pair.vendor_entry_id)
-            result.match_pairs.append(pair)
-
-        # ─── Pass 2: Tolerance Match ─────────────────────────────────────
+        # ─── Pass 2: Tolerance Match (reference exact, amount within %) ───
+        # Reference/invoice-number-aware passes (2, 3, 2.5) run BEFORE the
+        # blind Amount+Date pass (1.5). Amount+Date never inspects the
+        # invoice number, so if it ran first it could pair two DIFFERENT
+        # invoices that merely share an amount and a nearby date (e.g. two
+        # recurring monthly charges of the same value), stealing an entry
+        # that a reference-aware pass would have paired correctly. Running
+        # the reference-aware passes first ensures a genuine invoice-number
+        # match always wins over a coincidental amount/date match.
         available_company = [
             e for e in company_entries if e.id not in matched_company_ids
         ]
@@ -271,9 +491,27 @@ class ReconciliationEngineService:
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
 
+        # ─── Pass 3: Fuzzy Reference Match (reference similar > threshold) ─
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        fuzzy_pairs = self._fuzzy_reference_match(
+            available_company, available_vendor, fuzzy_threshold
+        )
+        for pair in fuzzy_pairs:
+            matched_company_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
+
         # ─── Pass 2.5: TDS/GST Tolerance Match ─────────────────────────────
         # Match entries where the difference equals TDS% or GST% of the amount
         # (e.g., company booked ₹100 but vendor shows ₹90 because 10% TDS was deducted)
+        # Still reference-aware (requires similarity >= 0.5), so it belongs
+        # ahead of the blind Amount+Date pass too.
+        tds_gst_pairs: list[MatchPair] = []
         if tds_percentage > 0 or gst_percentage > 0:
             available_company = [
                 e for e in company_entries if e.id not in matched_company_ids
@@ -289,20 +527,45 @@ class ReconciliationEngineService:
                 matched_vendor_ids.add(pair.vendor_entry_id)
                 result.match_pairs.append(pair)
 
-        # ─── Pass 3: Fuzzy Reference Match ────────────────────────────────
+        # ─── Pass 1.5: Amount + Date Match (ignoring doc number) ──────────
+        # Most common scenario: company SAP doc numbers don't match vendor invoice numbers
+        # but amounts are exactly equal and dates are close. Runs LAST among the
+        # 1:1 passes (after every reference-aware pass) so it only claims entries
+        # that truly have no traceable invoice-number correspondence left.
         available_company = [
             e for e in company_entries if e.id not in matched_company_ids
         ]
         available_vendor = [
             e for e in vendor_entries if e.id not in matched_vendor_ids
         ]
-        fuzzy_pairs = self._fuzzy_reference_match(
-            available_company, available_vendor, fuzzy_threshold
+        amount_date_pairs = self._amount_date_match(
+            available_company, available_vendor, date_tolerance_days
         )
-        for pair in fuzzy_pairs:
+        for pair in amount_date_pairs:
             matched_company_ids.add(pair.company_entry_id)
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
+
+        # ─── Pass 3.5: UTR-based Payment Grouping ─────────────────────────
+        # Per mapping doc: combine Emcure's split payment entries sharing the
+        # same UTR before matching against a single vendor entry. Runs before
+        # the generic one-to-many/many-to-one subset-sum so a genuine UTR
+        # grouping always wins over an incidental amount coincidence.
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        utr_groups = self._utr_payment_match(
+            available_company, available_vendor, date_tolerance_days=15
+        )
+        for group in utr_groups:
+            for cid in group.company_entry_ids:
+                matched_company_ids.add(cid)
+            for vid in group.vendor_entry_ids:
+                matched_vendor_ids.add(vid)
+            result.match_groups.append(group)
 
         # ─── Pass 4: One-to-Many ──────────────────────────────────────────
         available_company = [
@@ -357,6 +620,7 @@ class ReconciliationEngineService:
         # Catches invoices that differ by GST rounding or small journal
         # adjustments (e.g. company 208,683 vs vendor 208,860, diff 177).
         # Only applies when tolerance/tds/gst settings allow a difference.
+        tol_date_pairs: list[MatchPair] = []
         if tolerance > 0 or tds_percentage > 0 or gst_percentage > 0:
             available_company = [
                 e for e in company_entries if e.id not in matched_company_ids
@@ -381,10 +645,12 @@ class ReconciliationEngineService:
             e.id for e in vendor_entries if e.id not in matched_vendor_ids
         ]
 
-        # Determine if confirmation is needed (fuzzy/combination/date-proximity matches)
+        # Determine if confirmation is needed (fuzzy/combination/date-proximity/
+        # tolerance-date matches — anything not auto-accepted above).
         result.needs_confirmation = len(fuzzy_pairs) > 0 or (
-            len(one_to_many_groups) > 0 or len(many_to_one_groups) > 0
-            or len(date_proximity_pairs) > 0
+            len(utr_groups) > 0
+            or len(one_to_many_groups) > 0 or len(many_to_one_groups) > 0
+            or len(date_proximity_pairs) > 0 or len(tol_date_pairs) > 0
         )
 
         # Calculate statistics (Requirement 5.12)
@@ -432,30 +698,34 @@ class ReconciliationEngineService:
         net difference. Stores balances + net_difference on the case and
         updates document_category on each ledger entry.
         """
-        from src.domain.services.vlr.doc_type_mapping import classify_document_type
 
         def _classify_entries(entries: list) -> None:
-            """Set document_category on each entry based on its doc type."""
+            """
+            Set document_category on each entry based on its doc type —
+            but ONLY when no category has been set yet.
+
+            The Map Document Type screen writes the user's authoritative
+            category choice directly onto entry.document_category. That must
+            win over this fallback guesser on every subsequent reconciliation
+            re-run; otherwise a saved mapping (e.g. vendor "RV" -> Invoice)
+            gets silently reverted to "Unknown" the moment reconciliation
+            executes, re-poisoning the category gate used by the matching
+            passes. Uses the same derivation logic as the matching engine
+            (_derive_category) so the category shown in the export always
+            matches the category the passes actually gated on.
+            """
             for e in entries:
+                existing = (getattr(e, "document_category", "") or "").strip()
+                if existing:
+                    continue
                 dt = getattr(e, "document_type", None)
                 if dt:
-                    category = classify_document_type(dt)
-                    # If not in the SAP map, use the doc type itself if it's already a category
-                    if category == "Unknown":
-                        # Vendor ledgers often already have category-like doc types
-                        lowered = dt.lower()
-                        if "open" in lowered:
-                            category = "Opening Balance"
-                        elif "clos" in lowered:
-                            category = "Closing Balance"
-                        elif "sale" in lowered or "invoice" in lowered:
-                            category = "Invoice"
-                        elif "payment" in lowered or "receipt" in lowered:
-                            category = "Payment"
-                        elif "journal" in lowered:
-                            category = "Journal"
-                        else:
-                            category = dt
+                    category = _derive_category(dt)
+                    # _derive_category returns "Unknown" for unrecognized raw
+                    # codes (e.g. Tally-style "RV"/"DZ") rather than falling
+                    # back to the literal code — never poison document_category
+                    # with a raw code that would then fail every category
+                    # compatibility check on future re-runs.
                     e.document_category = category
 
         _classify_entries(company_entries_raw)
@@ -535,28 +805,30 @@ class ReconciliationEngineService:
     # ──────────────────────────────────────────────────────────────────────
 
     def _reversal_match(
-        self, company: list[LedgerEntryData]
+        self, entries: list[LedgerEntryData], side: str = "company"
     ) -> list[MatchPair]:
         """
-        Knock off company-side reversal entries against each other.
+        Knock off reversal (knock-off / AB) entries against each other within
+        a SINGLE ledger side.
 
-        A reversal pair is two COMPANY entries with:
-          - document type "AB" (SAP reversal document type), and
+        Per the mapping doc: "Knocking entries are internal entries for both
+        Emcure and vendor — it should be only map with their internal
+        entries." A reversal pair is two entries on the SAME side with:
+          - a reversal/knock-off marker (SAP doc type "AB" or category
+            "Knocking Off"), and
           - equal magnitude, opposite sign (they net to zero).
 
-        These offset within the company ledger itself (e.g. an entry posted and
-        later reversed), so they should be removed from the reconciliation
-        difference rather than reported as unmatched. Each pair is returned as a
-        MatchPair whose two entries are both on the company side.
+        These offset within one ledger (e.g. an entry posted and later
+        reversed), so they should be removed from the reconciliation
+        difference rather than reported as unmatched or — worse — matched
+        against a real invoice on the other side. Each pair is returned as a
+        MatchPair whose two entries are both on the same side; the caller
+        marks both as used on that side only.
         """
         pairs: list[MatchPair] = []
         used: set[UUID] = set()
 
-        # Only AB-type company entries participate.
-        ab_entries = [
-            e for e in company
-            if (e.document_type or "").strip().upper() == "AB"
-        ]
+        ab_entries = [e for e in entries if _is_reversal(e)]
 
         # Bucket by absolute amount so we can find opposite-sign counterparts.
         by_abs: dict[Decimal, list[LedgerEntryData]] = {}
@@ -580,11 +852,60 @@ class ReconciliationEngineService:
                     pairs.append(
                         MatchPair(
                             company_entry_id=d.id,
-                            vendor_entry_id=cr.id,  # both are company-side here
+                            vendor_entry_id=cr.id,  # both on the same side here
                             confidence_score=1.0,
                             pass_number=REVERSAL_PASS,
                             matched_amount=abs_amt,
                             difference_amount=Decimal("0"),
+                            reversal_side=side,
+                        )
+                    )
+                    break
+
+        return pairs
+
+    def _other_entry_match(
+        self, entries: list[LedgerEntryData], side: str = "company"
+    ) -> list[MatchPair]:
+        """
+        Net "Other entry" (SA) rows against each other within a SINGLE side.
+
+        Per the mapping doc: "Other entry like SA from both side, its
+        internal entries of Emcure and vendor therefore that only map with
+        each other in both side." Same netting logic as reversal_match but
+        for category "Adjusted" / doc-type "SA" instead of "AB".
+        """
+        pairs: list[MatchPair] = []
+        used: set[UUID] = set()
+
+        sa_entries = [e for e in entries if _is_other_entry(e)]
+
+        by_abs: dict[Decimal, list[LedgerEntryData]] = {}
+        for e in sa_entries:
+            by_abs.setdefault(abs(e.amount), []).append(e)
+
+        for abs_amt, group in by_abs.items():
+            if abs_amt == 0:
+                continue
+            debits = [e for e in group if e.amount > 0]
+            credits = [e for e in group if e.amount < 0]
+            for d in debits:
+                if d.id in used:
+                    continue
+                for cr in credits:
+                    if cr.id in used:
+                        continue
+                    used.add(d.id)
+                    used.add(cr.id)
+                    pairs.append(
+                        MatchPair(
+                            company_entry_id=d.id,
+                            vendor_entry_id=cr.id,  # both on the same side here
+                            confidence_score=1.0,
+                            pass_number=OTHER_ENTRY_PASS,
+                            matched_amount=abs_amt,
+                            difference_amount=Decimal("0"),
+                            reversal_side=side,
                         )
                     )
                     break
@@ -608,29 +929,37 @@ class ReconciliationEngineService:
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Build a lookup for vendor entries by (amount, date, reference)
+        # Build a lookup for vendor entries by (amount, date, reference).
+        # Only matchable entries participate (excludes balances/knock-offs/SA).
         vendor_lookup: dict[tuple, list[LedgerEntryData]] = {}
         for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
             key = (v_entry.amount, v_entry.posting_date, v_entry.reference_number)
             vendor_lookup.setdefault(key, []).append(v_entry)
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             key = (c_entry.amount, c_entry.posting_date, c_entry.reference_number)
             candidates = vendor_lookup.get(key, [])
             for v_entry in candidates:
-                if v_entry.id not in used_vendor_ids:
-                    pairs.append(
-                        MatchPair(
-                            company_entry_id=c_entry.id,
-                            vendor_entry_id=v_entry.id,
-                            confidence_score=1.0,
-                            pass_number=MatchPassType.EXACT,
-                            matched_amount=c_entry.amount,
-                            difference_amount=Decimal("0"),
-                        )
+                if v_entry.id in used_vendor_ids:
+                    continue
+                if not _categories_compatible(c_entry.category, v_entry.category):
+                    continue
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=v_entry.id,
+                        confidence_score=1.0,
+                        pass_number=MatchPassType.EXACT,
+                        matched_amount=c_entry.amount,
+                        difference_amount=Decimal("0"),
                     )
-                    used_vendor_ids.add(v_entry.id)
-                    break
+                )
+                used_vendor_ids.add(v_entry.id)
+                break
 
         return pairs
 
@@ -659,13 +988,18 @@ class ReconciliationEngineService:
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Build vendor lookup by absolute amount for fast matching
+        # Build vendor lookup by absolute amount for fast matching.
+        # Only matchable entries participate (excludes balances/knock-offs/SA).
         vendor_by_abs_amount: dict[Decimal, list[LedgerEntryData]] = {}
         for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
             abs_amt = abs(v_entry.amount)
             vendor_by_abs_amount.setdefault(abs_amt, []).append(v_entry)
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             abs_c_amount = abs(c_entry.amount)
             candidates = vendor_by_abs_amount.get(abs_c_amount, [])
 
@@ -675,19 +1009,21 @@ class ReconciliationEngineService:
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
                     continue
+                # Gate on document-category compatibility so an invoice never
+                # matches a payment/receipt of the same magnitude.
+                if not _categories_compatible(c_entry.category, v_entry.category):
+                    continue
 
-                # Check date proximity
-                if c_entry.posting_date and v_entry.posting_date:
-                    try:
-                        c_date = c_entry.posting_date
-                        v_date = v_entry.posting_date
-                        date_diff = abs((c_date - v_date).days)
-                    except (TypeError, AttributeError):
-                        date_diff = 0
-                else:
-                    date_diff = 0
+                # Check date proximity (directional forward-only window for
+                # Payment entries per the mapping doc; symmetric otherwise).
+                date_diff = _date_diff_within_window(
+                    c_entry.category, c_entry.posting_date, v_entry.posting_date,
+                    date_tolerance_days,
+                )
+                if date_diff is None:
+                    continue
 
-                if date_diff <= date_tolerance_days and date_diff < best_date_diff:
+                if date_diff < best_date_diff:
                     best_date_diff = date_diff
                     best_match = v_entry
 
@@ -696,8 +1032,8 @@ class ReconciliationEngineService:
                     MatchPair(
                         company_entry_id=c_entry.id,
                         vendor_entry_id=best_match.id,
-                        confidence_score=0.90,
-                        pass_number=MatchPassType.EXACT,  # Categorize under exact for simplicity
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.AMOUNT_DATE],
+                        pass_number=MatchPassType.AMOUNT_DATE,
                         matched_amount=c_entry.amount,
                         difference_amount=c_entry.amount + best_match.amount,  # sign-aware diff
                     )
@@ -733,6 +1069,8 @@ class ReconciliationEngineService:
         gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             abs_c = abs(c_entry.amount)
             if abs_c == 0:
                 continue
@@ -753,20 +1091,22 @@ class ReconciliationEngineService:
             for v_entry in vendor:
                 if v_entry.id in used_vendor_ids:
                     continue
+                if not _is_matchable(v_entry):
+                    continue
+                if not _categories_compatible(c_entry.category, v_entry.category):
+                    continue
 
                 diff = abs(abs_c - abs(v_entry.amount))
                 if diff > allowed:
                     continue
 
-                # Date proximity check
-                if c_entry.posting_date and v_entry.posting_date:
-                    try:
-                        date_diff = abs((c_entry.posting_date - v_entry.posting_date).days)
-                    except (TypeError, AttributeError):
-                        date_diff = 0
-                else:
-                    date_diff = 0
-                if date_diff > date_tolerance_days:
+                # Date proximity check (directional forward-only window for
+                # Payment entries per the mapping doc; symmetric otherwise).
+                date_diff = _date_diff_within_window(
+                    c_entry.category, c_entry.posting_date, v_entry.posting_date,
+                    date_tolerance_days,
+                )
+                if date_diff is None:
                     continue
 
                 if best_diff is None or diff < best_diff:
@@ -778,8 +1118,8 @@ class ReconciliationEngineService:
                     MatchPair(
                         company_entry_id=c_entry.id,
                         vendor_entry_id=best_match.id,
-                        confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
-                        pass_number=MatchPassType.TOLERANCE,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE_DATE],
+                        pass_number=MatchPassType.TOLERANCE_DATE,
                         matched_amount=c_entry.amount,
                         difference_amount=c_entry.amount + best_match.amount,
                     )
@@ -817,15 +1157,21 @@ class ReconciliationEngineService:
         # Determine if tolerance is percentage-based (< 1) or absolute (>= 1)
         is_percentage = tolerance < Decimal("1")
 
-        # Build reference lookup for vendor entries
+        # Build reference lookup for vendor entries (matchable only).
         vendor_by_ref: dict[str, list[LedgerEntryData]] = {}
         for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
             vendor_by_ref.setdefault(v_entry.reference_number, []).append(v_entry)
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             candidates = vendor_by_ref.get(c_entry.reference_number, [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
+                    continue
+                if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
                 diff = abs(c_entry.amount - v_entry.amount)
 
@@ -883,8 +1229,17 @@ class ReconciliationEngineService:
         for c_entry in company:
             if abs(c_entry.amount) == 0:
                 continue
+            if not _is_matchable(c_entry):
+                continue
             for v_entry in vendor:
                 if v_entry.id in used_vendor_ids:
+                    continue
+                if not _is_matchable(v_entry):
+                    continue
+                # TDS/GST gap only applies between economically compatible
+                # entries (invoice<->invoice). Never let a TDS gap knock a
+                # real invoice off against a reversal, receipt, or SA entry.
+                if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
 
                 diff = abs(c_entry.amount - v_entry.amount)
@@ -916,8 +1271,8 @@ class ReconciliationEngineService:
                             MatchPair(
                                 company_entry_id=c_entry.id,
                                 vendor_entry_id=v_entry.id,
-                                confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
-                                pass_number=MatchPassType.TOLERANCE,
+                                confidence_score=CONFIDENCE_SCORES[MatchPassType.TDS_GST],
+                                pass_number=MatchPassType.TDS_GST,
                                 matched_amount=c_entry.amount,
                                 difference_amount=c_entry.amount - v_entry.amount,
                             )
@@ -947,17 +1302,24 @@ class ReconciliationEngineService:
         used_vendor_ids: set[UUID] = set()
 
         # Build lookup for vendor entries by amount for efficient filtering
+        # (matchable only).
         vendor_by_amount: dict[Decimal, list[LedgerEntryData]] = {}
         for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
             vendor_by_amount.setdefault(v_entry.amount, []).append(v_entry)
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             candidates = vendor_by_amount.get(c_entry.amount, [])
             best_match: LedgerEntryData | None = None
             best_score: float = 0.0
 
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
+                    continue
+                if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
                 similarity = self._reference_similarity(
                     c_entry.reference_number, v_entry.reference_number
@@ -986,6 +1348,85 @@ class ReconciliationEngineService:
     # Pass 4: One-to-Many Match
     # ──────────────────────────────────────────────────────────────────────
 
+    def _utr_payment_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        date_tolerance_days: int = 15,
+    ) -> list[MatchGroup]:
+        """
+        Combine company-side Payment entries that share the same UTR
+        (assignment_number) into a single total, and match that total
+        against a single vendor entry by amount + date.
+
+        Per the mapping doc: "If Emcure has made the payment in multiple
+        split entries under the same UTR, then combine all those entries and
+        match them with the vendor's entry based on the payment date and
+        total amount." Runs BEFORE the generic one-to-many/many-to-one
+        subset-sum passes so a genuine UTR grouping always wins over an
+        incidental amount coincidence.
+        """
+        groups: list[MatchGroup] = []
+        used_company_ids: set[UUID] = set()
+        used_vendor_ids: set[UUID] = set()
+
+        payment_entries = [
+            e for e in company
+            if e.category == "Payment" and (e.assignment_number or "").strip()
+        ]
+        by_utr: dict[str, list[LedgerEntryData]] = {}
+        for e in payment_entries:
+            by_utr.setdefault(e.assignment_number.strip(), []).append(e)
+
+        available_vendor = [v for v in vendor if _is_matchable(v)]
+
+        for utr, group_entries in by_utr.items():
+            if len(group_entries) < 2:
+                continue  # Only split entries need combining; single entries go through normal passes.
+            total = sum(e.amount for e in group_entries)
+            anchor_date = max(
+                (e.posting_date for e in group_entries if e.posting_date is not None),
+                default=None,
+            )
+
+            best_match: LedgerEntryData | None = None
+            best_date_diff: int | None = None
+            for v_entry in available_vendor:
+                if v_entry.id in used_vendor_ids:
+                    continue
+                if not _categories_compatible("Payment", v_entry.category):
+                    continue
+                if abs(abs(total) - abs(v_entry.amount)) > Decimal("0.01"):
+                    continue
+                # Directional forward-only window: vendor receipt date must
+                # be on/after the (last) company payment date, within
+                # date_tolerance_days days — per the mapping doc.
+                date_diff = _date_diff_within_window(
+                    "Payment", anchor_date, v_entry.posting_date, date_tolerance_days
+                )
+                if date_diff is None:
+                    continue
+                if best_date_diff is None or date_diff < best_date_diff:
+                    best_date_diff = date_diff
+                    best_match = v_entry
+
+            if best_match is not None:
+                company_ids = [e.id for e in group_entries]
+                groups.append(
+                    MatchGroup(
+                        company_entry_ids=company_ids,
+                        vendor_entry_ids=[best_match.id],
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.MANY_TO_ONE],
+                        pass_number=MatchPassType.MANY_TO_ONE,
+                        matched_amount=abs(total),
+                        difference_amount=abs(total) - abs(best_match.amount),
+                    )
+                )
+                used_company_ids.update(company_ids)
+                used_vendor_ids.add(best_match.id)
+
+        return groups
+
     def _one_to_many_match(
         self,
         company: list[LedgerEntryData],
@@ -1002,19 +1443,31 @@ class ReconciliationEngineService:
         used_vendor_ids: set[UUID] = set()
 
         # Sort company entries by absolute amount descending (larger amounts more
-        # likely to be sums of multiple smaller vendor entries)
-        sorted_company = sorted(company, key=lambda e: abs(e.amount), reverse=True)
+        # likely to be sums of multiple smaller vendor entries). Only matchable
+        # company entries drive one-to-many grouping.
+        sorted_company = sorted(
+            (e for e in company if _is_matchable(e)),
+            key=lambda e: abs(e.amount),
+            reverse=True,
+        )
 
         for c_entry in sorted_company:
+            # Candidate vendor entries must be unused, matchable, and of a
+            # category compatible with the company entry (no invoice<->receipt,
+            # no matching against knock-offs/SA entries).
             available_vendor = [
-                v for v in vendor if v.id not in used_vendor_ids
+                v for v in vendor
+                if v.id not in used_vendor_ids
+                and _is_matchable(v)
+                and _categories_compatible(c_entry.category, v.category)
             ]
             if len(available_vendor) < 2:
                 continue
 
-            # Find subset of vendor entries whose absolute amounts sum to company amount
+            # Find subset of vendor entries whose absolute amounts sum to
+            # company amount, constrained to entries near the company entry's date.
             matching_subset = self._find_subset_sum(
-                available_vendor, c_entry.amount
+                available_vendor, c_entry.amount, anchor_date=c_entry.posting_date
             )
 
             if matching_subset and len(matching_subset) >= 2:
@@ -1052,19 +1505,27 @@ class ReconciliationEngineService:
         groups: list[MatchGroup] = []
         used_company_ids: set[UUID] = set()
 
-        # Sort vendor entries by absolute amount descending
-        sorted_vendor = sorted(vendor, key=lambda e: abs(e.amount), reverse=True)
+        # Sort vendor entries by absolute amount descending (matchable only).
+        sorted_vendor = sorted(
+            (e for e in vendor if _is_matchable(e)),
+            key=lambda e: abs(e.amount),
+            reverse=True,
+        )
 
         for v_entry in sorted_vendor:
             available_company = [
-                c for c in company if c.id not in used_company_ids
+                c for c in company
+                if c.id not in used_company_ids
+                and _is_matchable(c)
+                and _categories_compatible(v_entry.category, c.category)
             ]
             if len(available_company) < 2:
                 continue
 
-            # Find subset of company entries whose absolute amounts sum to vendor amount
+            # Find subset of company entries whose absolute amounts sum to
+            # vendor amount, constrained to entries near the vendor entry's date.
             matching_subset = self._find_subset_sum(
-                available_company, v_entry.amount
+                available_company, v_entry.amount, anchor_date=v_entry.posting_date
             )
 
             if matching_subset and len(matching_subset) >= 2:
@@ -1096,15 +1557,11 @@ class ReconciliationEngineService:
         date_tolerance_days: int = 3,
     ) -> list[MatchPair]:
         """
-        Match entries where amounts are equal (by absolute value) and
-        posting dates are within a configurable number of days.
+        Match entries where amounts are equal and posting dates are within
+        N days of each other (configurable via date_tolerance_days).
 
-        Requirement 17.1: Pass 6 matches by amount + date within N days.
-        This handles cases where the amount matches exactly but the reference
-        doesn't match — common when bank value dates differ from SAP posting dates.
-
-        Default date tolerance: ±3 days (configurable).
-        Confidence score: 0.70 for date-proximity matches.
+        Requirement 17.1: Match by amount + date within configurable N days.
+        BRD confidence = 0.70 (normalized from MatchScore 70).
         """
         if date_tolerance_days < 0:
             return []
@@ -1112,84 +1569,27 @@ class ReconciliationEngineService:
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Build lookup for vendor entries by absolute amount for efficient filtering
-        vendor_by_abs_amount: dict[Decimal, list[LedgerEntryData]] = {}
-        for v_entry in vendor:
-            abs_amount = abs(v_entry.amount)
-            vendor_by_abs_amount.setdefault(abs_amount, []).append(v_entry)
-
-        for c_entry in company:
-            abs_company_amount = abs(c_entry.amount)
-            candidates = vendor_by_abs_amount.get(abs_company_amount, [])
-
-            best_match: LedgerEntryData | None = None
-            best_date_diff: int | None = None
-
-            for v_entry in candidates:
-                if v_entry.id in used_vendor_ids:
-                    continue
-
-                # Calculate date difference in days
-                if c_entry.posting_date is None or v_entry.posting_date is None:
-                    continue
-
-                date_diff = abs(
-                    (c_entry.posting_date - v_entry.posting_date).days
-                )
-
-                if date_diff <= date_tolerance_days:
-                    # Pick the closest date match
-                    if best_date_diff is None or date_diff < best_date_diff:
-                        best_date_diff = date_diff
-                        best_match = v_entry
-
-            if best_match is not None:
-                pairs.append(
-                    MatchPair(
-                        company_entry_id=c_entry.id,
-                        vendor_entry_id=best_match.id,
-                        confidence_score=0.70,
-                        pass_number=MatchPassType.DATE_PROXIMITY,
-                        matched_amount=c_entry.amount,
-                        difference_amount=Decimal("0"),
-                    )
-                )
-                used_vendor_ids.add(best_match.id)
-
-        return pairs
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Pass 6: Date-proximity Match
-    # ──────────────────────────────────────────────────────────────────────
-
-    def _date_proximity_match(
-        self,
-        company: list[LedgerEntryData],
-        vendor: list[LedgerEntryData],
-        date_tolerance_days: int = 3,
-    ) -> list[MatchPair]:
-        """
-        Match entries where amounts are equal and posting dates are within
-        N days of each other (configurable via date_tolerance_days).
-
-        Requirement 17.1: Match by amount + date within configurable N days.
-        BRD confidence = 0.70 (normalized from MatchScore 70).
-        """
-        pairs: list[MatchPair] = []
-        used_vendor_ids: set[UUID] = set()
-
         # Build lookup for vendor entries by amount for efficient filtering
+        # (matchable only).
         vendor_by_amount: dict[Decimal, list[LedgerEntryData]] = {}
         for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
             vendor_by_amount.setdefault(v_entry.amount, []).append(v_entry)
 
         for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
             candidates = vendor_by_amount.get(c_entry.amount, [])
             best_match: LedgerEntryData | None = None
             best_date_diff: int | None = None
 
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
+                    continue
+                # Gate on category so an invoice can't match a receipt/payment
+                # merely because the amount and date align.
+                if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
                 # Calculate date difference in days
                 if c_entry.posting_date is None or v_entry.posting_date is None:
@@ -1226,6 +1626,8 @@ class ReconciliationEngineService:
         target: Decimal,
         max_subset_size: int = 5,
         tolerance: Decimal = Decimal("0.01"),
+        anchor_date: object | None = None,
+        date_window_days: int = 45,
     ) -> list[LedgerEntryData] | None:
         """
         Find a subset of entries whose ABSOLUTE amounts sum to the absolute target.
@@ -1237,6 +1639,11 @@ class ReconciliationEngineService:
 
         A small tolerance absorbs rounding differences.
         Limits search to combinations of up to max_subset_size entries.
+
+        When ``anchor_date`` is supplied, only entries whose posting date
+        falls within ``date_window_days`` of the anchor are considered. This
+        stops the subset-sum from fabricating a group out of unrelated
+        entries that merely happen to add up to the target amount.
         """
         from itertools import combinations
 
@@ -1244,9 +1651,20 @@ class ReconciliationEngineService:
         if abs_target == 0:
             return None
 
-        # Use absolute values; only consider entries not larger than the target
+        def _within_window(entry: LedgerEntryData) -> bool:
+            if anchor_date is None or entry.posting_date is None:
+                return True
+            try:
+                return abs((entry.posting_date - anchor_date).days) <= date_window_days
+            except (TypeError, AttributeError):
+                return True
+
+        # Use absolute values; only consider entries not larger than the
+        # target and within the date window of the anchor entry.
         candidates = [
-            e for e in entries if Decimal("0") < abs(e.amount) <= abs_target + tolerance
+            e for e in entries
+            if Decimal("0") < abs(e.amount) <= abs_target + tolerance
+            and _within_window(e)
         ]
 
         # Performance cap: keep the largest candidates
@@ -1334,7 +1752,12 @@ class ReconciliationEngineService:
             if total_entries > 0:
                 # Entries involved: for pairs = 2 per match, for groups = n entries
                 entries_involved = 0
-                if ps.pass_number in (1, 2, 3, 6):
+                if ps.pass_number in (
+                    1, 2, 3, 6,
+                    MatchPassType.AMOUNT_DATE,
+                    MatchPassType.TDS_GST,
+                    MatchPassType.TOLERANCE_DATE,
+                ):
                     entries_involved = ps.match_count * 2
                 elif ps.pass_number == 4:
                     for g in result.match_groups:
@@ -1397,20 +1820,31 @@ class ReconciliationEngineService:
         vendor_entries: list["LedgerEntryData"] | None = None,
     ) -> None:
         """Persist match results and update ledger entries with match metadata."""
-        # Persist match pairs (passes 1, 2, 3, 6)
+        # Persist match pairs (passes 1, 2, 3, 6, plus same-side netting 9/13)
         for pair in result.match_pairs:
             match_id = uuid4()
-            is_reversal = pair.pass_number == REVERSAL_PASS
+            is_same_side_netting = pair.pass_number in (REVERSAL_PASS, OTHER_ENTRY_PASS)
             # BRD: Auto-Accept for Pass 1 (Exact) and Pass 2 (Tolerance).
-            # Reversals net to zero within the company ledger, so auto-accept them.
-            is_auto_accepted = is_reversal or pair.pass_number in (
-                MatchPassType.EXACT, MatchPassType.TOLERANCE
+            # AMOUNT_DATE (1.5) and TDS_GST (2.5) are also high-confidence
+            # (0.90/0.85) so they auto-accept too; TOLERANCE_DATE (6.5) is the
+            # weakest tier (neither exact amount nor reference matched) and
+            # always needs Finance review, same as Pass 6 Date-proximity.
+            # Reversal/"Other entry" netting nets to zero within a single
+            # ledger, so auto-accept it.
+            is_auto_accepted = is_same_side_netting or pair.pass_number in (
+                MatchPassType.EXACT, MatchPassType.TOLERANCE,
+                MatchPassType.AMOUNT_DATE, MatchPassType.TDS_GST,
             )
-            # For reversal pairs BOTH entries are company-side; record them both
-            # under company_entry_ids (no vendor counterpart).
-            if is_reversal:
-                company_ids = [str(pair.company_entry_id), str(pair.vendor_entry_id)]
-                vendor_ids: list[str] = []
+            # For same-side netting pairs BOTH entries live on the SAME side
+            # (company or vendor, per reversal_side) — record them both under
+            # that side's id list (no cross-side counterpart).
+            if is_same_side_netting:
+                if pair.reversal_side == "vendor":
+                    company_ids: list[str] = []
+                    vendor_ids = [str(pair.company_entry_id), str(pair.vendor_entry_id)]
+                else:
+                    company_ids = [str(pair.company_entry_id), str(pair.vendor_entry_id)]
+                    vendor_ids = []
             else:
                 company_ids = [str(pair.company_entry_id)]
                 vendor_ids = [str(pair.vendor_entry_id)]
@@ -1418,7 +1852,7 @@ class ReconciliationEngineService:
                 "id": match_id,
                 "case_id": case_id,
                 "pass_number": pair.pass_number,
-                "match_type": "reversal" if is_reversal else "pair",
+                "match_type": "reversal" if is_same_side_netting else "pair",
                 "confidence_score": pair.confidence_score,
                 "is_confirmed": is_auto_accepted,
                 "company_entry_ids": company_ids,
@@ -1515,6 +1949,13 @@ class ReconciliationEngineService:
         """Convert raw repository objects to LedgerEntryData for matching."""
         result: list[LedgerEntryData] = []
         for entry in entries:
+            document_type = getattr(entry, "document_type", "") or ""
+            # Prefer a category already computed/saved on the entry
+            # (e.g. via the Map Document Type screen); otherwise derive it
+            # from the document type so matching can gate on it.
+            category = (getattr(entry, "document_category", "") or "").strip()
+            if not category:
+                category = _derive_category(document_type)
             result.append(
                 LedgerEntryData(
                     id=getattr(entry, "id"),
@@ -1523,7 +1964,9 @@ class ReconciliationEngineService:
                     reference_number=getattr(entry, "reference_number", "") or "",
                     document_number=getattr(entry, "document_number", "") or "",
                     side=getattr(entry, "side", ""),
-                    document_type=(getattr(entry, "document_type", "") or ""),
+                    document_type=document_type,
+                    assignment_number=getattr(entry, "assignment_number", "") or "",
+                    category=category,
                 )
             )
         return result

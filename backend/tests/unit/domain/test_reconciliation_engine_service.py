@@ -1150,9 +1150,16 @@ class TestDateProximityMatchInFullExecution:
         service: ReconciliationEngineService,
         mock_ledger_repo: AsyncMock,
     ):
-        """Pass 6 should match entries that don't match on reference but match on amount+date."""
+        """
+        Same amount, close dates, different references: caught by the
+        higher-confidence Pass 1.5 (Amount+Date, 0.90) before Pass 6
+        (Date-proximity, 0.70) ever runs — Pass 1.5 has always executed
+        before Pass 6 in the pipeline and shares the same "amount equal +
+        date within N days" criteria, so it wins for any entry pair this
+        simple. Pass 6 only fires for pairs Pass 1.5 could not claim (e.g.
+        already consumed by an earlier reference-aware pass on one side).
+        """
         case_id = uuid4()
-        # Same amount, close dates, different references - should match in pass 6
         c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
         v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT")
 
@@ -1166,8 +1173,8 @@ class TestDateProximityMatchInFullExecution:
         result = await service.execute(case_id, date_tolerance_days=3)
 
         assert len(result.match_pairs) == 1
-        assert result.match_pairs[0].pass_number == MatchPassType.DATE_PROXIMITY
-        assert result.match_pairs[0].confidence_score == 0.70
+        assert result.match_pairs[0].pass_number == MatchPassType.AMOUNT_DATE
+        assert result.match_pairs[0].confidence_score == 0.90
         assert result.unmatched_company_ids == []
         assert result.unmatched_vendor_ids == []
 
@@ -1197,12 +1204,16 @@ class TestDateProximityMatchInFullExecution:
         assert result.match_pairs[0].pass_number == MatchPassType.EXACT
 
     @pytest.mark.asyncio
-    async def test_date_proximity_needs_confirmation(
+    async def test_amount_date_match_is_auto_accepted(
         self,
         service: ReconciliationEngineService,
         mock_ledger_repo: AsyncMock,
     ):
-        """Date-proximity matches should flag needs_confirmation."""
+        """
+        Amount+Date matches (0.90 confidence) are high-confidence and
+        auto-accepted, unlike the genuinely weak Date-proximity (Pass 6) and
+        Tolerance+Date (Pass 6.5) tiers which always need Finance review.
+        """
         case_id = uuid4()
         c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
         v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT")
@@ -1216,7 +1227,7 @@ class TestDateProximityMatchInFullExecution:
 
         result = await service.execute(case_id, date_tolerance_days=3)
 
-        assert result.needs_confirmation is True
+        assert result.needs_confirmation is False
 
 # ─── Confidence Scoring Tests ─────────────────────────────────────────────────
 
@@ -1743,4 +1754,342 @@ class TestDateProximityMatch:
         ]
 
         pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+
+# ─── Category Gating Tests (Vendor Ledger Mapping Rules doc compliance) ──────
+
+
+def _cat_entry(
+    amount: str,
+    category: str = "",
+    posting_date: date | None = None,
+    reference_number: str = "REF-001",
+    document_type: str = "",
+    assignment_number: str = "",
+) -> LedgerEntryData:
+    """Helper to build a LedgerEntryData with a document category set."""
+    return LedgerEntryData(
+        id=uuid4(),
+        amount=Decimal(amount),
+        posting_date=posting_date or date(2024, 3, 15),
+        reference_number=reference_number,
+        document_type=document_type,
+        category=category,
+        assignment_number=assignment_number,
+    )
+
+
+class TestCategoryGating:
+    """
+    Cross-side matching must respect the Vendor Ledger Mapping Rules doc:
+      - Invoice only matches Invoice
+      - Debit Note only matches Credit Note (and vice versa)
+      - Payment only matches Receipt (and vice versa)
+      - TDS Adjusted only matches TDS Adjusted
+      - Knocking Off (AB) and Adjusted (SA) never cross-match at all
+    """
+
+    def test_invoice_does_not_match_receipt_on_amount_date(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Receipt", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0
+
+    def test_invoice_matches_invoice_on_amount_date(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 16))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 1
+
+    def test_payment_matches_receipt(self, service: ReconciliationEngineService):
+        company = [_cat_entry("500", "Payment", date(2024, 3, 15))]
+        vendor = [_cat_entry("-500", "Receipt", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 1
+
+    def test_debit_note_matches_credit_note_only(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Debit Note", date(2024, 3, 15), "REF-1")]
+        vendor_credit = [_cat_entry("1000", "Credit Note", date(2024, 3, 15), "REF-1")]
+        vendor_invoice = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "REF-1")]
+        assert len(service._exact_match(company, vendor_credit)) == 1
+        assert len(service._exact_match(company, vendor_invoice)) == 0
+
+    def test_debit_note_does_not_match_invoice_on_amount_date(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Debit Note", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0
+
+    def test_date_proximity_gates_on_category(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15))]
+        vendor = [_cat_entry("1000", "Payment", date(2024, 3, 16))]
+        pairs = service._date_proximity_match(company, vendor, date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_knockoff_excluded_from_matching(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Knocking Off", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0
+
+    def test_adjusted_sa_excluded_from_cross_matching(
+        self, service: ReconciliationEngineService
+    ):
+        """Bug fix: 'Other entry' (SA/Adjusted) must never cross-match a real
+        invoice/payment — per doc, it only nets with its own side's SA entries."""
+        company = [_cat_entry("1000", "Adjusted", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0
+
+    def test_tds_gst_gates_on_category(self, service: ReconciliationEngineService):
+        company = [_cat_entry("100000", "Invoice", date(2024, 3, 15), "INV-1")]
+        vendor = [_cat_entry("90000", "Knocking Off", date(2024, 3, 15), "INV-1")]
+        pairs = service._tds_gst_match(company, vendor, Decimal("10"), Decimal("0"))
+        assert len(pairs) == 0
+
+    def test_exact_match_gates_on_category(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "REF-1")]
+        vendor = [_cat_entry("1000", "Receipt", date(2024, 3, 15), "REF-1")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_wildcard_category_still_matches(
+        self, service: ReconciliationEngineService
+    ):
+        """Unrecognized/uncategorized entries (wildcard) must remain matchable
+        so users aren't blocked before mapping a doc type."""
+        company = [_cat_entry("1000", "", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 1
+
+
+class TestReversalBothSides:
+    """
+    Reversal (knock-off, AB) netting must run on BOTH ledger sides
+    independently — per doc: "Knocking entries are internal entries for both
+    Emcure and vendor; it should only map with their internal entries."
+    """
+
+    def test_company_reversal_pairs_matched(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("5000", document_type="AB")
+        cr = _cat_entry("-5000", document_type="AB")
+        pairs = service._reversal_match([d, cr], side="company")
+        assert len(pairs) == 1
+        assert pairs[0].reversal_side == "company"
+
+    def test_vendor_reversal_pairs_matched(
+        self, service: ReconciliationEngineService
+    ):
+        """Bug fix: vendor-side knock-off entries were never netted before —
+        they fell into the general matching pool and could match real invoices."""
+        d = _cat_entry("5000", category="Knocking Off")
+        cr = _cat_entry("-5000", category="Knocking Off")
+        pairs = service._reversal_match([d, cr], side="vendor")
+        assert len(pairs) == 1
+        assert pairs[0].reversal_side == "vendor"
+
+    def test_unpaired_reversal_not_matched(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("5000", document_type="AB")
+        pairs = service._reversal_match([d], side="company")
+        assert len(pairs) == 0
+
+    @pytest.mark.asyncio
+    async def test_vendor_reversal_wired_into_full_execution(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Vendor-side AB entries must net within the vendor ledger during a
+        full execute() run, not leak into cross-side matching or unmatched."""
+        case_id = uuid4()
+        v1 = _cat_entry("8000", document_type="AB", posting_date=date(2024, 3, 10))
+        v2 = _cat_entry("-8000", document_type="AB", posting_date=date(2024, 3, 10))
+
+        def side_effect(cid, side):
+            if side == "company":
+                return []
+            return [v1, v2]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+        result = await service.execute(case_id)
+
+        assert len(result.unmatched_vendor_ids) == 0
+        reversal_pairs = [p for p in result.match_pairs if p.pass_number == 9]
+        assert len(reversal_pairs) == 1
+        assert reversal_pairs[0].reversal_side == "vendor"
+
+
+class TestOtherEntrySameSideNetting:
+    """
+    "Other entry" (SA/Adjusted) rows net only against other SA entries on
+    the SAME side — per doc: "Other entry like SA from both side... therefore
+    that only map with each other in both side."
+    """
+
+    def test_company_sa_entries_net_within_company_side(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("3000", document_type="SA")
+        cr = _cat_entry("-3000", document_type="SA")
+        pairs = service._other_entry_match([d, cr], side="company")
+        assert len(pairs) == 1
+
+    def test_vendor_sa_entries_net_within_vendor_side(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("3000", category="Adjusted")
+        cr = _cat_entry("-3000", category="Adjusted")
+        pairs = service._other_entry_match([d, cr], side="vendor")
+        assert len(pairs) == 1
+
+
+class TestUTRPaymentGrouping:
+    """
+    Per doc: "If Emcure has made the payment in multiple split entries under
+    the same UTR, then combine all those entries and match them with the
+    vendor's entry based on the payment date and total amount."
+    """
+
+    def test_split_payments_same_utr_combine_and_match(
+        self, service: ReconciliationEngineService
+    ):
+        c1 = _cat_entry("600", "Payment", date(2024, 3, 10), assignment_number="UTR123")
+        c2 = _cat_entry("400", "Payment", date(2024, 3, 12), assignment_number="UTR123")
+        v1 = _cat_entry("-1000", "Receipt", date(2024, 3, 15))
+        groups = service._utr_payment_match([c1, c2], [v1], date_tolerance_days=15)
+        assert len(groups) == 1
+        assert set(groups[0].company_entry_ids) == {c1.id, c2.id}
+        assert groups[0].vendor_entry_ids == [v1.id]
+
+    def test_single_entry_utr_not_grouped(self, service: ReconciliationEngineService):
+        """A UTR with only one entry doesn't need combining — leave it to the
+        normal 1:1 passes."""
+        c1 = _cat_entry("600", "Payment", date(2024, 3, 10), assignment_number="UTR123")
+        v1 = _cat_entry("-600", "Receipt", date(2024, 3, 10))
+        groups = service._utr_payment_match([c1], [v1], date_tolerance_days=15)
+        assert len(groups) == 0
+
+    def test_utr_grouping_respects_date_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        c1 = _cat_entry("600", "Payment", date(2024, 1, 1), assignment_number="UTR9")
+        c2 = _cat_entry("400", "Payment", date(2024, 1, 1), assignment_number="UTR9")
+        v1 = _cat_entry("-1000", "Receipt", date(2024, 6, 1))  # far outside window
+        groups = service._utr_payment_match([c1, c2], [v1], date_tolerance_days=15)
+        assert len(groups) == 0
+
+
+# ─── Payment Date-Range Directionality (Vendor Ledger Mapping Rules doc) ────
+
+
+class TestPaymentDateDirectionality:
+    """
+    Per doc: "map with date range mapping, from the date of payment made
+    from Emcure to after 15 days of receipt amount of vendor" — the vendor's
+    receipt date must be ON OR AFTER the company payment date, within N days
+    forward. This is directional, NOT a symmetric ± window.
+    """
+
+    def test_vendor_receipt_after_payment_date_matches(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Payment", date(2024, 3, 1))]
+        vendor = [_cat_entry("-1000", "Receipt", date(2024, 3, 10))]  # +9 days
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
+        assert len(pairs) == 1
+
+    def test_vendor_receipt_before_payment_date_does_not_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Bug fix: previously used abs(date_diff), which incorrectly allowed
+        a vendor receipt dated BEFORE the company payment to match."""
+        company = [_cat_entry("1000", "Payment", date(2024, 3, 10))]
+        vendor = [_cat_entry("-1000", "Receipt", date(2024, 3, 1))]  # -9 days (before)
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
+        assert len(pairs) == 0
+
+    def test_vendor_receipt_beyond_window_forward_does_not_match(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Payment", date(2024, 3, 1))]
+        vendor = [_cat_entry("-1000", "Receipt", date(2024, 4, 1))]  # +31 days, beyond 15
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
+        assert len(pairs) == 0
+
+    def test_non_payment_category_stays_symmetric(
+        self, service: ReconciliationEngineService
+    ):
+        """Invoice matching is unaffected — still a symmetric ± window."""
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 10))]
+        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 1))]  # -9 days
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
+        assert len(pairs) == 1
+
+    def test_utr_grouping_rejects_vendor_receipt_before_payment(
+        self, service: ReconciliationEngineService
+    ):
+        c1 = _cat_entry("600", "Payment", date(2024, 3, 10), assignment_number="UTR1")
+        c2 = _cat_entry("400", "Payment", date(2024, 3, 12), assignment_number="UTR1")
+        v1 = _cat_entry("-1000", "Receipt", date(2024, 3, 1))  # before the payments
+        groups = service._utr_payment_match([c1, c2], [v1], date_tolerance_days=15)
+        assert len(groups) == 0
+
+
+# ─── Regression: "Other" category must be wildcard, not a real category ────
+
+
+class TestOtherCategoryIsWildcard:
+    """
+    DataTransformationService.classify_document_type persists
+    document_category="Other" for any doc type outside its narrow hardcoded
+    set (RE/KR/DR/ZP/KZ/ZV/KG/RV), BEFORE the reconciliation engine runs.
+    If "Other" were treated as a real, mutually-exclusive category (like
+    "Adjusted"), an Invoice entry could never match an "Other"-categorized
+    entry even when they're the same real invoice — this collapsed match
+    counts from ~340 to ~18 on a real case.
+    """
+
+    def test_invoice_matches_other_categorized_entry(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "REF-1")]
+        vendor = [_cat_entry("1000", "Other", date(2024, 3, 15), "REF-1")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 1
+
+    def test_other_matches_other(self, service: ReconciliationEngineService):
+        company = [_cat_entry("1000", "Other", date(2024, 3, 15), "REF-1")]
+        vendor = [_cat_entry("1000", "Other", date(2024, 3, 15), "REF-1")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 1
+
+    def test_other_still_excludes_knockoff(
+        self, service: ReconciliationEngineService
+    ):
+        """"Other" being wildcard doesn't override the hard exclusions —
+        knock-off entries must still never cross-match."""
+        company = [_cat_entry("1000", "Other", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Knocking Off", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 0

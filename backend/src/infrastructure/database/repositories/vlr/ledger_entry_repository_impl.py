@@ -118,10 +118,38 @@ class LedgerEntryRepositoryImpl(ILedgerEntryRepository):
         return list(result.scalars().all())
 
     async def get_by_case_and_side(self, case_id: UUID, side: str) -> list[LedgerEntryModel]:
-        stmt = select(LedgerEntryModel).where(
-            and_(
-                LedgerEntryModel.case_id == case_id,
-                LedgerEntryModel.side == side,
+        # Deterministic ordering is required here: the reconciliation engine's
+        # matching passes are greedy and pick the first available candidate
+        # among tied entries (same amount/date). Without a stable ORDER BY,
+        # Postgres does not guarantee row order between executions (sequential
+        # vs index scans, autovacuum, parallel workers), so re-running
+        # reconciliation on unchanged data could pick different specific
+        # entries as matched/unmatched each time, changing the counts even
+        # though nothing actually changed.
+        #
+        # The final tiebreaker must be content-based, NOT the primary key
+        # `id` — `id` is a randomly-generated UUID assigned at insert time
+        # (see AuditMixin), so two independent uploads of the byte-identical
+        # source ledger produce two cases whose rows tie on posting_date and
+        # amount but sort differently by id. That made the same ledger data
+        # reconcile to slightly different counts depending on which case/
+        # upload it landed in. document_number comes from the source file
+        # (or a row-order-derived fallback for blank rows — see
+        # file_parser_service `BAL_ROW_{row_number}`), so it reproduces the
+        # same order across re-uploads of the same file. `id` remains only
+        # as the last-resort tiebreaker for true duplicates.
+        stmt = (
+            select(LedgerEntryModel)
+            .where(
+                and_(
+                    LedgerEntryModel.case_id == case_id,
+                    LedgerEntryModel.side == side,
+                )
+            )
+            .order_by(
+                LedgerEntryModel.posting_date,
+                LedgerEntryModel.document_number,
+                LedgerEntryModel.id,
             )
         )
         result = await self._session.execute(stmt)

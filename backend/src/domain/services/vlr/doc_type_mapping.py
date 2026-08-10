@@ -14,16 +14,29 @@ DEFAULT_DOC_TYPE_MAP: dict[str, str] = {
     "AA": "Invoice",
     "MH": "Invoice",
     "MN": "Invoice",
+    "M7": "Invoice",
+    "M8": "Invoice",
+    # Vendor-side (Tally-style) invoice doc type — confirmed against real
+    # Firmway export data: "Party DocType=invoice | Party Original DocType=RV".
+    "RV": "Invoice",
+    "INV": "Invoice",
     # Debit Note
     "KG": "Debit Note",
+    # Credit Note
+    "CM": "Credit Note",
     # Knocking Off / Clearing
     "AB": "Knocking Off",
     # Journal / Adjusted
     "SA": "Adjusted",
     # Payment
     "KZ": "Payment",
+    # Vendor-side (Tally-style) payment/clearing doc type — confirmed against
+    # real Firmway export data: "Party DocType=payment | Party Original DocType=DZ".
+    "DZ": "Payment",
+    "REFUND": "Payment",
     # Receipt
     "RO": "Receipt",
+    "REC": "Receipt",
     # TDS
     "KA": "TDS Adjusted",
     # Opening / Closing Balance markers

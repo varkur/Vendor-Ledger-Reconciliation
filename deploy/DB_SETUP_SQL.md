@@ -68,3 +68,36 @@ sudo systemctl status ledger-recon-backend.service
   app (which connects as `vlr_user`) can read/write. Do not skip step 4.
 - The app's `.env` runtime driver:
   `DATABASE_URL=postgresql+asyncpg://vlr_user:vlr_pass@localhost:5432/vlr_db`
+
+## Fixing poisoned `document_category` values (low match count after deploy)
+
+If match counts stay low after deploying the doc-type-mapping / category-gating
+fixes, the DB may have raw/unrecognized values in
+`vlr_ledger_entries.document_category` (e.g. `'RV'`, `'DZ'`) left over from an
+old bug. The app never overwrites a non-empty `document_category`, so these
+poisoned rows won't self-heal on their own — they need a one-time SQL cleanup.
+
+Use `10_fix_poisoned_categories.sql`:
+
+```bash
+sudo cp 10_fix_poisoned_categories.sql /tmp/
+
+# Step 1 — dry run (report only, no changes):
+sudo -u postgres psql -d vlr_db -f /tmp/10_fix_poisoned_categories.sql
+```
+
+Review the "unrecognized document_category" report. If it looks right, take a
+backup, then open the file, uncomment the `UPDATE` block under Step 2, copy it
+back up, and re-run:
+
+```bash
+# Recommended backup before Step 2:
+sudo -u postgres pg_dump -d vlr_db -t vlr_ledger_entries -F c -f /tmp/vlr_ledger_entries_backup.dump
+
+sudo cp 10_fix_poisoned_categories.sql /tmp/
+sudo -u postgres psql -d vlr_db -f /tmp/10_fix_poisoned_categories.sql
+```
+
+**After the UPDATE commits, re-run reconciliation** for every affected case
+(UI "Start Reconciliation") — clearing the column alone does not recompute
+matches, it only lets the next run re-derive categories correctly.

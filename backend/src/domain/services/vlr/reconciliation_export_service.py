@@ -24,6 +24,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+
 
 # ── Colour palette (matches the reference export) ──
 FILL_COMPANY = PatternFill("solid", fgColor="1E88E5")   # blue
@@ -37,23 +39,27 @@ BOLD = Font(bold=True)
 
 
 # ── Match pass → human-readable classification ──
-# Labels are constrained to the reference system's classification taxonomy so
-# the export's "Classification" column values are valid members of that set:
-#   Amount Matched - Recommended, Closing Balance, Date and Amount Matched,
-#   Date and Amount Matched - Recommended, Invoice Number Matched,
-#   Multiple Based on Date, Multiple Based on Invoice Number,
-#   Multiple Based on Invoice Number and Date, Opening Balance,
-#   Payment Matched - Recommended, Reversal Entries, TDS Booked by Party,
-#   Unmatched
+# Taxonomy verified against a real Firmway reconciliation export (see
+# docs/Reconciliation-INOX-*.xlsx). Each pass maps to a distinct Classification
+# so a genuine invoice-number match is never visually indistinguishable from a
+# match that only compared amount + date (the bug that caused an Emcure
+# invoice to appear "matched" against the wrong invoice while showing an
+# exact-match-looking label).
+#
 # pass numbers per MatchPassType: 1 EXACT, 2 TOLERANCE, 3 FUZZY_REFERENCE,
-# 4 ONE_TO_MANY, 5 MANY_TO_ONE, 6 DATE_PROXIMITY
+# 4 ONE_TO_MANY, 5 MANY_TO_ONE, 6 DATE_PROXIMITY, 7 UNMATCHED,
+# 10 AMOUNT_DATE (was mislabeled as EXACT), 11 TDS_GST (was mislabeled as
+# TOLERANCE), 12 TOLERANCE_DATE (was mislabeled as TOLERANCE).
 PASS_CLASSIFICATION: dict[int, str] = {
-    1: "Invoice Number Matched",          # exact match on amount+date+reference(invoice no)
-    2: "Date and Amount Matched",         # tolerance on amount within date window
-    3: "Invoice Number Matched",          # fuzzy match on reference/invoice number
-    4: "Multiple Based on Date",          # one company ↔ many party (subset-sum by date)
-    5: "Multiple Based on Date",          # many company ↔ one party
-    6: "Date and Amount Matched - Recommended",  # date-proximity fallback
+    1: "Invoice Number Matched",                  # amount + date + reference(invoice no) all identical
+    2: "Invoice Number Matched",                  # reference exact, amount within tolerance (small write-off)
+    3: "Partial Invoice Number Matched",          # reference SIMILAR (not exact) — never claim full invoice match
+    4: "Multiple Date and Amount Matched",        # one company ↔ many party (subset-sum by date)
+    5: "Multiple Date and Amount Matched",        # many company ↔ one party
+    6: "Date and Amount Matched - Recommended",   # date-proximity fallback, reference not checked
+    MatchPassType.AMOUNT_DATE: "Date and Amount Matched",              # amount exact, reference NEVER checked
+    MatchPassType.TDS_GST: "Invoice Number Matched",                   # reference similarity >= 0.5 required
+    MatchPassType.TOLERANCE_DATE: "Date Range and Amount Matched",     # neither exact amount nor reference matched
 }
 
 # Match pass → derived rule code (our own taxonomy, prefixed VLR-)
@@ -64,6 +70,9 @@ PASS_RULE_CODE: dict[int, str] = {
     4: "VLR-ONE2MANY-4.0",
     5: "VLR-MANY2ONE-5.0",
     6: "VLR-DATEPROX-6.0",
+    MatchPassType.AMOUNT_DATE: "VLR-AMTDATE-1.5",
+    MatchPassType.TDS_GST: "VLR-TDSGST-2.5",
+    MatchPassType.TOLERANCE_DATE: "VLR-TOLDATE-6.5",
 }
 
 
@@ -73,10 +82,43 @@ def _classification(pass_number: int | None) -> str:
     # Pass 8 = manual link (see manual_link endpoint). Treat as a valid match
     # classification rather than the "Unmatched" fallback.
     if int(pass_number) == 8:
-        return "Invoice Number Matched"
-    if int(pass_number) == 9:
+        return "Manually Matched"
+    if int(pass_number) in (9, 13):
+        # 9 = knock-off (AB) same-side netting, 13 = "Other entry" (SA)
+        # same-side netting — both are entry-intrinsic reversals per the
+        # mapping doc, shown identically as "Reversal Entries".
         return "Reversal Entries"
     return PASS_CLASSIFICATION.get(int(pass_number), "Date and Amount Matched")
+
+
+def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str:
+    """
+    Row-level Status (distinct from Classification). Reconciled unless the
+    match carries a genuine residual difference, in which case Firmway
+    reports the specific reason:
+      - Pass 2/TOLERANCE (reference matched exactly, amount off by a small
+        rounding/write-off amount) -> "Write off / Rounding off"
+      - Pass TDS_GST (amount gap explained by a TDS/GST rate) -> "TDS Booked
+        by Company" or "TDS Booked by Party", whichever side shows the
+        SMALLER absolute amount (i.e. the side that had tax withheld/deducted)
+      - Everything else that matched -> "Reconciled"
+    """
+    if pass_number is None:
+        return ""
+    pn = int(pass_number)
+    if pn in (9, 13):
+        return "Reversal Entries"
+    if pn == 2 and abs(difference) > 0.005:
+        return "Write off / Rounding off"
+    if pn == MatchPassType.TDS_GST:
+        c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
+        p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
+        # The side with the SMALLER absolute amount had tax withheld/deducted
+        # from it, so that side is the one that "booked" the TDS.
+        if c_amt > 0 and p_amt > 0:
+            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+        return "Reconciled"
+    return "Reconciled"
 
 
 def _invoice_number(entry) -> str:
@@ -149,6 +191,13 @@ def _special_classification(entry) -> str | None:
     if dtype == "ab" or "knock" in sig or "reversal" in sig or "reverse" in sig:
         return "Reversal Entries"
 
+    # "Other entry" (SA) rows — per the mapping doc these are internal to
+    # each side and only net against other SA entries on the same side, so
+    # an unmatched one is not a genuine "not booked by X" difference.
+    cat = (getattr(entry, "document_category", "") or "").strip()
+    if dtype == "sa" or cat == "Adjusted":
+        return "Reversal Entries"
+
     # TDS entries (tagged by the transformation pass, or doc type/remark = TDS).
     if getattr(entry, "is_tds", False) or "tds" in sig or dtype in ("tds", "wt"):
         return "TDS Booked by Party"
@@ -163,6 +212,8 @@ def _rule_code(pass_number: int | None) -> str:
         return "VLR-MANUAL-8.0"
     if int(pass_number) == 9:
         return "VLR-REVERSAL-9.0"
+    if int(pass_number) == 13:
+        return "VLR-OTHERENTRY-13.0"
     return PASS_RULE_CODE.get(int(pass_number), "VLR-MATCH")
 
 
@@ -355,7 +406,14 @@ class ReconciliationExportService:
             for i in range(maxlen):
                 c = by_id.get(comp_ids[i]) if i < len(comp_ids) else None
                 p = by_id.get(party_ids[i]) if i < len(party_ids) else None
-                rows.append(self._row(c, p, m, status="Reconciled"))
+                # Status is match-pass-aware (e.g. "Write off / Rounding off"
+                # for small tolerance-matched differences, "TDS Booked by ..."
+                # for TDS/GST gap matches) rather than a blanket "Reconciled".
+                pn = getattr(c or p, "pass_number", None)
+                c_amt = _num(getattr(c, "amount", 0)) if c else 0.0
+                p_amt = _num(getattr(p, "amount", 0)) if p else 0.0
+                row_diff = (c_amt + p_amt) if (c and p) else 0.0
+                rows.append(self._row(c, p, m, status=_status(pn, c, p, row_diff)))
 
         # One-sided (unmatched) entries.
         for e in company_entries:
@@ -376,7 +434,12 @@ class ReconciliationExportService:
             return special
         cat = (getattr(entry, "document_category", "") or "").strip()
         info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
-        return info["company_missing"] if side == "company" else info["party_missing"]
+        # An entry present on ONE side is missing on the OTHER side. Per the
+        # Emcure mapping rules ("If Emcure invoice is open, then invoice is
+        # not booked by vendor"), a company-side (Emcure) open item is
+        # "not booked by Party", and a party-side (vendor) open item is
+        # "not booked by Company".
+        return info["party_missing"] if side == "company" else info["company_missing"]
 
     def _row(self, c, p, match, status: str) -> dict:
         pass_number = getattr(c or p, "pass_number", None)
@@ -546,10 +609,15 @@ class ReconciliationExportService:
         for e in vendor_entries:
             m = entry_match.get(str(e.id))
             pass_number = getattr(e, "pass_number", None)
+            # Party sheet only has one side per row, so the TDS-side
+            # comparison in _status() isn't available here; a plain
+            # "Write off / Rounding off" check (via the match's persisted
+            # difference_amount) is still applied for tolerance matches.
+            row_diff = _num(getattr(m, "difference_amount", 0)) if m else 0.0
             ws.append([
                 str(e.id),
                 str(m.id) if m else "",
-                "Reconciled" if m else self._unmatched_status(e, "party"),
+                _status(pass_number, None, e, row_diff) if m else self._unmatched_status(e, "party"),
                 _classification(pass_number) if m else "Unmatched",
                 "ledger",
                 _fmt_date(getattr(e, "posting_date", None)),
@@ -638,8 +706,11 @@ class ReconciliationExportService:
                 if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                     continue
                 info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
-                label = info["company_missing"] if side == "company" else info["party_missing"]
-                action = info["company_action"] if side == "company" else info["party_action"]
+                # Same side-attribution rule as _unmatched_status: an entry
+                # open on the company side is missing on the party side, and
+                # vice versa (see Emcure mapping rules doc).
+                label = info["party_missing"] if side == "company" else info["company_missing"]
+                action = info["party_action"] if side == "company" else info["company_action"]
                 grp = info["group"]
                 key = (grp, label, action)
                 agg = out.setdefault(key, [Decimal("0"), 0])
