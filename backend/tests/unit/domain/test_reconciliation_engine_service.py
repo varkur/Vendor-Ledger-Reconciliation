@@ -19,6 +19,7 @@ from src.domain.services.vlr.reconciliation_engine_service import (
     LedgerEntryData,
     MatchPassType,
     ReconciliationEngineService,
+    _is_reversal,
 )
 
 
@@ -35,8 +36,17 @@ class FakeLedgerEntry:
     amount: Decimal = Decimal("1000.00")
     posting_date: date = field(default_factory=lambda: date(2024, 3, 15))
     reference_number: str = "REF-001"
+    # NOTE: document_number is derived from reference_number by default (see
+    # make_entry) rather than a fixed literal — the engine's invoice-number
+    # matching key (LedgerEntryData.invoice_number) is computed from
+    # derived_invoice_number/document_number, NOT reference_number, in the
+    # real _to_entry_data_list conversion path used by execute(). A shared
+    # literal default here would make every fake entry resolve to the same
+    # invoice_number regardless of reference_number, causing false matches
+    # in full-execution tests.
     document_number: str = "DOC-001"
     document_type: str = "invoice"
+    derived_invoice_number: str = ""
     match_id: UUID | None = None
     pass_number: int | None = None
     confidence_score: float | None = None
@@ -48,12 +58,20 @@ def make_entry(
     posting_date: date | None = None,
     reference_number: str = "REF-001",
 ) -> FakeLedgerEntry:
-    """Helper to create a fake ledger entry with given attributes."""
+    """Helper to create a fake ledger entry with given attributes.
+
+    document_number is derived from reference_number (not a fixed literal)
+    so that entries with different reference_number values also get
+    different invoice-matching keys once converted via _to_entry_data_list —
+    matching this test file's existing convention of using reference_number
+    as the per-test matchable identifier.
+    """
     return FakeLedgerEntry(
         side=side,
         amount=Decimal(amount),
         posting_date=posting_date or date(2024, 3, 15),
         reference_number=reference_number,
+        document_number=f"DOC-{reference_number}",
     )
 
 
@@ -262,10 +280,15 @@ class TestToleranceMatch:
     def test_tolerance_match_within_threshold(
         self, service: ReconciliationEngineService
     ):
-        """Should match when amount diff <= tolerance and reference matches."""
+        """Should match when amount diff <= tolerance and reference matches.
+
+        Company records payables as negative, vendor records sales as
+        positive for the same invoice (confirmed on real data) — the diff
+        check must compare magnitudes, not the raw signed difference.
+        """
         company = [
             LedgerEntryData(
-                id=uuid4(), amount=Decimal("1005"),
+                id=uuid4(), amount=Decimal("-1005"),
                 posting_date=date(2024, 3, 15), reference_number="REF-001"
             )
         ]
@@ -280,7 +303,7 @@ class TestToleranceMatch:
 
         assert len(pairs) == 1
         assert pairs[0].pass_number == MatchPassType.TOLERANCE
-        assert pairs[0].difference_amount == Decimal("5")
+        assert pairs[0].difference_amount == Decimal("-5")
 
     def test_tolerance_match_exceeds_threshold(
         self, service: ReconciliationEngineService
@@ -1767,6 +1790,8 @@ def _cat_entry(
     reference_number: str = "REF-001",
     document_type: str = "",
     assignment_number: str = "",
+    document_number: str = "",
+    derived_invoice_number: str = "",
 ) -> LedgerEntryData:
     """Helper to build a LedgerEntryData with a document category set."""
     return LedgerEntryData(
@@ -1777,6 +1802,8 @@ def _cat_entry(
         document_type=document_type,
         category=category,
         assignment_number=assignment_number,
+        document_number=document_number,
+        derived_invoice_number=derived_invoice_number,
     )
 
 
@@ -1938,6 +1965,140 @@ class TestReversalBothSides:
         reversal_pairs = [p for p in result.match_pairs if p.pass_number == 9]
         assert len(reversal_pairs) == 1
         assert reversal_pairs[0].reversal_side == "vendor"
+
+
+class TestSuffixedInvoiceReversal:
+    """
+    Bug fix: Emcure reposts a reclassed/reversed invoice under the SAME base
+    invoice number with a "-R", "-RE", or "-Rev" suffix and the opposite sign
+    (e.g. "GJ2501027881-R" = -16755.62 paired with "GJ2501027881-RE" =
+    +16755.62). Confirmed against real DB data pulled from a live case.
+
+    Critically, on real data this suffix lives on `derived_invoice_number`
+    (the CLEAN-derived value from ZUONR/XBLNR/BELNR) — NOT on
+    `document_number`, which is a plain SAP document number with no suffix
+    at all (e.g. "6000009613"). An earlier version of this fix checked
+    document_number/reference_number only, which never matched real data —
+    it only passed against hand-built test fixtures that put the suffix on
+    document_number directly. The real bug this caused: the genuine,
+    un-suffixed invoice sat unmatched while its "-RE" reversal counterpart
+    stole the vendor's match instead.
+    """
+
+    def test_suffixed_pair_nets_within_company_side(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry(
+            "16755.62", "Invoice", document_number="6000009613",
+            derived_invoice_number="GJ2501027881-RE",
+        )
+        cr = _cat_entry(
+            "-16755.62", "Invoice", document_number="6000009614",
+            derived_invoice_number="GJ2501027881-R",
+        )
+        pairs = service._reversal_match([d, cr], side="company")
+        assert len(pairs) == 1
+        assert pairs[0].reversal_side == "company"
+
+    def test_suffix_detection_via_reference_number_too(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("11519", "Invoice", reference_number="GJ2501018033-R")
+        cr = _cat_entry("-11519", "Invoice", reference_number="GJ2501018033-R")
+        pairs = service._reversal_match([d, cr], side="company")
+        assert len(pairs) == 1
+
+    def test_unsuffixed_invoice_not_treated_as_reversal(
+        self, service: ReconciliationEngineService
+    ):
+        """The plain, un-suffixed invoice (e.g. "GJ2501027881") must NOT be
+        swept into same-side netting — it keeps matching cross-side as usual."""
+        plain = _cat_entry(
+            "-16755.62", "Invoice", document_number="7043047546",
+            derived_invoice_number="GJ2501027881",
+        )
+        assert _is_reversal(plain) is False
+
+    def test_unpaired_suffixed_entry_falls_through(
+        self, service: ReconciliationEngineService
+    ):
+        """An unpaired suffixed entry (no opposite-sign counterpart) is left
+        alone by the reversal pass and falls through to normal matching."""
+        lone = _cat_entry(
+            "-17174.51", "Invoice", document_number="6000009613",
+            derived_invoice_number="GJ2501024670-RE",
+        )
+        pairs = service._reversal_match([lone], side="company")
+        assert len(pairs) == 0
+
+    def test_different_base_invoice_not_netted_despite_equal_amount(
+        self, service: ReconciliationEngineService
+    ):
+        """Two DIFFERENT invoices' suffixed legs that happen to cancel out in
+        amount (e.g. a Debit Note leg of one invoice and a TDS leg of an
+        unrelated invoice) must NOT be netted against each other — only
+        same-base-invoice suffix pairs may net. Reproduces the real DB shape:
+        both entries carry a "-Rev" suffix but on different base invoices."""
+        d = _cat_entry(
+            "17174.51", "Debit Note", document_number="7031002318",
+            derived_invoice_number="GJ2501024670-Rev",
+        )
+        unrelated = _cat_entry(
+            "-17174.51", "TDS Adjusted", document_number="9999999999",
+            derived_invoice_number="GJ2501099999-Rev",
+        )
+        pairs = service._reversal_match([d, unrelated], side="company")
+        assert len(pairs) == 0
+
+    @pytest.mark.asyncio
+    async def test_suffixed_reversal_wired_into_full_execution(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Full execute() run: the suffixed pair nets out and never reaches
+        cross-side matching, so it can't steal an unrelated vendor invoice
+        tied on amount/date. Also proves the genuine un-suffixed invoice is
+        the one that ends up matched, not a reversal leg."""
+        case_id = uuid4()
+        c1 = _cat_entry(
+            "16755.62", "Invoice", document_number="6000009613",
+            derived_invoice_number="GJ2501027881-RE",
+            posting_date=date(2024, 3, 10),
+        )
+        c2 = _cat_entry(
+            "-16755.62", "Invoice", document_number="6000009614",
+            derived_invoice_number="GJ2501027881-R",
+            posting_date=date(2024, 3, 10),
+        )
+        genuine = _cat_entry(
+            "-16755.62", "Invoice", document_number="7043047546",
+            derived_invoice_number="GJ2501027881",
+            posting_date=date(2024, 3, 10),
+        )
+        v1 = _cat_entry(
+            "16755.62", "Invoice", document_number="201193",
+            reference_number="GJ2501027881",
+            posting_date=date(2024, 3, 10),
+        )
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c1, c2, genuine]
+            return [v1]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+        result = await service.execute(case_id)
+
+        reversal_pairs = [p for p in result.match_pairs if p.pass_number == 9]
+        assert len(reversal_pairs) == 1
+        assert reversal_pairs[0].reversal_side == "company"
+        assert {reversal_pairs[0].company_entry_id, reversal_pairs[0].vendor_entry_id} == {c1.id, c2.id}
+        # The vendor entry must be matched against the GENUINE invoice, not
+        # consumed by a reversal leg.
+        genuine_pairs = [p for p in result.match_pairs if p.company_entry_id == genuine.id]
+        assert len(genuine_pairs) == 1
+        assert genuine_pairs[0].vendor_entry_id == v1.id
 
 
 class TestOtherEntrySameSideNetting:

@@ -19,6 +19,7 @@ Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 5.8, 5.9, 5.10, 5.11, 5.12, 5.1
 """
 
 import difflib
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -93,6 +94,33 @@ class LedgerEntryData:
     document_type: str = ""
     assignment_number: str = ""
     category: str = ""
+    # The CLEAN-derived invoice number (ZUONR > XBLNR > BELNR fallback, see
+    # DataTransformationService). This is where the "-R"/"-RE"/"-Rev"
+    # reclass/reversal suffix actually lives on real data — NOT on
+    # document_number, which is a plain SAP document number (e.g.
+    # "6000009613") with no suffix at all.
+    derived_invoice_number: str = ""
+    # Best available invoice number for MATCHING purposes: derived_invoice_number
+    # when present and not a synthetic "BAL_ROW_*" placeholder, else
+    # document_number. Confirmed against real data that `reference_number`
+    # on the company (SAP) side is NOT an invoice number at all — it's a
+    # generic cost-center/reference code (e.g. "EP22", "EMHC") shared by
+    # hundreds of unrelated entries. The invoice-number-aware passes
+    # (_exact_match, _tolerance_match, _fuzzy_reference_match) must key off
+    # THIS field, not reference_number, or genuine invoice-number matches
+    # never fire and everything falls through to weaker amount/date passes.
+    invoice_number: str = ""
+
+    def __post_init__(self) -> None:
+        # Callers that construct LedgerEntryData directly without knowledge
+        # of the derived-invoice-number pipeline (tests, ad-hoc scripts)
+        # historically used reference_number as the matchable identifier.
+        # Default invoice_number to reference_number in that case so those
+        # call sites keep working unchanged. Production code always passes
+        # invoice_number explicitly (see _to_entry_data_list), so this
+        # default never fires there.
+        if not self.invoice_number:
+            self.invoice_number = self.reference_number
 
 
 # ── Document-category matching rules (Vendor Ledger Mapping Rules doc) ────
@@ -198,6 +226,26 @@ def _derive_category(document_type: str) -> str:
     return "Unknown"
 
 
+def _best_invoice_number(derived_invoice_number: str, document_number: str) -> str:
+    """
+    Best invoice number for MATCHING: prefer derived_invoice_number (the
+    CLEAN-derived ZUONR/XBLNR/BELNR value), falling back to document_number,
+    skipping synthetic "BAL_ROW_*" placeholders inserted by the file parser
+    for rows with no recognizable invoice column. Mirrors
+    entry_columns.invoice_number()'s fallback so matching and the
+    export/UI agree on what "the invoice number" is for a given entry.
+
+    Deliberately does NOT consider reference_number: on real company (SAP)
+    data, reference_number is a generic cost-center/reference code (e.g.
+    "EP22") shared by hundreds of unrelated entries, never an invoice number.
+    """
+    for candidate in (derived_invoice_number, document_number):
+        candidate = (candidate or "").strip()
+        if candidate and not candidate.startswith("BAL_ROW_"):
+            return candidate
+    return ""
+
+
 def _is_matchable(entry: "LedgerEntryData") -> bool:
     """True when an entry may participate in cross-side matching."""
     return entry.category not in NON_MATCHABLE_CATEGORIES and entry.category != "Adjusted"
@@ -229,11 +277,60 @@ def _categories_compatible(cat_a: str, cat_b: str) -> bool:
     return True
 
 
+_REVERSAL_SUFFIX_RE = re.compile(r"-(RE|REV|R)$", re.IGNORECASE)
+
+
+def _reversal_base_invoice(entry: "LedgerEntryData") -> str:
+    """
+    Base invoice number with the reclass/reversal suffix stripped, e.g.
+    "GJ2501027881-RE" -> "GJ2501027881". Used to require that suffix-based
+    reversal pairs share the SAME base invoice before netting them — pairing
+    purely on "amount happens to cancel" would risk netting two entries that
+    are unrelated other than a coincidental equal-and-opposite amount (e.g.
+    a Debit Note and a TDS Adjusted entry that both happen to be 17174.51).
+    Returns "" when the entry has no suffixed invoice number at all (e.g.
+    AB/Knocking Off entries, which are paired on amount alone per the
+    mapping doc — they don't carry an invoice number concept).
+    """
+    derived = (entry.derived_invoice_number or "").strip()
+    doc_no = (entry.document_number or "").strip()
+    ref_no = (entry.reference_number or "").strip()
+    for candidate in (derived, doc_no, ref_no):
+        if candidate and _REVERSAL_SUFFIX_RE.search(candidate):
+            return _REVERSAL_SUFFIX_RE.sub("", candidate).strip().upper()
+    return ""
+
+
 def _is_reversal(entry: "LedgerEntryData") -> bool:
     """True when an entry is a knock-off / reversal entry (nets within a side)."""
     if entry.category == "Knocking Off":
         return True
-    return (entry.document_type or "").strip().upper() == "AB"
+    if (entry.document_type or "").strip().upper() == "AB":
+        return True
+    # Company-side reclass/reversal convention confirmed against real DB
+    # data: Emcure reposts an invoice under the SAME base invoice number with
+    # a "-R", "-RE", or "-Rev" suffix and the opposite sign (e.g.
+    # "GJ2501027881-R" = -16755.62 paired with "GJ2501027881-RE" = +16755.62).
+    # Critically, this suffix lives on `derived_invoice_number` (the
+    # CLEAN-derived value from ZUONR/XBLNR/BELNR fallback) — NOT on
+    # `document_number`, which is a plain SAP document number with no
+    # suffix (e.g. "6000009613"). Checking document_number/reference_number
+    # here never matches real data; it only ever matched hand-built test
+    # fixtures. The original, un-suffixed invoice keeps its normal Invoice
+    # category and still matches cross-side as usual. An unpaired suffixed
+    # entry (no opposite-sign counterpart at the same amount) simply falls
+    # through to normal matching, same as any other unmatched reversal
+    # candidate.
+    derived = (entry.derived_invoice_number or "").strip()
+    doc_no = (entry.document_number or "").strip()
+    ref_no = (entry.reference_number or "").strip()
+    if (
+        _REVERSAL_SUFFIX_RE.search(derived)
+        or _REVERSAL_SUFFIX_RE.search(doc_no)
+        or _REVERSAL_SUFFIX_RE.search(ref_no)
+    ):
+        return True
+    return False
 
 
 def _is_other_entry(entry: "LedgerEntryData") -> bool:
@@ -830,12 +927,19 @@ class ReconciliationEngineService:
 
         ab_entries = [e for e in entries if _is_reversal(e)]
 
-        # Bucket by absolute amount so we can find opposite-sign counterparts.
-        by_abs: dict[Decimal, list[LedgerEntryData]] = {}
+        # Bucket by (base invoice number, absolute amount) so we can find
+        # opposite-sign counterparts. AB/Knocking-Off entries have no
+        # invoice-number concept (base == ""), so they're bucketed by
+        # amount alone, same as before. Suffix-triggered candidates (e.g.
+        # "GJ2501027881-R" / "-RE") additionally require the SAME base
+        # invoice number, so a Debit Note and an unrelated TDS entry that
+        # merely happen to cancel out in amount are never netted together.
+        by_key: dict[tuple[str, Decimal], list[LedgerEntryData]] = {}
         for e in ab_entries:
-            by_abs.setdefault(abs(e.amount), []).append(e)
+            base = _reversal_base_invoice(e)
+            by_key.setdefault((base, abs(e.amount)), []).append(e)
 
-        for abs_amt, group in by_abs.items():
+        for (_base, abs_amt), group in by_key.items():
             if abs_amt == 0:
                 continue
             debits = [e for e in group if e.amount > 0]
@@ -922,26 +1026,42 @@ class ReconciliationEngineService:
         vendor: list[LedgerEntryData],
     ) -> list[MatchPair]:
         """
-        Match entries where amount, date, and reference_number are identical.
+        Match entries where amount, date, and invoice number are identical.
 
         Requirement 5.2: confidence_score = 1.0 for exact matches.
+
+        Uses `invoice_number` (derived_invoice_number, falling back to
+        document_number), NOT `reference_number` — on real company (SAP)
+        data, reference_number is a generic cost-center/reference code
+        (e.g. "EP22") shared across hundreds of unrelated entries, never an
+        invoice number. Keying off it here meant a genuine invoice-number
+        match could never be recognized as such.
         """
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Build a lookup for vendor entries by (amount, date, reference).
+        # Build a lookup for vendor entries by (amount, date, invoice number).
         # Only matchable entries participate (excludes balances/knock-offs/SA).
         vendor_lookup: dict[tuple, list[LedgerEntryData]] = {}
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
-            key = (v_entry.amount, v_entry.posting_date, v_entry.reference_number)
+            if not v_entry.invoice_number:
+                continue
+            # abs(amount): company records payables as negative, vendor
+            # records sales as positive for the SAME invoice (confirmed on
+            # real data). Without abs() here, no company/vendor pair for the
+            # same invoice could ever match in this pass — they'd always
+            # fall through to the weaker _amount_date_match pass instead.
+            key = (abs(v_entry.amount), v_entry.posting_date, v_entry.invoice_number)
             vendor_lookup.setdefault(key, []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
                 continue
-            key = (c_entry.amount, c_entry.posting_date, c_entry.reference_number)
+            if not c_entry.invoice_number:
+                continue
+            key = (abs(c_entry.amount), c_entry.posting_date, c_entry.invoice_number)
             candidates = vendor_lookup.get(key, [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
@@ -1140,13 +1260,15 @@ class ReconciliationEngineService:
     ) -> list[MatchPair]:
         """
         Match entries where amount difference is within tolerance
-        AND reference numbers match exactly.
+        AND invoice numbers match exactly.
 
         Tolerance can be a percentage (fraction like 0.01 for 1%) applied to
         the company entry amount, or an absolute value if > 1.
 
         Requirement 5.3: Amount within configured Tolerance_Amount
-        and reference numbers match.
+        and invoice numbers match.
+
+        Uses `invoice_number`, NOT `reference_number` — see _exact_match.
         """
         if tolerance <= 0:
             return []
@@ -1157,23 +1279,34 @@ class ReconciliationEngineService:
         # Determine if tolerance is percentage-based (< 1) or absolute (>= 1)
         is_percentage = tolerance < Decimal("1")
 
-        # Build reference lookup for vendor entries (matchable only).
+        # Build invoice-number lookup for vendor entries (matchable only).
         vendor_by_ref: dict[str, list[LedgerEntryData]] = {}
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
-            vendor_by_ref.setdefault(v_entry.reference_number, []).append(v_entry)
+            if not v_entry.invoice_number:
+                continue
+            vendor_by_ref.setdefault(v_entry.invoice_number, []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
                 continue
-            candidates = vendor_by_ref.get(c_entry.reference_number, [])
+            if not c_entry.invoice_number:
+                continue
+            candidates = vendor_by_ref.get(c_entry.invoice_number, [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
                     continue
                 if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
-                diff = abs(c_entry.amount - v_entry.amount)
+                # abs(amount) on both sides: company records payables as
+                # negative, vendor records sales as positive for the SAME
+                # invoice. Without abs() here, diff = |c - v| would compute
+                # the SUM's magnitude instead of the actual amount gap
+                # (e.g. -15498.94 vs 15498.94 -> diff of ~31000, not 0),
+                # so no genuine invoice-number+tolerance match could ever
+                # pass the tolerance check.
+                diff = abs(abs(c_entry.amount) - abs(v_entry.amount))
 
                 # Calculate allowed tolerance
                 if is_percentage:
@@ -1189,7 +1322,7 @@ class ReconciliationEngineService:
                             confidence_score=CONFIDENCE_SCORES[MatchPassType.TOLERANCE],
                             pass_number=MatchPassType.TOLERANCE,
                             matched_amount=c_entry.amount,
-                            difference_amount=c_entry.amount - v_entry.amount,
+                            difference_amount=c_entry.amount + v_entry.amount,
                         )
                     )
                     used_vendor_ids.add(v_entry.id)
@@ -1242,7 +1375,13 @@ class ReconciliationEngineService:
                 if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
 
-                diff = abs(c_entry.amount - v_entry.amount)
+                # abs() on both sides: company records payables as negative,
+                # vendor records sales as positive for the SAME invoice.
+                # Without abs() here, diff would compute the SUM's magnitude
+                # (e.g. -100000 vs 90000 -> ~190000) instead of the actual
+                # TDS/GST gap (~10000), so this pass could never fire on
+                # real opposite-signed data.
+                diff = abs(abs(c_entry.amount) - abs(v_entry.amount))
                 base_amount = max(abs(c_entry.amount), abs(v_entry.amount))
 
                 matched = False
@@ -1262,11 +1401,15 @@ class ReconciliationEngineService:
                         matched = True
 
                 if matched:
-                    # Also verify references have some similarity (>50%)
+                    # Also verify invoice numbers have some similarity (>50%).
+                    # Uses invoice_number, NOT reference_number — see _exact_match.
                     ref_sim = self._reference_similarity(
-                        c_entry.reference_number, v_entry.reference_number
+                        c_entry.invoice_number, v_entry.invoice_number
                     )
-                    if ref_sim >= 0.5 or c_entry.reference_number == v_entry.reference_number:
+                    if ref_sim >= 0.5 or (
+                        c_entry.invoice_number
+                        and c_entry.invoice_number == v_entry.invoice_number
+                    ):
                         pairs.append(
                             MatchPair(
                                 company_entry_id=c_entry.id,
@@ -1274,7 +1417,7 @@ class ReconciliationEngineService:
                                 confidence_score=CONFIDENCE_SCORES[MatchPassType.TDS_GST],
                                 pass_number=MatchPassType.TDS_GST,
                                 matched_amount=c_entry.amount,
-                                difference_amount=c_entry.amount - v_entry.amount,
+                                difference_amount=c_entry.amount + v_entry.amount,
                             )
                         )
                         used_vendor_ids.add(v_entry.id)
@@ -1293,10 +1436,14 @@ class ReconciliationEngineService:
         threshold: float = 0.8,
     ) -> list[MatchPair]:
         """
-        Match entries where amounts are equal but reference numbers have
+        Match entries where amounts are equal but invoice numbers have
         a similarity score above the threshold (default 80%).
 
         Requirement 5.4: Uses difflib.SequenceMatcher for similarity.
+
+        Uses `invoice_number`, NOT `reference_number` — see _exact_match.
+        Buckets by abs(amount): company records payables as negative,
+        vendor records sales as positive for the same invoice.
         """
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
@@ -1307,12 +1454,12 @@ class ReconciliationEngineService:
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
-            vendor_by_amount.setdefault(v_entry.amount, []).append(v_entry)
+            vendor_by_amount.setdefault(abs(v_entry.amount), []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
                 continue
-            candidates = vendor_by_amount.get(c_entry.amount, [])
+            candidates = vendor_by_amount.get(abs(c_entry.amount), [])
             best_match: LedgerEntryData | None = None
             best_score: float = 0.0
 
@@ -1322,7 +1469,7 @@ class ReconciliationEngineService:
                 if not _categories_compatible(c_entry.category, v_entry.category):
                     continue
                 similarity = self._reference_similarity(
-                    c_entry.reference_number, v_entry.reference_number
+                    c_entry.invoice_number, v_entry.invoice_number
                 )
                 if similarity > threshold and similarity > best_score:
                     best_score = similarity
@@ -1956,6 +2103,7 @@ class ReconciliationEngineService:
             category = (getattr(entry, "document_category", "") or "").strip()
             if not category:
                 category = _derive_category(document_type)
+            derived_invoice_number = getattr(entry, "derived_invoice_number", "") or ""
             result.append(
                 LedgerEntryData(
                     id=getattr(entry, "id"),
@@ -1967,6 +2115,10 @@ class ReconciliationEngineService:
                     document_type=document_type,
                     assignment_number=getattr(entry, "assignment_number", "") or "",
                     category=category,
+                    derived_invoice_number=derived_invoice_number,
+                    invoice_number=_best_invoice_number(
+                        derived_invoice_number, getattr(entry, "document_number", "") or ""
+                    ),
                 )
             )
         return result

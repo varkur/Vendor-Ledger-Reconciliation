@@ -860,10 +860,22 @@ async def apply_column_mapping(
                         if cat:
                             entry.document_category = cat
 
-        # Derive invoice/posting date from the mapped header. The mapping page's
-        # "Invoice Date" (invoice_date) is the primary date; an optional separate
-        # "Posting Date" header overrides it when provided.
-        date_header = (mappings.posting_date or mappings.invoice_date or "").strip()
+        # Derive invoice/posting date from the mapped header. "Invoice Date"
+        # (invoice_date) is the PRIMARY reconciliation date — it's the field
+        # the user actively selects on the Map Columns screen (e.g. mapping
+        # it to a "Document Date" column). posting_date is a separate,
+        # auto-detected/saved field that is populated on essentially every
+        # case regardless of what the user intended for Invoice Date — an
+        # earlier version of this code let posting_date win whenever it was
+        # present, which silently overrode the user's explicit Document Date
+        # choice on both sides and skewed match dates by the SAP posting-vs-
+        # document-date gap (confirmed on real data: same invoice dated
+        # 19-Apr on "document date" but 02-May on "posting date" — a 13 day
+        # gap that pushed genuine same-invoice matches into weaker
+        # date-tolerance passes instead of being recognized immediately).
+        # posting_date is now only used as a fallback when invoice_date isn't
+        # mapped at all.
+        date_header = (mappings.invoice_date or mappings.posting_date or "").strip()
         if date_header:
             raw_date = _lookup_raw(entry.raw_data, date_header)
             parsed_date = _parse_date_value(raw_date)
