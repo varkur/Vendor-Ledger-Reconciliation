@@ -581,7 +581,8 @@ class ReconciliationEngineService:
             e for e in vendor_entries if e.id not in matched_vendor_ids
         ]
         tolerance_pairs = self._tolerance_match(
-            available_company, available_vendor, tolerance
+            available_company, available_vendor, tolerance,
+            tds_percentage, gst_percentage,
         )
         for pair in tolerance_pairs:
             matched_company_ids.add(pair.company_entry_id)
@@ -1257,20 +1258,30 @@ class ReconciliationEngineService:
         company: list[LedgerEntryData],
         vendor: list[LedgerEntryData],
         tolerance: Decimal,
+        tds_percentage: Decimal = Decimal("0"),
+        gst_percentage: Decimal = Decimal("0"),
     ) -> list[MatchPair]:
         """
         Match entries where amount difference is within tolerance
         AND invoice numbers match exactly.
 
         Tolerance can be a percentage (fraction like 0.01 for 1%) applied to
-        the company entry amount, or an absolute value if > 1.
+        the company entry amount, or an absolute value if > 1. The allowed
+        gap is ALSO widened to cover a TDS/GST-sized difference (same
+        calculation as _tolerance_date_match) — otherwise a pair with an
+        exact invoice-number AND date match, but a real tax-driven amount
+        gap, fails this pass on amount alone and falls through to the
+        weaker _tolerance_date_match (which doesn't check invoice number at
+        all), reporting a real invoice-number match as the much weaker
+        "Date Range and Amount Matched" classification and losing the TDS
+        signal on the difference entirely.
 
         Requirement 5.3: Amount within configured Tolerance_Amount
         and invoice numbers match.
 
         Uses `invoice_number`, NOT `reference_number` — see _exact_match.
         """
-        if tolerance <= 0:
+        if tolerance <= 0 and tds_percentage <= 0 and gst_percentage <= 0:
             return []
 
         pairs: list[MatchPair] = []
@@ -1278,6 +1289,8 @@ class ReconciliationEngineService:
 
         # Determine if tolerance is percentage-based (< 1) or absolute (>= 1)
         is_percentage = tolerance < Decimal("1")
+        tds_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
 
         # Build invoice-number lookup for vendor entries (matchable only).
         vendor_by_ref: dict[str, list[LedgerEntryData]] = {}
@@ -1308,11 +1321,15 @@ class ReconciliationEngineService:
                 # pass the tolerance check.
                 diff = abs(abs(c_entry.amount) - abs(v_entry.amount))
 
-                # Calculate allowed tolerance
+                # Calculate allowed tolerance, widened to cover a TDS/GST-
+                # sized gap on top of the plain rounding tolerance.
                 if is_percentage:
                     allowed = abs(c_entry.amount) * tolerance
                 else:
                     allowed = tolerance
+                base_amount = max(abs(c_entry.amount), abs(v_entry.amount))
+                tax_allowed = base_amount * max(tds_frac, gst_frac)
+                allowed = max(allowed, tax_allowed)
 
                 if diff <= allowed:
                     pairs.append(

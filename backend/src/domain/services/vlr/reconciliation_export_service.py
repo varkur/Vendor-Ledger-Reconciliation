@@ -109,6 +109,16 @@ def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str
     if pn in (9, 13):
         return "Reversal Entries"
     if pn == 2 and abs(difference) > 0.005:
+        # Pass 2 (_tolerance_match) now covers both small rounding
+        # differences AND TDS/GST-sized gaps on an exact invoice-number
+        # match (widened so those pairs don't fall through to the weaker
+        # amount-only pass 12 and lose their invoice-number classification).
+        # A gap in the TDS/GST range should report as TDS booked, not a
+        # generic write-off — the same side-attribution logic as TDS_GST.
+        c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
+        p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
+        if abs(difference) > 5 and c_amt > 0 and p_amt > 0:
+            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
         return "Write off / Rounding off"
     if pn == MatchPassType.TDS_GST:
         c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0

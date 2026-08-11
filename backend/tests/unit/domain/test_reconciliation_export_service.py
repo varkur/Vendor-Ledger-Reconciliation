@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from src.domain.services.vlr.reconciliation_export_service import (
     ReconciliationExportService,
+    _status,
 )
 
 
@@ -52,3 +53,29 @@ class TestUnmatchedStatusSide:
         entry = FakeEntry(document_category="Opening Balance", document_type="OP")
         status = ReconciliationExportService._unmatched_status(entry, "company")
         assert status == "Opening Balance"
+
+
+class TestPassTwoStatusTdsVsWriteOff:
+    """
+    Bug fix: client reported that for an invoice-number match with a real
+    (non-rounding) amount difference, the difference should be classified
+    under TDS, not shown as a generic write-off. Pass 2 (_tolerance_match)
+    was widened to also match TDS/GST-sized gaps, so its Status must
+    distinguish a genuine TDS-sized gap from a small rounding write-off.
+    """
+
+    def test_small_rounding_gap_is_write_off(self):
+        c_entry = FakeEntry()
+        p_entry = FakeEntry()
+        # A tiny gap (<= 5) stays a rounding write-off, not TDS.
+        result = _status(2, c_entry, p_entry, difference=2.5)
+        assert result == "Write off / Rounding off"
+
+    def test_large_tds_sized_gap_is_tds_booked_by_party(self):
+        c_entry = FakeEntry()
+        c_entry.amount = -29729.22  # type: ignore[attr-defined]
+        p_entry = FakeEntry()
+        p_entry.amount = 31524.0  # type: ignore[attr-defined]
+        result = _status(2, c_entry, p_entry, difference=1794.78)
+        # Company has the SMALLER absolute amount -> company booked the TDS.
+        assert result == "TDS Booked by Company"

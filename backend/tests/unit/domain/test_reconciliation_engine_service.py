@@ -385,6 +385,61 @@ class TestToleranceMatch:
         pairs = service._tolerance_match(company, vendor, Decimal("10"))
         assert len(pairs) == 1
 
+    def test_tolerance_match_widened_for_tds_gap(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Bug fix: an invoice-number-exact, date-exact pair with a real TDS/GST-
+        sized amount gap must still match on invoice number (Pass 2), not
+        fall through to the weaker _tolerance_date_match (which doesn't
+        check invoice number and reported this as "Date Range and Amount
+        Matched" instead of "Invoice Number Matched" — the client's exact
+        complaint: "classification is showing Date Range and Amount Matched
+        even though the invoice number and invoice date are the same").
+        A plain (non-TDS) tolerance of 10 is far too small for this gap, so
+        this only passes because of the TDS-percentage widening.
+        """
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("-29729.22"),
+                posting_date=date(2025, 8, 29), reference_number="GST/0863/2025-26"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("31524"),
+                posting_date=date(2025, 8, 29), reference_number="GST/0863/2025-26"
+            )
+        ]
+
+        pairs = service._tolerance_match(
+            company, vendor, Decimal("10"),
+            tds_percentage=Decimal("0"), gst_percentage=Decimal("6"),
+        )
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.TOLERANCE
+
+    def test_tolerance_match_no_tds_gst_still_gates_on_plain_tolerance(
+        self, service: ReconciliationEngineService
+    ):
+        """Without a TDS/GST percentage configured, a large gap must still
+        NOT match — the widening only applies when tds/gst % is actually set."""
+        company = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("-29729.22"),
+                posting_date=date(2025, 8, 29), reference_number="GST/0863/2025-26"
+            )
+        ]
+        vendor = [
+            LedgerEntryData(
+                id=uuid4(), amount=Decimal("31524"),
+                posting_date=date(2025, 8, 29), reference_number="GST/0863/2025-26"
+            )
+        ]
+
+        pairs = service._tolerance_match(company, vendor, Decimal("10"))
+        assert len(pairs) == 0
+
 
 # ─── Pass 3: Fuzzy Reference Match Tests ──────────────────────────────────────
 
