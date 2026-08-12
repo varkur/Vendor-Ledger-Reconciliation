@@ -17,8 +17,10 @@ from uuid import UUID, uuid4
 from src.domain.services.vlr.reconciliation_engine_service import (
     CONFIDENCE_SCORES,
     LedgerEntryData,
+    MatchPair,
     MatchPassType,
     ReconciliationEngineService,
+    TDS_LINK_PASS,
     _is_reversal,
 )
 
@@ -50,6 +52,8 @@ class FakeLedgerEntry:
     match_id: UUID | None = None
     pass_number: int | None = None
     confidence_score: float | None = None
+    is_tds: bool = False
+    tds_parent_entry_id: UUID | None = None
 
 
 def make_entry(
@@ -1847,6 +1851,8 @@ def _cat_entry(
     assignment_number: str = "",
     document_number: str = "",
     derived_invoice_number: str = "",
+    is_tds: bool = False,
+    tds_parent_entry_id: "UUID | None" = None,
 ) -> LedgerEntryData:
     """Helper to build a LedgerEntryData with a document category set."""
     return LedgerEntryData(
@@ -1859,6 +1865,8 @@ def _cat_entry(
         assignment_number=assignment_number,
         document_number=document_number,
         derived_invoice_number=derived_invoice_number,
+        is_tds=is_tds,
+        tds_parent_entry_id=tds_parent_entry_id,
     )
 
 
@@ -2309,3 +2317,134 @@ class TestOtherCategoryIsWildcard:
         vendor = [_cat_entry("-1000", "Knocking Off", date(2024, 3, 15))]
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 0
+
+
+class TestTdsSequentialLink:
+    """
+    Per the mapping doc: "if vendor has separate tds entry then it get
+    match with in sequence like after Emcure invoice match with vendor
+    invoice then their difference value map with the remaining tds entry of
+    vendor ledger." I.e. match the invoice pair FIRST, then separately link
+    a standalone TDS ledger line to that already-matched pair as a third
+    leg — distinct from _tds_gst_match, which only catches TDS as a single
+    amount gap between two entries, never as its own separate line item.
+    """
+
+    def test_vendor_side_tds_entry_links_to_matched_invoice_pair(
+        self, service: ReconciliationEngineService
+    ):
+        c_invoice = _cat_entry("1000", "Invoice", document_number="C-1")
+        v_invoice = _cat_entry("1000", "Invoice", document_number="V-1")
+        parent_pair = MatchPair(
+            company_entry_id=c_invoice.id,
+            vendor_entry_id=v_invoice.id,
+            confidence_score=1.0,
+            pass_number=MatchPassType.EXACT,
+            matched_amount=Decimal("1000"),
+        )
+        v_tds = _cat_entry(
+            "-100", "TDS Adjusted", document_number="V-TDS-1",
+            is_tds=True, tds_parent_entry_id=v_invoice.id,
+        )
+
+        groups = service._tds_link_match([parent_pair], [c_invoice], [v_tds])
+
+        assert len(groups) == 1
+        g = groups[0]
+        assert g.pass_number == TDS_LINK_PASS
+        assert g.company_entry_ids == [c_invoice.id]
+        assert set(g.vendor_entry_ids) == {v_invoice.id, v_tds.id}
+
+    def test_company_side_tds_entry_links_to_matched_invoice_pair(
+        self, service: ReconciliationEngineService
+    ):
+        c_invoice = _cat_entry("1000", "Invoice", document_number="C-1")
+        v_invoice = _cat_entry("1000", "Invoice", document_number="V-1")
+        parent_pair = MatchPair(
+            company_entry_id=c_invoice.id,
+            vendor_entry_id=v_invoice.id,
+            confidence_score=1.0,
+            pass_number=MatchPassType.EXACT,
+            matched_amount=Decimal("1000"),
+        )
+        c_tds = _cat_entry(
+            "-100", "TDS Adjusted", document_number="C-TDS-1",
+            is_tds=True, tds_parent_entry_id=c_invoice.id,
+        )
+
+        groups = service._tds_link_match([parent_pair], [c_tds], [v_invoice])
+
+        assert len(groups) == 1
+        g = groups[0]
+        assert set(g.company_entry_ids) == {c_invoice.id, c_tds.id}
+        assert g.vendor_entry_ids == [v_invoice.id]
+
+    def test_tds_entry_with_no_matched_parent_is_not_linked(
+        self, service: ReconciliationEngineService
+    ):
+        """A TDS entry whose tds_parent_entry_id doesn't correspond to any
+        already-matched pair must not produce a group."""
+        v_tds = _cat_entry(
+            "-100", "TDS Adjusted", is_tds=True, tds_parent_entry_id=uuid4(),
+        )
+        groups = service._tds_link_match([], [], [v_tds])
+        assert len(groups) == 0
+
+    def test_tds_entry_linked_to_weak_pass_pair_is_not_linked(
+        self, service: ReconciliationEngineService
+    ):
+        """A TDS entry must not attach to a pair from TDS_GST/TOLERANCE_DATE
+        (those passes already used their gap to explain a DIFFERENT,
+        single-amount-gap TDS/GST scenario)."""
+        c_invoice = _cat_entry("1000", "Invoice")
+        v_invoice = _cat_entry("900", "Invoice")
+        weak_pair = MatchPair(
+            company_entry_id=c_invoice.id,
+            vendor_entry_id=v_invoice.id,
+            confidence_score=0.85,
+            pass_number=MatchPassType.TDS_GST,
+            matched_amount=Decimal("1000"),
+        )
+        v_tds = _cat_entry(
+            "-100", "TDS Adjusted", is_tds=True, tds_parent_entry_id=v_invoice.id,
+        )
+        groups = service._tds_link_match([weak_pair], [c_invoice], [v_tds])
+        assert len(groups) == 0
+
+    @pytest.mark.asyncio
+    async def test_tds_link_wired_into_full_execution(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+    ):
+        """Full execute() run: the invoice pair matches (pass 1), then the
+        standalone vendor-side TDS entry is linked to it as a 3-entry group,
+        and the original 2-entry pair is removed so it isn't double-counted."""
+        case_id = uuid4()
+        c_invoice = _cat_entry("1000", "Invoice", document_number="C-1")
+        v_invoice = _cat_entry("1000", "Invoice", document_number="V-1")
+        v_tds = _cat_entry(
+            "-100", "TDS Adjusted", document_number="V-TDS-1",
+            is_tds=True, tds_parent_entry_id=v_invoice.id,
+        )
+
+        def side_effect(cid, side):
+            if side == "company":
+                return [c_invoice]
+            return [v_invoice, v_tds]
+
+        mock_ledger_repo.get_by_case_and_side.side_effect = side_effect
+        result = await service.execute(case_id)
+
+        # The original 2-entry EXACT pair must be gone...
+        exact_pairs = [p for p in result.match_pairs if p.pass_number == MatchPassType.EXACT]
+        assert len(exact_pairs) == 0
+        # ...replaced by a single 3-entry TDS_LINK group.
+        tds_groups = [g for g in result.match_groups if g.pass_number == TDS_LINK_PASS]
+        assert len(tds_groups) == 1
+        assert tds_groups[0].company_entry_ids == [c_invoice.id]
+        assert set(tds_groups[0].vendor_entry_ids) == {v_invoice.id, v_tds.id}
+        # All three entries end up matched, none unmatched.
+        assert c_invoice.id not in result.unmatched_company_ids
+        assert v_invoice.id not in result.unmatched_vendor_ids
+        assert v_tds.id not in result.unmatched_vendor_ids

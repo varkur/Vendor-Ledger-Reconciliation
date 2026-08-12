@@ -78,6 +78,7 @@ CONFIDENCE_SCORES: dict[int, float] = {
     MatchPassType.AMOUNT_DATE: 0.90,
     MatchPassType.TDS_GST: 0.85,
     MatchPassType.TOLERANCE_DATE: 0.70,
+    14: 0.90,  # TDS_LINK_PASS (constant defined further below in this module)
 }
 
 
@@ -110,6 +111,14 @@ class LedgerEntryData:
     # THIS field, not reference_number, or genuine invoice-number matches
     # never fire and everything falls through to weaker amount/date passes.
     invoice_number: str = ""
+    # TDS linking (populated by DataTransformationService.tag_tds_entries,
+    # persisted on LedgerEntryModel). is_tds marks a standalone TDS ledger
+    # line; tds_parent_entry_id points at the (same-side) invoice/reference
+    # entry it was derived from, already computed during transformation —
+    # the reconciliation engine's _tds_link_match pass below just needs to
+    # follow this pointer once the parent has been cross-side matched.
+    is_tds: bool = False
+    tds_parent_entry_id: UUID | None = None
 
     def __post_init__(self) -> None:
         # Callers that construct LedgerEntryData directly without knowledge
@@ -377,6 +386,16 @@ def _date_diff_within_window(
 REVERSAL_PASS = 9
 # Pass number for "Other entry" (SA) same-side netting.
 OTHER_ENTRY_PASS = 13
+# Pass number for the TDS sequential-link pass: an invoice pair is matched
+# cleanly first (full amount, no gap), THEN a separate, standalone TDS
+# ledger line on one side is linked to that already-matched pair as a third
+# leg. Per the mapping doc: "if vendor has separate tds entry then it get
+# match with in sequence like after Emcure invoice match with vendor
+# invoice then their difference value map with the remaining tds entry of
+# vendor ledger." Distinct from TDS_GST (11), which only catches TDS when it
+# shows up as a single amount gap between two entries, not as a separate
+# third TDS line item.
+TDS_LINK_PASS = 14
 
 
 @dataclass
@@ -643,6 +662,41 @@ class ReconciliationEngineService:
             matched_company_ids.add(pair.company_entry_id)
             matched_vendor_ids.add(pair.vendor_entry_id)
             result.match_pairs.append(pair)
+
+        # ─── Pass 0.75 (applied here): TDS Sequential Link ────────────────
+        # Now that invoice pairs are matched (EXACT/TOLERANCE/AMOUNT_DATE),
+        # link any still-unmatched standalone TDS ledger line to its parent
+        # pair (via tds_parent_entry_id, computed during transformation).
+        # A linked pair is promoted from a 2-entry MatchPair into a 3-entry
+        # MatchGroup, so the original pair is removed from match_pairs to
+        # avoid double-counting it once as a pair and again as a group.
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        tds_link_groups = self._tds_link_match(
+            result.match_pairs, available_company, available_vendor
+        )
+        if tds_link_groups:
+            absorbed_pair_ids: set[tuple] = set()
+            for group in tds_link_groups:
+                # The parent pair's ids are the group's ids MINUS the newly
+                # linked TDS entry — reconstruct which original pair this
+                # group absorbed so it can be removed from match_pairs.
+                for cid in group.company_entry_ids:
+                    for vid in group.vendor_entry_ids:
+                        absorbed_pair_ids.add((cid, vid))
+                for cid in group.company_entry_ids:
+                    matched_company_ids.add(cid)
+                for vid in group.vendor_entry_ids:
+                    matched_vendor_ids.add(vid)
+            result.match_pairs = [
+                p for p in result.match_pairs
+                if (p.company_entry_id, p.vendor_entry_id) not in absorbed_pair_ids
+            ]
+            result.match_groups.extend(tds_link_groups)
 
         # ─── Pass 3.5: UTR-based Payment Grouping ─────────────────────────
         # Per mapping doc: combine Emcure's split payment entries sharing the
@@ -1016,6 +1070,84 @@ class ReconciliationEngineService:
                     break
 
         return pairs
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 0.75: TDS Sequential Link (invoice pair matched first, then a
+    # separate standalone TDS ledger line is linked to it as a third leg)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _tds_link_match(
+        self,
+        already_matched_pairs: list[MatchPair],
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+    ) -> list[MatchGroup]:
+        """
+        Link a standalone TDS ledger line to an ALREADY cross-side-matched
+        invoice pair, per the mapping doc's sequential TDS rule: "if vendor
+        has separate tds entry then it get match with in sequence like
+        after Emcure invoice match with vendor invoice then their
+        difference value map with the remaining tds entry of vendor
+        ledger."
+
+        This is distinct from _tds_gst_match (pass 11), which only catches
+        TDS when it shows up as a single amount GAP between two entries —
+        it never handles a TDS amount that exists as its OWN separate line
+        item on one ledger side (a third entry, not baked into either the
+        company or vendor invoice amount).
+
+        DataTransformationService.tag_tds_entries already computes exactly
+        this linkage during transformation (same-side, by reference/document
+        number) and persists it as tds_parent_entry_id — this pass only
+        needs to follow that existing pointer once its parent has been
+        cross-side matched, and turn the pair into a 3-entry group.
+
+        Only considers pairs from passes that leave no unexplained residual
+        amount gap (EXACT/TOLERANCE/AMOUNT_DATE) — TDS_GST/TOLERANCE_DATE
+        pairs already used up their gap explaining a DIFFERENT (single
+        amount-gap) TDS/GST scenario, so re-linking a third TDS line to
+        those would double-count the same tax adjustment.
+        """
+        eligible_passes = {
+            MatchPassType.EXACT, MatchPassType.TOLERANCE, MatchPassType.AMOUNT_DATE,
+        }
+        pair_by_parent_id: dict[UUID, MatchPair] = {}
+        for pair in already_matched_pairs:
+            if pair.pass_number not in eligible_passes:
+                continue
+            pair_by_parent_id[pair.company_entry_id] = pair
+            pair_by_parent_id[pair.vendor_entry_id] = pair
+
+        groups: list[MatchGroup] = []
+        for tds_entry in company + vendor:
+            if not tds_entry.is_tds or tds_entry.tds_parent_entry_id is None:
+                continue
+            parent_pair = pair_by_parent_id.get(tds_entry.tds_parent_entry_id)
+            if parent_pair is None:
+                continue
+            # tds_entry's own side determines which id-list it's appended to;
+            # the parent pair already has one id on each side.
+            is_company_side = any(
+                tds_entry.id == e.id for e in company
+            )
+            company_ids = [parent_pair.company_entry_id] + (
+                [tds_entry.id] if is_company_side else []
+            )
+            vendor_ids = [parent_pair.vendor_entry_id] + (
+                [] if is_company_side else [tds_entry.id]
+            )
+            groups.append(
+                MatchGroup(
+                    company_entry_ids=company_ids,
+                    vendor_entry_ids=vendor_ids,
+                    confidence_score=CONFIDENCE_SCORES[TDS_LINK_PASS],
+                    pass_number=TDS_LINK_PASS,
+                    matched_amount=parent_pair.matched_amount,
+                    difference_amount=tds_entry.amount,
+                )
+            )
+
+        return groups
 
     # ──────────────────────────────────────────────────────────────────────
     # Pass 1: Exact Match
@@ -1900,9 +2032,13 @@ class ReconciliationEngineService:
             ps.match_count += 1
             ps.matched_amount += pair.matched_amount
 
-        # Count from groups (passes 4, 5)
+        # Count from groups (passes 4, 5, plus non-standard passes like
+        # TDS_LINK_PASS=14 that aren't pre-seeded in pass_data above).
         for group in result.match_groups:
-            ps = pass_data[group.pass_number]
+            ps = pass_data.get(group.pass_number)
+            if ps is None:
+                ps = PassStatistics(pass_number=group.pass_number)
+                pass_data[group.pass_number] = ps
             ps.match_count += 1
             ps.matched_amount += group.matched_amount
 
@@ -2043,7 +2179,13 @@ class ReconciliationEngineService:
                 "pass_number": group.pass_number,
                 "match_type": "group",
                 "confidence_score": group.confidence_score,
-                "is_confirmed": False,  # Groups need confirmation (Req 5.11)
+                # Groups generally need confirmation (Req 5.11), EXCEPT
+                # TDS_LINK groups: the underlying pair was already an
+                # auto-accepted EXACT/TOLERANCE/AMOUNT_DATE match, and the
+                # TDS leg is a deterministic, already-computed linkage
+                # (tds_parent_entry_id from transformation), not a
+                # probabilistic combination like one-to-many/many-to-one.
+                "is_confirmed": group.pass_number == TDS_LINK_PASS,
                 "company_entry_ids": [str(cid) for cid in group.company_entry_ids],
                 "vendor_entry_ids": [str(vid) for vid in group.vendor_entry_ids],
                 "matched_amount": float(group.matched_amount),
@@ -2136,6 +2278,8 @@ class ReconciliationEngineService:
                     invoice_number=_best_invoice_number(
                         derived_invoice_number, getattr(entry, "document_number", "") or ""
                     ),
+                    is_tds=bool(getattr(entry, "is_tds", False)),
+                    tds_parent_entry_id=getattr(entry, "tds_parent_entry_id", None),
                 )
             )
         return result

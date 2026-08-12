@@ -125,6 +125,7 @@ _NON_DIFFERENCE_DOC_TYPES = ["AB", "SA"]
 _AUTO_ACCEPTED_PASSES = [
     MatchPassType.EXACT, MatchPassType.TOLERANCE,
     MatchPassType.AMOUNT_DATE, MatchPassType.TDS_GST,
+    14,  # TDS_LINK_PASS — deterministic TDS-entry-to-parent-pair link, auto-accepted
 ]
 _NEEDS_CONFIRMATION_PASSES = [
     MatchPassType.FUZZY_REFERENCE, MatchPassType.ONE_TO_MANY,

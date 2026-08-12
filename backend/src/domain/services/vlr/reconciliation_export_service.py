@@ -88,6 +88,10 @@ def _classification(pass_number: int | None) -> str:
         # same-side netting — both are entry-intrinsic reversals per the
         # mapping doc, shown identically as "Reversal Entries".
         return "Reversal Entries"
+    if int(pass_number) == 14:
+        # TDS Sequential Link: an invoice pair matched cleanly first, then a
+        # separate standalone TDS ledger line linked to it as a third leg.
+        return "Invoice Number Matched"
     return PASS_CLASSIFICATION.get(int(pass_number), "Date and Amount Matched")
 
 
@@ -108,6 +112,15 @@ def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str
     pn = int(pass_number)
     if pn in (9, 13):
         return "Reversal Entries"
+    if pn == 14:
+        # TDS Sequential Link group: exported as 2 rows — the parent
+        # invoice pair row (both c_entry AND p_entry present, no residual
+        # gap -> Reconciled) and the linked TDS leg's own row (only ONE
+        # side present, since the TDS entry has no counterpart on the
+        # other ledger -> attribute to whichever side it's actually on).
+        if c_entry and p_entry:
+            return "Reconciled"
+        return "TDS Booked by Company" if c_entry else "TDS Booked by Party"
     if pn == 2 and abs(difference) > 0.005:
         # Pass 2 (_tolerance_match) now covers both small rounding
         # differences AND TDS/GST-sized gaps on an exact invoice-number
@@ -224,6 +237,8 @@ def _rule_code(pass_number: int | None) -> str:
         return "VLR-REVERSAL-9.0"
     if int(pass_number) == 13:
         return "VLR-OTHERENTRY-13.0"
+    if int(pass_number) == 14:
+        return "VLR-TDSLINK-14.0"
     return PASS_RULE_CODE.get(int(pass_number), "VLR-MATCH")
 
 
@@ -299,6 +314,18 @@ CATEGORY_TO_SUMMARY = {
         "party_missing": "Receipt not booked by Party",
         "company_action": "Company to book the receipt entries",
         "party_action": "Vendor to check the receipt details",
+    },
+    # Unmatched TDS entries (see _special_classification's "TDS Booked by
+    # Party"/"TDS Booked by Company") must roll up under the dedicated
+    # "TDS / TCS Difference" summary group, not "Other Differences" — the
+    # group already exists in group_order below but was never populated
+    # because these entries fell through to DEFAULT_SUMMARY.
+    "TDS Adjusted": {
+        "group": "TDS / TCS Difference",
+        "company_missing": "TDS not booked by Company",
+        "party_missing": "TDS not booked by Party",
+        "company_action": "Company to book the TDS entry",
+        "party_action": "Vendor to book the TDS entry",
     },
 }
 DEFAULT_SUMMARY = {
@@ -411,6 +438,21 @@ class ReconciliationExportService:
                 used.add(cid)
             for vid in party_ids:
                 used.add(vid)
+            # A ONE-TO-MANY/MANY-TO-ONE group has more than one entry on one
+            # side (e.g. 1 company entry <-> 2 vendor entries). _row() below
+            # only ever sees ONE company entry and ONE vendor entry per row
+            # (aligned by index), so its own c_amt+p_amt diff calculation is
+            # meaningless for a group — it's comparing a single leg's amount
+            # against a single leg on the other side, not the GROUP total.
+            # Client-confirmed bug: this produced a nonsense non-zero
+            # "Difference" on a payment-grouped-by-clearing-document match
+            # that actually reconciles to zero as a whole. The match
+            # record's OWN difference_amount (computed correctly across the
+            # full group by _one_to_many_match/_many_to_one_match) is the
+            # true group-level answer — use it for every row of a
+            # multi-entry group instead of recomputing per-row.
+            is_multi_entry_group = len(comp_ids) > 1 or len(party_ids) > 1
+            group_diff = _num(getattr(m, "difference_amount", 0)) if is_multi_entry_group else None
             # Pair rows: align company[i] with party[i]; extras get their own row.
             maxlen = max(len(comp_ids), len(party_ids), 1)
             for i in range(maxlen):
@@ -422,8 +464,10 @@ class ReconciliationExportService:
                 pn = getattr(c or p, "pass_number", None)
                 c_amt = _num(getattr(c, "amount", 0)) if c else 0.0
                 p_amt = _num(getattr(p, "amount", 0)) if p else 0.0
-                row_diff = (c_amt + p_amt) if (c and p) else 0.0
-                rows.append(self._row(c, p, m, status=_status(pn, c, p, row_diff)))
+                row_diff = group_diff if group_diff is not None else (
+                    (c_amt + p_amt) if (c and p) else 0.0
+                )
+                rows.append(self._row(c, p, m, status=_status(pn, c, p, row_diff), row_difference=group_diff))
 
         # One-sided (unmatched) entries.
         for e in company_entries:
@@ -436,11 +480,15 @@ class ReconciliationExportService:
 
     @staticmethod
     def _unmatched_status(entry, side: str) -> str:
-        # Opening/Closing balance and reversal (knock-off) entries are not a
-        # genuine "not booked" reconciliation gap — give them their own status
-        # so they aren't reported as missing on one side.
+        # Opening/Closing balance, reversal (knock-off), and TDS entries are
+        # not a genuine "not booked" reconciliation gap — give them their own
+        # status so they aren't reported as missing on one side. Bug fix: an
+        # unmatched TDS entry's Classification already said "TDS Booked by
+        # Party" (via _special_classification in _row/_classification), but
+        # Status fell through to the generic "Other entry not booked by..."
+        # because this function didn't check for the TDS special case too.
         special = _special_classification(entry)
-        if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
+        if special in ("Opening Balance", "Closing Balance", "Reversal Entries", "TDS Booked by Party"):
             return special
         cat = (getattr(entry, "document_category", "") or "").strip()
         info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
@@ -451,11 +499,18 @@ class ReconciliationExportService:
         # "not booked by Company".
         return info["party_missing"] if side == "company" else info["company_missing"]
 
-    def _row(self, c, p, match, status: str) -> dict:
+    def _row(self, c, p, match, status: str, row_difference: float | None = None) -> dict:
         pass_number = getattr(c or p, "pass_number", None)
         c_amt = _num(getattr(c, "amount", 0)) if c else 0.0
         p_amt = _num(getattr(p, "amount", 0)) if p else 0.0
-        diff = (c_amt + p_amt) if (c and p) else 0.0
+        # row_difference overrides the naive per-row (c_amt + p_amt) calc —
+        # used for multi-entry ONE_TO_MANY/MANY_TO_ONE groups, where a single
+        # row's two entries are not the full picture; the group's own
+        # difference_amount (computed across ALL entries in the group) is
+        # the correct value. See _build_recon_rows.
+        diff = row_difference if row_difference is not None else (
+            (c_amt + p_amt) if (c and p) else 0.0
+        )
         # A row belongs to a match whenever it came from a match record — even
         # if this particular line only carries one side (the "extra" entries of
         # a one-to-many / many-to-one group). Classification and rule must key
@@ -715,7 +770,15 @@ class ReconciliationExportService:
                 special = _special_classification(e)
                 if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                     continue
-                info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
+                # An unmatched TDS entry must roll up under "TDS / TCS
+                # Difference" regardless of its raw document_category (TDS
+                # detection in _special_classification checks is_tds/doc
+                # type/narration, not document_category) — otherwise it fell
+                # through to DEFAULT_SUMMARY ("Other Differences").
+                if special == "TDS Booked by Party":
+                    info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
+                else:
+                    info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
                 # Same side-attribution rule as _unmatched_status: an entry
                 # open on the company side is missing on the party side, and
                 # vice versa (see Emcure mapping rules doc).
