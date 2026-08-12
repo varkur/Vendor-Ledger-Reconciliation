@@ -82,7 +82,7 @@ def _classification(pass_number: int | None) -> str:
     # Pass 8 = manual link (see manual_link endpoint). Treat as a valid match
     # classification rather than the "Unmatched" fallback.
     if int(pass_number) == 8:
-        return "Manually Matched"
+        return "Manually Mapped"
     if int(pass_number) in (9, 13):
         # 9 = knock-off (AB) same-side netting, 13 = "Other entry" (SA)
         # same-side netting — both are entry-intrinsic reversals per the
@@ -105,11 +105,15 @@ def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str
       - Pass TDS_GST (amount gap explained by a TDS/GST rate) -> "TDS Booked
         by Company" or "TDS Booked by Party", whichever side shows the
         SMALLER absolute amount (i.e. the side that had tax withheld/deducted)
+      - Pass 8 (manual link) -> "Manually Mapped" (the reviewer's own
+        selected reason is shown separately in the Remark column)
       - Everything else that matched -> "Reconciled"
     """
     if pass_number is None:
         return ""
     pn = int(pass_number)
+    if pn == 8:
+        return "Manually Mapped"
     if pn in (9, 13):
         return "Reversal Entries"
     if pn == 14:
@@ -533,6 +537,9 @@ class ReconciliationExportService:
             "matched_id": str(match.id) if match else "",
             "status": status,
             "classification": classification,
+            # Reviewer-selected reason for a manual link (pass 8), shown in
+            # the Remark column. Blank for every auto-matched pass.
+            "remark": (getattr(match, "status_reason", "") or "") if match else "",
             "c_stmt": "ledger" if c else "",
             "c_date": _fmt_date(getattr(c, "posting_date", None)) if c else "",
             "c_invno": _invoice_number(c) if c else "",
@@ -601,6 +608,7 @@ class ReconciliationExportService:
         rec[19] = r["difference"]
         rec[20] = r["rule"]
         rec[21] = self._reco_dt
+        rec[22] = r["remark"]              # Remark (reviewer's manual-link reason)
         rec[23] = self._party_code
         # Company-side SAP detail columns (0-indexed against RECON_HEADERS).
         rec[24] = r["c_daybook"]           # Daybook Name

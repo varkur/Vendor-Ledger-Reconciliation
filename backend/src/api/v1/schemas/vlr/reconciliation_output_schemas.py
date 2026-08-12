@@ -124,6 +124,9 @@ class MatchedEntryResponse(BaseModel):
     company_columns: EntryColumns | None = Field(None, description="Full company-side column set")
     party_columns: EntryColumns | None = Field(None, description="Full party-side column set")
     matched_rule: str | None = Field(None, description="Derived rule code for the match")
+    status_reason: str | None = Field(
+        None, description="Reviewer-selected reason (manual links only, see docs/Update Status.xlsx)"
+    )
 
     model_config = {"from_attributes": True}
 

@@ -16,10 +16,13 @@ import { Toast } from 'primereact/toast';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
 import { Tag } from 'primereact/tag';
+import { Dialog } from 'primereact/dialog';
+import { Dropdown } from 'primereact/dropdown';
+import { InputTextarea } from 'primereact/inputtextarea';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
-import { manualLink, LEDGER_COLUMN_DEFS } from '../components/ReconciliationOutput/reconciliationOutputApi';
+import { manualLink, getStatusReasons, LEDGER_COLUMN_DEFS } from '../components/ReconciliationOutput/reconciliationOutputApi';
 import type { EntryColumns } from '../components/ReconciliationOutput/reconciliationOutputApi';
 
 type LedgerSource = 'Company' | 'Party';
@@ -59,6 +62,16 @@ export const LinkUnmatchedPage = () => {
 
   const [selection, setSelection] = useState<UnmatchedRow[]>([]);
   const [isLinking, setIsLinking] = useState(false);
+  const [showReasonDialog, setShowReasonDialog] = useState(false);
+  const [selectedReason, setSelectedReason] = useState<string | null>(null);
+  const [linkNotes, setLinkNotes] = useState('');
+
+  // Fixed list of reasons the reviewer must choose from (docs/Update Status.xlsx).
+  const { data: statusReasons, isLoading: reasonsLoading } = useQuery({
+    queryKey: ['manual-link-status-reasons'],
+    queryFn: getStatusReasons,
+    staleTime: Infinity, // the reason list never changes at runtime
+  });
 
   const { data: companyData, isLoading: companyLoading, refetch: refetchCompany } = useQuery({
     queryKey: ['unmatched-company-link', caseId],
@@ -107,9 +120,24 @@ export const LinkUnmatchedPage = () => {
   );
   const netDiff = companySum + vendorSum; // opposite signs
 
-  const handleLink = async () => {
+  /** "Link Selected" button — opens the mandatory reason-selection dialog
+   * instead of linking immediately. The actual API call happens in
+   * handleConfirmLink once a reason has been chosen. */
+  const handleLink = () => {
     if (selection.length === 0) {
       toast.current?.show({ severity: 'warn', summary: 'Nothing selected', detail: 'Select at least one entry to link.', life: 4000 });
+      return;
+    }
+    setSelectedReason(null);
+    setLinkNotes('');
+    setShowReasonDialog(true);
+  };
+
+  /** Dialog "Confirm Link" button — submits the manual link with the
+   * reviewer's mandatory reason. */
+  const handleConfirmLink = async () => {
+    if (!selectedReason) {
+      toast.current?.show({ severity: 'warn', summary: 'Reason required', detail: 'Select why these entries are being linked.', life: 4000 });
       return;
     }
     setIsLinking(true);
@@ -117,10 +145,13 @@ export const LinkUnmatchedPage = () => {
       const res = await manualLink(
         caseId!,
         companySelection.map((r) => r.id),
-        vendorSelection.map((r) => r.id)
+        vendorSelection.map((r) => r.id),
+        selectedReason,
+        linkNotes || undefined
       );
       toast.current?.show({ severity: 'success', summary: 'Linked', detail: res.message, life: 5000 });
       setSelection([]);
+      setShowReasonDialog(false);
       refetchCompany();
       refetchVendor();
       queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
@@ -229,6 +260,65 @@ export const LinkUnmatchedPage = () => {
           ))}
         </DataTable>
       </div>
+
+      {/* Mandatory reason-selection dialog — a reviewer must select WHY
+          these entries are being linked before the match is created. */}
+      <Dialog
+        header="Reason for Linking"
+        visible={showReasonDialog}
+        onHide={() => setShowReasonDialog(false)}
+        style={{ width: '32rem' }}
+        modal
+      >
+        <p className="text-color-secondary mb-4">
+          Linking {companySelection.length} company + {vendorSelection.length} party
+          entr{companySelection.length + vendorSelection.length === 1 ? 'y' : 'ies'}.
+          Net difference: <strong>{fmt(netDiff)}</strong>
+        </p>
+
+        <label htmlFor="link-reason" className="block font-medium mb-2">
+          Reason <span className="text-red-500">*</span>
+        </label>
+        <Dropdown
+          id="link-reason"
+          value={selectedReason}
+          onChange={(e) => setSelectedReason(e.value)}
+          options={statusReasons ?? []}
+          placeholder={reasonsLoading ? 'Loading reasons...' : 'Select a reason'}
+          disabled={reasonsLoading}
+          filter
+          className="w-full mb-4"
+          aria-required="true"
+        />
+
+        <label htmlFor="link-notes" className="block font-medium mb-2">
+          Notes (optional)
+        </label>
+        <InputTextarea
+          id="link-notes"
+          value={linkNotes}
+          onChange={(e) => setLinkNotes(e.target.value)}
+          rows={3}
+          className="w-full mb-4"
+          placeholder="Any additional context for this manual link..."
+        />
+
+        <div className="flex justify-content-end gap-2">
+          <Button
+            label="Cancel"
+            className="p-button-text"
+            onClick={() => setShowReasonDialog(false)}
+            disabled={isLinking}
+          />
+          <Button
+            label="Confirm Link"
+            icon="pi pi-link"
+            loading={isLinking}
+            disabled={!selectedReason}
+            onClick={handleConfirmLink}
+          />
+        </div>
+      </Dialog>
     </div>
   );
 };

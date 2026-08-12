@@ -29,6 +29,18 @@ import type { ListParams, MatchedItem, MatchType } from './reconciliationOutputA
 interface MatchedItemsTabProps {
   caseId: string;
   editable?: boolean;
+  /**
+   * Pre-applied, non-editable filter to a single manual-link status_reason
+   * (from the "Manually Mapped" Particulars drill-in). When set, the
+   * match-type dropdown and search bar are hidden since the view is already
+   * scoped to one reason.
+   */
+  statusReasonFilter?: string;
+  /**
+   * Show all manual links (pass 8) regardless of reason — used for the
+   * group-level "View" on the "Manually Mapped" Particulars row.
+   */
+  manualOnly?: boolean;
 }
 
 const MATCH_TYPE_OPTIONS = [
@@ -74,7 +86,7 @@ function getConfidenceSeverity(score: number): 'success' | 'warning' | 'danger' 
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabProps) => {
+export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, manualOnly = false }: MatchedItemsTabProps) => {
   const [params, setParams] = useState<ListParams>({
     page: 1,
     page_size: 10,
@@ -96,10 +108,13 @@ export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabPro
     }
   };
 
+  const isReasonScoped = !!statusReasonFilter || manualOnly;
   const { data, isLoading, error, refetch } = useMatchedItems(caseId, {
     ...params,
-    search: searchInput || undefined,
-    match_type: (matchTypeFilter as MatchType) || undefined,
+    search: isReasonScoped ? undefined : (searchInput || undefined),
+    match_type: isReasonScoped ? undefined : ((matchTypeFilter as MatchType) || undefined),
+    status_reason: statusReasonFilter || undefined,
+    manual_only: manualOnly || undefined,
   });
 
   // ─── Event Handlers ──────────────────────────────────────────────────────────
@@ -190,30 +205,36 @@ export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabPro
     <div>
       <Toast ref={toast} />
       {/* Filter Bar */}
-      <div className="flex align-items-center gap-3 mb-3">
-        <div className="em-search-bar">
-          <InputText
-            placeholder="Search by reference..."
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            onKeyDown={onSearchKeyDown}
-            style={{ border: 'none', boxShadow: 'none', width: 200 }}
-            aria-label="Search matched items"
-          />
-          <i className="pi pi-search" />
+      {isReasonScoped ? (
+        <div className="mb-3">
+          <Tag value={statusReasonFilter ? `Reason: ${statusReasonFilter}` : 'All Manually Mapped Entries'} severity="info" />
         </div>
-        <Dropdown
-          value={matchTypeFilter}
-          options={MATCH_TYPE_OPTIONS}
-          onChange={(e) => {
-            setMatchTypeFilter(e.value);
-            setParams((prev) => ({ ...prev, page: 1 }));
-          }}
-          placeholder="Filter by match type"
-          className="w-12rem"
-          aria-label="Filter by match type"
-        />
-      </div>
+      ) : (
+        <div className="flex align-items-center gap-3 mb-3">
+          <div className="em-search-bar">
+            <InputText
+              placeholder="Search by reference..."
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              onKeyDown={onSearchKeyDown}
+              style={{ border: 'none', boxShadow: 'none', width: 200 }}
+              aria-label="Search matched items"
+            />
+            <i className="pi pi-search" />
+          </div>
+          <Dropdown
+            value={matchTypeFilter}
+            options={MATCH_TYPE_OPTIONS}
+            onChange={(e) => {
+              setMatchTypeFilter(e.value);
+              setParams((prev) => ({ ...prev, page: 1 }));
+            }}
+            placeholder="Filter by match type"
+            className="w-12rem"
+            aria-label="Filter by match type"
+          />
+        </div>
+      )}
 
       {/* DataTable */}
       <div className="em-card" style={{ padding: 0 }}>
@@ -235,6 +256,9 @@ export const MatchedItemsTab = ({ caseId, editable = false }: MatchedItemsTabPro
         >
           <Column field="match_type" header="Match Type" sortable body={matchTypeTemplate} style={{ minWidth: '9rem' }} />
           <Column field="matched_rule" header="Matched Rule" style={{ minWidth: '10rem' }} body={(row: MatchedItem) => row.matched_rule || '—'} />
+          {isReasonScoped && (
+            <Column field="status_reason" header="Reason" style={{ minWidth: '12rem' }} body={(row: MatchedItem) => row.status_reason || '—'} />
+          )}
           <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ minWidth: '8rem', textAlign: 'center' }} />
           {LEDGER_COLUMN_DEFS.map((c) => (
             <Column

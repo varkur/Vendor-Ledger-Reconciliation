@@ -31,6 +31,11 @@ class MatchResultModel(BaseModel):
     vendor_entry_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     matched_amount: Mapped[float] = mapped_column(Numeric(15, 2), nullable=False)
     difference_amount: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
+    status_reason: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="Reviewer-selected reason for a manual link (see docs/Update Status.xlsx)",
+    )
 
     # Relationships
     case = relationship("ReconciliationCaseModel", back_populates="match_results")

@@ -50,6 +50,7 @@ from src.api.v1.schemas.vlr.reconciliation_output_schemas import (
 from src.domain.entities.user import User
 from src.domain.services.vlr.entry_columns import build_entry_columns, invoice_number
 from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+from src.domain.services.vlr.status_reasons import STATUS_REASONS, VALID_STATUS_REASONS
 from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
 from src.infrastructure.database.models.vlr.match_result_model import MatchResultModel
 from src.infrastructure.database.models.vlr.reconciliation_case_model import (
@@ -215,6 +216,12 @@ async def get_matched_items(
     sort_by: str = Query("pass_number", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     match_type_filter: str | None = Query(None, description="Filter by match type"),
+    status_reason_filter: str | None = Query(
+        None, description="Filter to manual links (pass 8) with this exact status_reason"
+    ),
+    manual_only: bool = Query(
+        False, description="Filter to all manual links (pass 8), regardless of status_reason"
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> MatchedItemsResponse:
@@ -228,14 +235,34 @@ async def get_matched_items(
     """
     await _verify_case_exists(case_id, session)
 
-    # Build base query: confirmed / auto-accepted matches
-    base_query = select(MatchResultModel).where(
-        and_(
-            MatchResultModel.case_id == str(case_id),
-            MatchResultModel.is_confirmed == True,  # noqa: E712
-            MatchResultModel.pass_number.in_(_AUTO_ACCEPTED_PASSES),
+    # Build base query: confirmed / auto-accepted matches. A status_reason
+    # filter (or manual_only) is only meaningful for manual links (pass 8,
+    # which isn't part of the normal auto-accepted set) — used by the
+    # "Manually Mapped" Particulars drill-in, so swap the pass filter to
+    # pass==8 in that case.
+    if status_reason_filter:
+        base_query = select(MatchResultModel).where(
+            and_(
+                MatchResultModel.case_id == str(case_id),
+                MatchResultModel.pass_number == 8,
+                MatchResultModel.status_reason == status_reason_filter,
+            )
         )
-    )
+    elif manual_only:
+        base_query = select(MatchResultModel).where(
+            and_(
+                MatchResultModel.case_id == str(case_id),
+                MatchResultModel.pass_number == 8,
+            )
+        )
+    else:
+        base_query = select(MatchResultModel).where(
+            and_(
+                MatchResultModel.case_id == str(case_id),
+                MatchResultModel.is_confirmed == True,  # noqa: E712
+                MatchResultModel.pass_number.in_(_AUTO_ACCEPTED_PASSES),
+            )
+        )
 
     if match_type_filter:
         base_query = base_query.where(
@@ -301,6 +328,7 @@ async def get_matched_items(
                 company_columns=EntryColumns(**build_entry_columns(company_entry)) if company_entry else None,
                 party_columns=EntryColumns(**build_entry_columns(vendor_entry)) if vendor_entry else None,
                 matched_rule=_rule_code(match.pass_number),
+                status_reason=match.status_reason,
             )
         )
 
@@ -1203,6 +1231,53 @@ async def get_reconciliation_particulars(
             )
         )
 
+    # ── Manually Mapped section ──
+    # Reviewer-linked entries (pass 8) grouped by the mandatory status_reason
+    # selected at link time (see manual_link / docs/Update Status.xlsx). Each
+    # reason becomes a child row with its own amount total and entry count.
+    manual_res = await session.execute(
+        select(MatchResultModel).where(
+            and_(
+                MatchResultModel.case_id == cid,
+                MatchResultModel.pass_number == 8,
+            )
+        )
+    )
+    manual_matches = list(manual_res.scalars().all())
+
+    if manual_matches:
+        reason_buckets: dict[str, list] = {}
+        for m in manual_matches:
+            reason = m.status_reason or "Unspecified"
+            n_entries = len(m.company_entry_ids or []) + len(m.vendor_entry_ids or [])
+            agg = reason_buckets.setdefault(reason, [Decimal("0"), 0])
+            agg[0] += Decimal(str(_num(m.matched_amount)))
+            agg[1] += n_entries
+
+        manual_children = [
+            ParticularsChild(
+                label=reason,
+                amount=amt,
+                no_of_entries=cnt,
+                side="",
+                document_category="Manually Mapped",
+                view_key="manually_mapped",
+            )
+            for reason, (amt, cnt) in sorted(reason_buckets.items())
+        ]
+        manual_total_amount = sum((c.amount for c in manual_children), Decimal("0"))
+        manual_total_entries = sum((c.no_of_entries for c in manual_children), 0)
+
+        groups.append(
+            ParticularsGroup(
+                label="Manually Mapped",
+                amount=manual_total_amount,
+                no_of_entries=manual_total_entries,
+                view_key="manually_mapped",
+                children=manual_children,
+            )
+        )
+
     return ParticularsSummaryResponse(
         case_id=case_id,
         closing_balance_company=company_closing,
@@ -1441,9 +1516,15 @@ from uuid import uuid4 as _uuid4  # noqa: E402
 
 
 class ManualLinkRequest(_LinkBaseModel):
-    """Request to manually link unmatched company + vendor entries."""
+    """Request to manually link unmatched company + vendor entries.
+
+    status_reason is MANDATORY: the reviewer must select why these two
+    entries are being linked, from the fixed list in
+    docs/Update Status.xlsx (see status_reasons.STATUS_REASONS).
+    """
     company_entry_ids: list[str]
     vendor_entry_ids: list[str]
+    status_reason: str
     notes: str | None = None
 
 
@@ -1452,7 +1533,13 @@ class ManualLinkResponse(_LinkBaseModel):
     company_amount: float
     vendor_amount: float
     difference: float
+    status_reason: str
     message: str
+
+
+class StatusReasonsResponse(_LinkBaseModel):
+    """List of valid reasons a reviewer may select for a manual link."""
+    reasons: list[str]
 
 
 class UnlinkRequest(_LinkBaseModel):
@@ -1483,6 +1570,18 @@ async def manual_link(
 
     if not request.company_entry_ids and not request.vendor_entry_ids:
         raise HTTPException(status_code=400, detail="Select at least one entry to link.")
+
+    reason = (request.status_reason or "").strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422,
+            detail="status_reason is required — select why these entries are being linked.",
+        )
+    if reason not in VALID_STATUS_REASONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{reason}' is not a recognized status reason. See GET /status-reasons for the valid list.",
+        )
 
     # Load and validate the selected entries
     all_ids = request.company_entry_ids + request.vendor_entry_ids
@@ -1529,6 +1628,7 @@ async def manual_link(
         vendor_entry_ids=[str(e.id) for e in vendor_entries],
         matched_amount=float(abs(company_amount) or abs(vendor_amount)),
         difference_amount=float(difference),
+        status_reason=reason,
     )
     session.add(match_record)
 
@@ -1554,6 +1654,7 @@ async def manual_link(
             "company_entries": len(company_entries),
             "vendor_entries": len(vendor_entries),
             "difference": float(difference),
+            "status_reason": reason,
             "notes": request.notes or "",
         },
     ))
@@ -1565,11 +1666,32 @@ async def manual_link(
         company_amount=float(company_amount),
         vendor_amount=float(vendor_amount),
         difference=float(difference),
+        status_reason=reason,
         message=(
             f"Linked {len(company_entries)} company + {len(vendor_entries)} vendor "
             f"entries. Net difference: {float(difference):.2f}"
         ),
     )
+
+
+@router.get(
+    "/status-reasons",
+    response_model=StatusReasonsResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List valid manual-link status reasons",
+    dependencies=[Depends(require_permission("vlr.cases.read"))],
+)
+async def get_status_reasons(
+    current_user: User = Depends(get_current_active_user),
+) -> StatusReasonsResponse:
+    """
+    GET /api/v1/vlr/reconciliation/status-reasons
+
+    Returns the fixed list of reasons a reviewer must choose from when
+    manually linking two unmatched entries (see docs/Update Status.xlsx).
+    Not case-scoped — the list is the same across all cases.
+    """
+    return StatusReasonsResponse(reasons=STATUS_REASONS)
 
 
 @router.post(

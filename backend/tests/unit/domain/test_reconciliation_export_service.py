@@ -43,6 +43,7 @@ class FakeMatch:
     company_entry_ids: list = field(default_factory=list)
     vendor_entry_ids: list = field(default_factory=list)
     difference_amount: float = 0.0
+    status_reason: str | None = None
 
 
 class TestUnmatchedStatusSide:
@@ -106,6 +107,52 @@ class TestPassTwoStatusTdsVsWriteOff:
         result = _status(2, c_entry, p_entry, difference=1794.78)
         # Company has the SMALLER absolute amount -> company booked the TDS.
         assert result == "TDS Booked by Company"
+
+
+class TestManualLinkStatusAndRemark:
+    """
+    Manual-link feature: a reviewer manually pairing two unmatched entries
+    must select a mandatory reason (from docs/Update Status.xlsx). The row's
+    Status should show "Manually Mapped" (not the old "Reconciled" fallback),
+    and the reviewer's selected reason surfaces in the Remark column.
+    """
+
+    def test_pass_8_status_is_manually_mapped(self):
+        c_entry = FakeEntry()
+        p_entry = FakeEntry()
+        result = _status(8, c_entry, p_entry, difference=0.0)
+        assert result == "Manually Mapped"
+
+    def test_pass_8_classification_is_manually_mapped(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        assert _classification(8) == "Manually Mapped"
+
+    def test_remark_shows_reviewer_reason_for_manual_link(self):
+        c1 = FakeEntry(pass_number=8)
+        p1 = FakeEntry(pass_number=8)
+        match = FakeMatch(
+            company_entry_ids=[c1.id], vendor_entry_ids=[p1.id],
+            difference_amount=0.0, status_reason="Invoice Booked And Adjusted",
+        )
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
+
+        assert len(rows) == 1
+        assert rows[0]["remark"] == "Invoice Booked And Adjusted"
+        assert rows[0]["status"] == "Manually Mapped"
+
+    def test_remark_blank_for_auto_matched_rows(self):
+        """Only manual links carry a reason — auto-matched rows (and
+        unmatched rows) show a blank Remark."""
+        c1 = FakeEntry(pass_number=1, amount=1000.0)
+        p1 = FakeEntry(pass_number=1, amount=-1000.0)
+        match = FakeMatch(company_entry_ids=[c1.id], vendor_entry_ids=[p1.id])
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
+
+        assert rows[0]["remark"] == ""
 
 
 class TestMultiEntryGroupDifference:

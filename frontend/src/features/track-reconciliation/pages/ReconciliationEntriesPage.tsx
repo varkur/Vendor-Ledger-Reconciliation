@@ -10,7 +10,7 @@
  * only unmatched, etc.
  */
 
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button } from 'primereact/button';
 
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
@@ -38,6 +38,7 @@ const VIEW_CONFIG: Record<
   'unmatched-vendor': { title: 'Unmatched — Vendor', icon: 'pi pi-users' },
   knocking: { title: 'Knocking Off Entries', icon: 'pi pi-replay' },
   differences: { title: 'Differences Summary', icon: 'pi pi-chart-bar' },
+  'manually-mapped': { title: 'Manually Mapped Entries', icon: 'pi pi-link' },
 };
 
 export const ReconciliationEntriesPage = () => {
@@ -48,6 +49,8 @@ export const ReconciliationEntriesPage = () => {
   }>();
   const navigate = useNavigate();
   const { companyCode } = useSelectedEntity();
+  const [searchParams] = useSearchParams();
+  const statusReason = searchParams.get('status_reason') || undefined;
 
   const config = (view && VIEW_CONFIG[view]) || VIEW_CONFIG.matched;
 
@@ -80,6 +83,15 @@ export const ReconciliationEntriesPage = () => {
         return <UnmatchedVendorTab caseId={caseId} />;
       case 'differences':
         return <DifferencesSummaryTab caseId={caseId} />;
+      case 'manually-mapped':
+        return (
+          <MatchedItemsTab
+            caseId={caseId}
+            editable={canEditLinks}
+            statusReasonFilter={statusReason}
+            manualOnly={!statusReason}
+          />
+        );
       case 'matched':
       default:
         return <MatchedItemsTab caseId={caseId} editable={canEditLinks} />;

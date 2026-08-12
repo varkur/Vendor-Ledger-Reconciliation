@@ -75,6 +75,8 @@ interface ParticularsFlatRow {
   side: string;
   isClosingBalance: boolean;
   isKnocking: boolean;
+  isManuallyMapped: boolean;
+  statusReason?: string;
 }
 
 /** Map an analytics row to its dedicated view slug. */
@@ -88,6 +90,7 @@ function analyticsViewSlug(r: AnalyticsRow): string {
 
 /** Map a particulars row to its dedicated view slug. */
 function particularsViewSlug(r: ParticularsFlatRow): string {
+  if (r.isManuallyMapped) return 'manually-mapped';
   if (r.isKnocking) return 'knocking';
   if (r.isClosingBalance) return 'differences';
   // Company-side lines live in the Unmatched-Company view; party lines in Vendor.
@@ -152,6 +155,7 @@ export const ReconciliationOutputPage = () => {
   (particulars?.groups ?? []).forEach((g, gi) => {
     const groupIsClosing = g.view_key === 'closing_balance' || /closing balance/i.test(g.label);
     const groupIsKnocking = g.view_key === 'knocking' || /knocking/i.test(g.label);
+    const groupIsManuallyMapped = g.view_key === 'manually_mapped' || /manually mapped/i.test(g.label);
     particularsRows.push({
       key: `g-${gi}`,
       label: g.label,
@@ -163,6 +167,7 @@ export const ReconciliationOutputPage = () => {
       side: '',
       isClosingBalance: groupIsClosing,
       isKnocking: groupIsKnocking,
+      isManuallyMapped: groupIsManuallyMapped,
     });
     if (expandedGroups.has(gi)) {
       g.children.forEach((c, ci) => {
@@ -177,6 +182,8 @@ export const ReconciliationOutputPage = () => {
           side: c.side || '',
           isClosingBalance: groupIsClosing,
           isKnocking: groupIsKnocking,
+          isManuallyMapped: groupIsManuallyMapped,
+          statusReason: groupIsManuallyMapped ? c.label : undefined,
         });
       });
     }
@@ -191,6 +198,7 @@ export const ReconciliationOutputPage = () => {
       side: '',
       isClosingBalance: false,
       isKnocking: false,
+      isManuallyMapped: false,
       groupIndex: null,
       hasChildren: false,
     });
@@ -466,7 +474,11 @@ export const ReconciliationOutputPage = () => {
                       <span
                         className="link-view"
                         style={{ color: 'var(--color-primary)', cursor: 'pointer', fontWeight: 600 }}
-                        onClick={() => navigate(`/track-reconciliation/${requestId}/case/${caseId}/view/${particularsViewSlug(r)}`)}
+                        onClick={() => {
+                          const slug = particularsViewSlug(r);
+                          const qs = r.statusReason ? `?status_reason=${encodeURIComponent(r.statusReason)}` : '';
+                          navigate(`/track-reconciliation/${requestId}/case/${caseId}/view/${slug}${qs}`);
+                        }}
                       >
                         View
                       </span>

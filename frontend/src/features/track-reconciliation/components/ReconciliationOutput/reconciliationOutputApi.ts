@@ -116,6 +116,10 @@ export interface ListParams {
   sort_order?: 'asc' | 'desc';
   search?: string;
   match_type?: MatchType;
+  /** Filter to manual links (pass 8) with this exact status_reason. */
+  status_reason?: string;
+  /** Filter to all manual links (pass 8), regardless of status_reason. */
+  manual_only?: boolean;
 }
 
 /** A single matched item entry (Tab 1). */
@@ -131,6 +135,7 @@ export interface MatchedItem {
   document_type: string;
   currency: string;
   matched_rule?: string;
+  status_reason?: string;
   company_columns?: EntryColumns;
   party_columns?: EntryColumns;
 }
@@ -257,7 +262,14 @@ export async function getMatchedItems(
   caseId: string,
   params?: ListParams
 ): Promise<PaginatedResponse<MatchedItem>> {
-  const response = await apiClient.get<any>(`${BASE}/${caseId}/matched`, { params });
+  const { status_reason, manual_only, ...rest } = params ?? {};
+  const response = await apiClient.get<any>(`${BASE}/${caseId}/matched`, {
+    params: {
+      ...rest,
+      status_reason_filter: status_reason || undefined,
+      manual_only: manual_only || undefined,
+    },
+  });
   const items: MatchedItem[] = (response.data.items ?? []).map((it: any) => ({
     id: it.match_id ?? it.id,
     company_reference: it.cl_reference ?? '',
@@ -270,6 +282,7 @@ export async function getMatchedItems(
     document_type: it.document_type ?? '',
     currency: it.currency ?? 'INR',
     matched_rule: it.matched_rule ?? '',
+    status_reason: it.status_reason ?? '',
     company_columns: it.company_columns ?? undefined,
     party_columns: it.party_columns ?? undefined,
   }));
@@ -423,19 +436,46 @@ export interface ManualLinkResponse {
   company_amount: number;
   vendor_amount: number;
   difference: number;
+  status_reason: string;
   message: string;
 }
 
-/** Manually link selected unmatched company + vendor entries. */
+export interface StatusReasonsResponse {
+  reasons: string[];
+}
+
+/**
+ * Fetch the fixed list of reasons a reviewer must choose from when manually
+ * linking two unmatched entries (see docs/Update Status.xlsx). Not
+ * case-scoped — the list is the same across all cases.
+ */
+export async function getStatusReasons(): Promise<string[]> {
+  const { data } = await apiClient.get<StatusReasonsResponse>(
+    `${BASE}/status-reasons`
+  );
+  return data.reasons;
+}
+
+/**
+ * Manually link selected unmatched company + vendor entries.
+ * statusReason is MANDATORY — the reviewer must select why these entries
+ * are being linked (from getStatusReasons()).
+ */
 export async function manualLink(
   caseId: string,
   companyEntryIds: string[],
   vendorEntryIds: string[],
+  statusReason: string,
   notes?: string
 ): Promise<ManualLinkResponse> {
   const { data } = await apiClient.post<ManualLinkResponse>(
     `${BASE}/${caseId}/link`,
-    { company_entry_ids: companyEntryIds, vendor_entry_ids: vendorEntryIds, notes }
+    {
+      company_entry_ids: companyEntryIds,
+      vendor_entry_ids: vendorEntryIds,
+      status_reason: statusReason,
+      notes,
+    }
   );
   return data;
 }

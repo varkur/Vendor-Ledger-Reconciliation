@@ -101,3 +101,17 @@ sudo -u postgres psql -d vlr_db -f /tmp/10_fix_poisoned_categories.sql
 **After the UPDATE commits, re-run reconciliation** for every affected case
 (UI "Start Reconciliation") — clearing the column alone does not recompute
 matches, it only lets the next run re-derive categories correctly.
+
+## Adding the manual-link status_reason column
+
+`11_add_status_reason.sql` adds the `status_reason` column to
+`vlr_match_results`, required by the mandatory-reason manual-link feature
+(Link Unmatched screen). Run it after deploying the corresponding backend
+code:
+
+```bash
+sudo cp 11_add_status_reason.sql /tmp/
+sudo -u postgres psql -d vlr_db -f /tmp/11_add_status_reason.sql
+```
+
+Idempotent — safe to re-run (`ADD COLUMN IF NOT EXISTS`).
