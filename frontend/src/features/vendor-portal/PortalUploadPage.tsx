@@ -41,6 +41,10 @@ export const PortalUploadPage = () => {
   const navigate = useNavigate();
   const { portalToken, caseInfo, isAuthenticated } = usePortalContext();
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  // Once a file has been successfully uploaded/processed, disable the
+  // upload widget entirely (Browse/Upload/Clear) rather than letting the
+  // user immediately queue another file on top of it.
+  const [uploadLocked, setUploadLocked] = useState(false);
   const [isPolling, setIsPolling] = useState(false);
   const [pollingTimedOut, setPollingTimedOut] = useState(false);
   const [processingError, setProcessingError] = useState<string | null>(null);
@@ -128,6 +132,7 @@ export const PortalUploadPage = () => {
 
   const handleUpload = async (event: FileUploadHandlerEvent) => {
     const files = event.files;
+    let anySucceeded = false;
 
     for (const file of files) {
       const fileId = `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -173,6 +178,8 @@ export const PortalUploadPage = () => {
           life: 5000,
         });
 
+        anySucceeded = true;
+
         // If task_id is returned, start polling for reconciliation status
         if (result.task_id) {
           startPolling();
@@ -198,6 +205,17 @@ export const PortalUploadPage = () => {
           life: 8000,
         });
       }
+    }
+
+    // Clear the widget's own pending-file list once processing is done, so
+    // the Browse/Upload/Clear buttons and "Pending" row don't keep showing
+    // a file that's already been processed (visible below in the Uploaded
+    // Files table). The FileUpload component's internal state is otherwise
+    // left untouched after uploadHandler runs.
+    event.options.clear();
+
+    if (anySucceeded) {
+      setUploadLocked(true);
     }
   };
 
@@ -374,6 +392,15 @@ export const PortalUploadPage = () => {
         </div>
       </div>
 
+      {/* Upload locked message — shown once a file has been processed */}
+      {uploadLocked && !(caseInfo && caseInfo.upload_count >= caseInfo.max_uploads) && (
+        <Message
+          severity="success"
+          text="Your statement has been uploaded and processed. Refresh the page if you need to upload a corrected file."
+          className="mb-3 w-full"
+        />
+      )}
+
       {/* Max uploads warning */}
       {caseInfo && caseInfo.upload_count >= caseInfo.max_uploads && (
         <Message
@@ -394,6 +421,7 @@ export const PortalUploadPage = () => {
           maxFileSize={10000000}
           disabled={
             isPending ||
+            uploadLocked ||
             (caseInfo ? caseInfo.upload_count >= caseInfo.max_uploads : false)
           }
           emptyTemplate={

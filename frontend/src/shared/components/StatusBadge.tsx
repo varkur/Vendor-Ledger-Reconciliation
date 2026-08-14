@@ -42,6 +42,10 @@ interface StatusConfig {
  * - danger (red / --color-error): Disputed, Overdue
  */
 const STATUS_CONFIG: Record<string, StatusConfig> = {
+  created: {
+    label: 'Initiated',
+    severity: 'info',
+  },
   requested: {
     label: 'Requested',
     severity: 'info',

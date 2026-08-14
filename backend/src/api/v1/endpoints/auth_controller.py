@@ -169,11 +169,34 @@ async def refresh_token(
     summary="Get current user info",
     description="Returns the authenticated user's profile (no password hash).",
 )
-async def get_me(current_user: User = Depends(get_current_active_user)) -> dict:
-    """GET /api/v1/auth/me - Returns current user info."""
+async def get_me(
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """GET /api/v1/auth/me - Returns current user info.
+
+    `email` is resolved from user_details.email (populated by Darwin AD
+    import / Microsoft SSO) when available, falling back to `username` if
+    it looks like an email address (e.g. users provisioned via Microsoft
+    SSO, where username IS the email).
+    """
+    from src.infrastructure.database.models.user_details_model import UserDetailsModel
+
+    email = ""
+    details_stmt = select(UserDetailsModel.email).where(
+        UserDetailsModel.user_id == current_user.id
+    )
+    details_result = await session.execute(details_stmt)
+    details_email = details_result.scalar_one_or_none()
+    if details_email:
+        email = details_email
+    elif "@" in current_user.username:
+        email = current_user.username
+
     return {
         "id": str(current_user.id),
         "username": current_user.username,
+        "email": email,
         "is_active": current_user.is_active,
     }
 

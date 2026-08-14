@@ -569,6 +569,31 @@ class UploadCompanyLedgerResponse(BaseModel):
     entries_parsed: int
     status: str = Field(default="uploaded", description="Upload processing status")
     message: str = Field(default="", description="Descriptive message")
+    # ── Consolidated multi-vendor ledger split results ─────────────────
+    # Populated when the request has more than one case (i.e. this is a
+    # bulk/multi-vendor request) and the uploaded file was split by PAN /
+    # vendor code across the matching cases. Empty for single-vendor
+    # requests, where all entries simply go to the one case as before.
+    split_by_vendor: bool = Field(
+        default=False,
+        description="Whether the upload was split across multiple vendor cases by PAN/vendor code",
+    )
+    identifier_column: str | None = Field(
+        default=None, description="Header of the column used to identify the vendor per row (PAN or vendor code)",
+    )
+    matched_vendor_count: int = Field(
+        default=0, description="Number of vendors (cases) that received at least one entry",
+    )
+    unmatched_entry_count: int = Field(
+        default=0, description="Number of rows whose PAN/vendor code did not match any vendor on this request",
+    )
+    unmatched_identifiers: list[str] = Field(
+        default_factory=list,
+        description="Sample of distinct PAN/vendor code values from the file that couldn't be matched to a vendor on this request",
+    )
+    invites_sent: int = Field(
+        default=0, description="Number of vendor invite emails auto-sent (only when auto_notify_vendors=true)",
+    )
 
 
 reconciliation_requests_router = APIRouter(
@@ -799,6 +824,15 @@ async def upload_company_ledger(
     request_id: UUID,
     file: UploadFile = File(..., description="Company ledger file (CSV, XLSX, or XLS)"),
     company_code: str = Query(..., min_length=1, description="Company code"),
+    auto_notify_vendors: bool = Query(
+        False,
+        description=(
+            "If true, automatically send a vendor invite email (with portal "
+            "link) to every vendor whose case received entries from this "
+            "upload. Defaults to false — sending stays an explicit, opt-in "
+            "action so nothing changes for existing callers."
+        ),
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> UploadCompanyLedgerResponse:
@@ -806,19 +840,38 @@ async def upload_company_ledger(
     POST /api/v1/vlr/reconciliation-requests/{request_id}/upload-company-ledger
 
     Accepts a company ledger file upload (.csv, .xlsx, .xls), validates it,
-    parses the entries, stores them in the database against the first case of
-    the request, and triggers the data transformation pipeline.
+    and parses the entries.
+
+    - Single-vendor requests (one case): all entries go to that one case,
+      same as before.
+    - Multi-vendor / bulk requests (many cases): the file is treated as a
+      CONSOLIDATED ledger. Each row is assigned to the correct vendor's case
+      by matching a PAN or vendor/party-code column against the PANs/codes
+      of the vendors on this request. Rows that don't match any vendor on
+      the request are reported back as unmatched rather than silently
+      dumped into the first vendor's case.
+
+    Optionally (auto_notify_vendors=true) triggers the existing vendor
+    invite email for every vendor whose case received entries.
 
     Requirements: 11
     """
     import logging
+    import os
 
     from src.domain.exceptions.vlr import FileValidationException
     from src.domain.services.vlr.file_parser_service import FileParserService
+    from src.domain.services.vlr.company_ledger_split_service import (
+        build_split_ledger_csv,
+        detect_identifier_header,
+        normalize_identifier,
+        split_entries_by_identifier,
+    )
     from src.infrastructure.database.models.vlr.ledger_entry_model import LedgerEntryModel
     from src.infrastructure.database.models.vlr.reconciliation_case_model import (
         ReconciliationCaseModel,
     )
+    from src.infrastructure.database.models.vlr.vendor_model import VendorModel
     from src.infrastructure.database.repositories.vlr.request_repository_impl import (
         RequestRepositoryImpl,
     )
@@ -893,24 +946,27 @@ async def upload_company_ledger(
             detail="No valid entries found in the uploaded file.",
         )
 
-    # ─── Find or get the first case for this request ──────────────────────
+    # ─── Get all cases for this request ────────────────────────────────────
     case_stmt = (
         select(ReconciliationCaseModel)
-        .where(ReconciliationCaseModel.request_id == request_id)
+        .where(
+            ReconciliationCaseModel.request_id == request_id,
+            ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+        )
         .order_by(ReconciliationCaseModel.created_date.asc())
-        .limit(1)
     )
     case_result = await session.execute(case_stmt)
-    case = case_result.scalar_one_or_none()
+    all_cases = list(case_result.scalars().all())
 
-    if case is None:
+    if not all_cases:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No cases found for reconciliation request {request_id}.",
         )
 
-    # ─── Save original file headers for column mapping UI ────────────────
-    if result.raw_headers:
+    async def _save_headers_setting(case_id, headers: list[str]) -> None:
+        if not headers:
+            return
         import json as _json
         from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
             SettingRepositoryImpl as _SettingRepoHeaders,
@@ -918,42 +974,144 @@ async def upload_company_ledger(
         _headers_repo = _SettingRepoHeaders(session)
         await _headers_repo.upsert(
             company_code="__global__",
-            key=f"file_headers.{case.id}.company",
-            value=_json.dumps(result.raw_headers),
+            key=f"file_headers.{case_id}.company",
+            value=_json.dumps(headers),
             value_type="json",
             description="Original file headers from company ledger upload",
         )
 
-    # ─── Store ledger entries ─────────────────────────────────────────────
-    for entry in result.entries:
-        ledger_entry = LedgerEntryModel(
-            case_id=case.id,
-            side="company",
-            document_number=entry.document_number,
-            document_type=entry.document_type,
-            reference_number=entry.reference_number,
-            posting_date=entry.posting_date,
-            clearing_date=entry.clearing_date,
-            clearing_document=entry.clearing_document,
-            amount=float(entry.amount),
-            currency=entry.currency,
-            assignment_number=entry.assignment_number,
-            description=entry.description,
-            raw_data=getattr(entry, "raw_data", None),
-            source="upload",
-            created_by=current_user.username,
-            modified_by=current_user.username,
-        )
-        session.add(ledger_entry)
+    def _store_entries(case_id, entries) -> None:
+        for entry in entries:
+            session.add(LedgerEntryModel(
+                case_id=case_id,
+                side="company",
+                document_number=entry.document_number,
+                document_type=entry.document_type,
+                reference_number=entry.reference_number,
+                posting_date=entry.posting_date,
+                clearing_date=entry.clearing_date,
+                clearing_document=entry.clearing_document,
+                amount=float(entry.amount),
+                currency=entry.currency,
+                assignment_number=entry.assignment_number,
+                description=entry.description,
+                raw_data=getattr(entry, "raw_data", None),
+                source="upload",
+                created_by=current_user.username,
+                modified_by=current_user.username,
+            ))
 
-    # ─── Store the ORIGINAL uploaded file bytes (verbatim download) ───────
     from src.api.v1.endpoints.vlr.column_mapping_controller import (
         store_original_ledger_file as _store_original,
     )
-    await _store_original(
-        session, case.id, "company", filename, file_content,
-        modified_by=current_user.username,
-    )
+
+    split_by_vendor = False
+    identifier_column: str | None = None
+    matched_vendor_count = 0
+    unmatched_entry_count = 0
+    unmatched_identifiers: list[str] = []
+    notified_case_ids: list = []
+
+    if len(all_cases) == 1:
+        # ─── Single-vendor request: unchanged behavior ─────────────────
+        case = all_cases[0]
+        await _save_headers_setting(case.id, result.raw_headers)
+        _store_entries(case.id, result.entries)
+        await _store_original(
+            session, case.id, "company", filename, file_content,
+            modified_by=current_user.username,
+        )
+        matched_vendor_count = 1
+        notified_case_ids = [case.id]
+    else:
+        # ─── Multi-vendor / bulk request: split the consolidated ledger ──
+        vendor_ids = [c.vendor_id for c in all_cases]
+        vendor_stmt = select(VendorModel).where(VendorModel.id.in_(vendor_ids))
+        vendor_result = await session.execute(vendor_stmt)
+        vendors_by_id = {v.id: v for v in vendor_result.scalars().all()}
+
+        # Build normalized identifier -> case lookup. Match against BOTH the
+        # vendor's `pan` and `vendor_code` fields regardless of which column
+        # type the file looks like — vendor master data isn't always clean
+        # (e.g. some vendors get onboarded with the PAN value stored in
+        # vendor_code instead of the dedicated pan column). Checking only
+        # one field caused vendors that ARE on this request to be reported
+        # as unmatched.
+        lookup: dict[str, ReconciliationCaseModel] = {}
+        for case in all_cases:
+            vendor = vendors_by_id.get(case.vendor_id)
+            if not vendor:
+                continue
+            if vendor.pan:
+                lookup.setdefault(normalize_identifier(vendor.pan), case)
+            if vendor.vendor_code:
+                lookup.setdefault(normalize_identifier(vendor.vendor_code), case)
+
+        sample_rows = [
+            e.raw_data for e in result.entries[:20] if e.raw_data
+        ]
+        header, id_type = detect_identifier_header(result.raw_headers, sample_rows)
+
+        if header is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "This request has multiple vendors, so the uploaded file "
+                    "must be a consolidated ledger with a PAN or vendor/party "
+                    "code column identifying which vendor each row belongs "
+                    "to. Couldn't automatically detect that column — please "
+                    "add a 'PAN' (or 'Vendor Code') column to the file."
+                ),
+            )
+
+        identifier_column = header
+        split_by_vendor = True
+
+        split_result = split_entries_by_identifier(result.entries, header)
+
+        entries_by_case: dict = {}
+        for key, entries in split_result.grouped.items():
+            case = lookup.get(key)
+            if case is None:
+                unmatched_entry_count += len(entries)
+                if key not in unmatched_identifiers:
+                    unmatched_identifiers.append(key)
+                continue
+            entries_by_case.setdefault(case.id, []).extend(entries)
+
+        unmatched_entry_count += len(split_result.blank_identifier)
+
+        if not entries_by_case:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"None of the rows in '{filename}' matched a vendor on "
+                    f"this request via the '{header}' column. Check that "
+                    "the PAN/vendor code values match the vendors selected "
+                    "for this request."
+                ),
+            )
+
+        for case_id, entries in entries_by_case.items():
+            _store_entries(case_id, entries)
+            notified_case_ids.append(case_id)
+        matched_vendor_count = len(entries_by_case)
+
+        # Save headers + a PER-VENDOR CSV (that vendor's rows only) against
+        # each case that received rows. We deliberately do NOT store the
+        # original consolidated file's raw bytes here — that would contain
+        # every other vendor's rows too, and "Download" would return the
+        # whole ledger instead of just this vendor's slice.
+        for case_id, entries in entries_by_case.items():
+            await _save_headers_setting(case_id, result.raw_headers)
+            split_csv_bytes = build_split_ledger_csv(entries, result.raw_headers)
+            split_filename = f"{os.path.splitext(filename)[0]}_split.csv"
+            await _store_original(
+                session, case_id, "company", split_filename, split_csv_bytes,
+                modified_by=current_user.username,
+            )
+
+        unmatched_identifiers = unmatched_identifiers[:10]
 
     await session.flush()
 
@@ -961,22 +1119,57 @@ async def upload_company_ledger(
     # Reconciliation" (or on vendor portal upload), so no async transformation
     # task is triggered here. The upload itself is complete at this point.
     pipeline_status = "uploaded"
-    message = f"Successfully uploaded {len(result.entries)} entries from '{filename}'."
+    entries_stored = len(result.entries) - unmatched_entry_count
+    if split_by_vendor:
+        message = (
+            f"Split '{filename}' across {matched_vendor_count} vendor(s) "
+            f"using the '{identifier_column}' column "
+            f"({entries_stored} entries matched"
+            + (f", {unmatched_entry_count} unmatched" if unmatched_entry_count else "")
+            + ")."
+        )
+    else:
+        message = f"Successfully uploaded {len(result.entries)} entries from '{filename}'."
 
     logger.info(
-        "Company ledger uploaded: request_id=%s, case_id=%s, entries=%d, file=%s",
+        "Company ledger uploaded: request_id=%s, cases=%d, entries=%d, "
+        "split_by_vendor=%s, unmatched=%d, file=%s",
         request_id,
-        case.id,
-        len(result.entries),
+        matched_vendor_count,
+        entries_stored,
+        split_by_vendor,
+        unmatched_entry_count,
         filename,
     )
+
+    invites_sent = 0
+    if auto_notify_vendors and notified_case_ids:
+        repo2 = RequestRepositoryImpl(session)
+        request_obj = await repo2.get_by_id(request_id, company_code)
+        notify_stmt = select(ReconciliationCaseModel).where(
+            ReconciliationCaseModel.id.in_(notified_case_ids)
+        )
+        notify_result = await session.execute(notify_stmt)
+        notify_cases = list(notify_result.scalars().all())
+        invite_response = await _send_invites_for_cases(
+            session, request_id, company_code, request_obj, notify_cases, [], "",
+        )
+        invites_sent = invite_response.emails_sent
+    else:
+        await session.commit()
 
     return UploadCompanyLedgerResponse(
         request_id=request_id,
         filename=filename,
-        entries_parsed=len(result.entries),
+        entries_parsed=entries_stored,
         status=pipeline_status,
         message=message,
+        split_by_vendor=split_by_vendor,
+        identifier_column=identifier_column,
+        matched_vendor_count=matched_vendor_count,
+        unmatched_entry_count=unmatched_entry_count,
+        unmatched_identifiers=unmatched_identifiers,
+        invites_sent=invites_sent,
     )
 
 
@@ -1008,38 +1201,27 @@ class SendInviteRequest(BaseModel):
     remarks: str = Field(default="", description="Optional remarks/message shown in the invite email")
 
 
-@reconciliation_requests_router.post(
-    "/{request_id}/send-vendor-invites",
-    response_model=SendInviteResponse,
-    summary="Send vendor invite emails with portal links",
-    dependencies=[Depends(require_permission("vlr.requests.write"))],
-)
-async def send_vendor_invites(
+async def _send_invites_for_cases(
+    session: AsyncSession,
     request_id: UUID,
-    company_code: str = Query(..., min_length=1, description="Company code"),
-    body: SendInviteRequest | None = None,
-    current_user: User = Depends(get_current_active_user),
-    session: AsyncSession = Depends(get_db_session),
+    company_code: str,
+    request_obj,
+    cases: list,
+    cc_emails: list[str],
+    remarks: str,
 ) -> SendInviteResponse:
     """
-    POST /api/v1/vlr/reconciliation-requests/{request_id}/send-vendor-invites
+    Shared implementation for sending vendor invite emails to a given list of
+    cases belonging to `request_id`.
 
-    Sends vendor invite emails for all cases in the request. Each vendor's primary
-    contact receives an email with a unique tokenized portal link where they can
-    upload their ledger statement.
-
-    This should be called after the company ledger has been uploaded.
+    Extracted so both the manual "Send Vendor Invites" endpoint and the
+    optional auto-notify path on consolidated ledger upload can reuse the
+    exact same email-building / SMTP logic instead of duplicating it.
     """
     import logging
     from datetime import datetime, timedelta, timezone
 
     from sqlalchemy import select
-    from src.infrastructure.database.models.vlr.reconciliation_case_model import (
-        ReconciliationCaseModel,
-    )
-    from src.infrastructure.database.models.vlr.reconciliation_request_model import (
-        ReconciliationRequestModel,
-    )
     from src.infrastructure.database.models.vlr.vendor_model import VendorModel
     from src.infrastructure.database.models.vlr.vendor_contact_model import VendorContactModel
     from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
@@ -1048,15 +1230,6 @@ async def send_vendor_invites(
     from src.infrastructure.external.email.smtp_provider import SmtpEmailSender
 
     logger = logging.getLogger(__name__)
-
-    # Verify request exists
-    repo = RequestRepositoryImpl(session)
-    request_obj = await repo.get_by_id(request_id, company_code)
-    if request_obj is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Reconciliation request {request_id} not found.",
-        )
 
     # Load email configuration
     setting_repo = SettingRepositoryImpl(session)
@@ -1073,12 +1246,6 @@ async def send_vendor_invites(
     sender_email = await _get_setting("sender_email")
     sender_name = await _get_setting("sender_name")
     use_tls = (await _get_setting("use_tls", "true")).lower() == "true"
-
-    # Additional CC recipients selected in the UI (contact person dropdown).
-    cc_emails = [e.strip() for e in (body.cc_emails if body else []) if e and e.strip()]
-
-    # Optional free-text remarks/message included in each invite email.
-    remarks = (body.remarks if body else "").strip()
 
     # Base URL for the vendor portal link. Resolution order:
     #   1. portal_base_url DB setting
@@ -1117,17 +1284,6 @@ async def send_vendor_invites(
         sender_name=sender_name,
         use_tls=use_tls,
     )
-
-    # Get all cases for this request
-    case_stmt = (
-        select(ReconciliationCaseModel)
-        .where(
-            ReconciliationCaseModel.request_id == request_id,
-            ReconciliationCaseModel.is_deleted == False,  # noqa: E712
-        )
-    )
-    case_result = await session.execute(case_stmt)
-    cases = list(case_result.scalars().all())
 
     if not cases:
         raise HTTPException(
@@ -1302,4 +1458,56 @@ async def send_vendor_invites(
         emails_sent=emails_sent,
         emails_failed=emails_failed,
         details=details,
+    )
+
+
+@reconciliation_requests_router.post(
+    "/{request_id}/send-vendor-invites",
+    response_model=SendInviteResponse,
+    summary="Send vendor invite emails with portal links",
+    dependencies=[Depends(require_permission("vlr.requests.write"))],
+)
+async def send_vendor_invites(
+    request_id: UUID,
+    company_code: str = Query(..., min_length=1, description="Company code"),
+    body: SendInviteRequest | None = None,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> SendInviteResponse:
+    """
+    POST /api/v1/vlr/reconciliation-requests/{request_id}/send-vendor-invites
+
+    Sends vendor invite emails for all cases in the request. Each vendor's primary
+    contact receives an email with a unique tokenized portal link where they can
+    upload their ledger statement.
+
+    This should be called after the company ledger has been uploaded.
+    """
+    from sqlalchemy import select
+    from src.infrastructure.database.models.vlr.reconciliation_case_model import (
+        ReconciliationCaseModel,
+    )
+
+    # Verify request exists
+    repo = RequestRepositoryImpl(session)
+    request_obj = await repo.get_by_id(request_id, company_code)
+    if request_obj is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Reconciliation request {request_id} not found.",
+        )
+
+    # Get all cases for this request
+    case_stmt = select(ReconciliationCaseModel).where(
+        ReconciliationCaseModel.request_id == request_id,
+        ReconciliationCaseModel.is_deleted == False,  # noqa: E712
+    )
+    case_result = await session.execute(case_stmt)
+    cases = list(case_result.scalars().all())
+
+    cc_emails = [e.strip() for e in (body.cc_emails if body else []) if e and e.strip()]
+    remarks = (body.remarks if body else "").strip()
+
+    return await _send_invites_for_cases(
+        session, request_id, company_code, request_obj, cases, cc_emails, remarks,
     )

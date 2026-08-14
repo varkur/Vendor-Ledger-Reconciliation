@@ -18,6 +18,7 @@ from src.api.v1.endpoints.vlr.settings_controller import router as vlr_settings_
 from src.api.v1.endpoints.vlr.sap_pull_controller import router as vlr_sap_pull_router
 from src.api.v1.endpoints.vlr.request_controller import router as vlr_request_router
 from src.api.v1.endpoints.vlr.request_controller import reconciliation_requests_router as vlr_reconciliation_requests_router
+from src.api.v1.endpoints.vlr.consolidated_upload_controller import router as vlr_consolidated_upload_router
 from src.api.v1.endpoints.vlr.case_controller import router as vlr_case_router
 from src.api.v1.endpoints.vlr.exception_controller import router as vlr_exception_router
 from src.api.v1.endpoints.vlr.approval_controller import router as vlr_approval_router
@@ -54,6 +55,7 @@ api_v1_router.include_router(vlr_settings_router)
 api_v1_router.include_router(vlr_sap_pull_router)
 api_v1_router.include_router(vlr_request_router)
 api_v1_router.include_router(vlr_reconciliation_requests_router)
+api_v1_router.include_router(vlr_consolidated_upload_router)
 api_v1_router.include_router(vlr_case_router)
 api_v1_router.include_router(vlr_exception_router)
 api_v1_router.include_router(vlr_approval_router)

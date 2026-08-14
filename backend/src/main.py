@@ -71,6 +71,14 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 # ─── Middleware (order matters: outermost first) ───
+# Starlette applies these in reverse of the order added (each add_middleware
+# call wraps the previous stack), so the FIRST one added ends up as the
+# OUTERMOST layer. We want, from outermost to innermost:
+#   GZip -> CORS -> ExceptionHandler -> CorrelationId -> RequestLogging
+#   -> AuditContext -> RateLimit -> routes
+# so ExceptionHandlerMiddleware sees exceptions raised by everything beneath
+# it (including our own middleware), and returns our structured JSON error
+# envelope instead of Starlette's bare-bones default 500 response.
 app.add_middleware(GZipMiddleware, minimum_size=1024)  # Compress responses > 1KB
 app.add_middleware(
     CORSMiddleware,
@@ -79,6 +87,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(ExceptionHandlerMiddleware)
+app.add_middleware(CorrelationIdMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(AuditContextMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 # ─── Routers ───
 app.include_router(api_v1_router)

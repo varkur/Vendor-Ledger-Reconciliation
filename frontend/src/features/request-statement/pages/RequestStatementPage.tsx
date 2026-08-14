@@ -15,7 +15,7 @@
  * Requirements: 9, 10, 23.3, 25.1, 25.2
  */
 
-import { useState, useCallback, useMemo, useRef } from 'react';
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { InputText } from 'primereact/inputtext';
 import { Dropdown } from 'primereact/dropdown';
@@ -35,6 +35,13 @@ import { useVendorSelection, useCreateStatementRequest, useUploadCompanyLedger }
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import { useQuery } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
+import { useAppSelector } from '@app/store';
+import {
+  previewLedgerUpload,
+  confirmLedgerUpload,
+  discardLedgerUpload,
+  type PreviewLedgerUploadResponse,
+} from '../api/requestStatementApi';
 
 type Step = 'configure' | 'upload';
 
@@ -63,6 +70,7 @@ interface VendorContact {
 
 export const RequestStatementPage = () => {
   const { companyCode } = useSelectedEntity();
+  const { user: loggedInUser } = useAppSelector((state) => state.auth);
   const toast = useRef<Toast>(null);
   const navigate = useNavigate();
   const [currentStep, setCurrentStep] = useState<Step>('configure');
@@ -77,6 +85,16 @@ export const RequestStatementPage = () => {
   const [remarks, setRemarks] = useState('');
   const [selectedVendorIds, setSelectedVendorIds] = useState<string[]>([]);
   const [vendorSearch, setVendorSearch] = useState('');
+
+  // Vendor selection mode: pick vendors manually, or auto-detect them from a
+  // consolidated ledger's PAN/vendor-code column (no request created until
+  // the upload is previewed + confirmed).
+  const [vendorSelectionMode, setVendorSelectionMode] = useState<'manual' | 'auto_detect'>('manual');
+  const [autoDetectRequestId, setAutoDetectRequestId] = useState('');
+  const [ledgerPreview, setLedgerPreview] = useState<PreviewLedgerUploadResponse | null>(null);
+  const [missingVendorsDialogVisible, setMissingVendorsDialogVisible] = useState(false);
+  const [isPreviewingLedger, setIsPreviewingLedger] = useState(false);
+  const [isConfirmingLedger, setIsConfirmingLedger] = useState(false);
 
   // Responder settings
   const [requestOpenItem, setRequestOpenItem] = useState('No');
@@ -126,9 +144,12 @@ export const RequestStatementPage = () => {
 
   const createMutation = useCreateStatementRequest();
 
-  // Upload hook — enabled once request is created (request_id available)
-  const requestId = createMutation.data?.id || '';
-  const { mutateAsync: uploadFile, uploadProgress, isPending: isUploading } = useUploadCompanyLedger(requestId, companyCode);
+  // Upload hook — enabled once request is created (request_id available).
+  // In auto_detect mode there's no request yet at this point; requestId
+  // resolves to the one created by confirmLedgerUpload() instead.
+  const manualRequestId = createMutation.data?.id || '';
+  const requestId = vendorSelectionMode === 'auto_detect' ? autoDetectRequestId : manualRequestId;
+  const { mutateAsync: uploadFile, uploadProgress, isPending: isUploading } = useUploadCompanyLedger(manualRequestId, companyCode);
   const [uploadComplete, setUploadComplete] = useState(false);
 
   // Fetch email templates for dropdowns
@@ -204,16 +225,37 @@ export const RequestStatementPage = () => {
     return [{ label, value: emailConfigData.sender_email }];
   }, [emailConfigData]);
 
-  // "Contact Person" dropdown options from vendor contacts
+  // "Contact Person" dropdown options — the logged-in user is always
+  // offered first (so they can CC themselves without needing a vendor
+  // contact on file), followed by the selected vendor's contacts.
+  const loggedInUserEmail = loggedInUser?.email || (loggedInUser?.username.includes('@') ? loggedInUser.username : '');
+  const SELF_CONTACT_VALUE = loggedInUserEmail ? `self:${loggedInUserEmail}` : '';
   const contactPersonOptions = useMemo(() => {
-    if (!vendorContactsData || vendorContactsData.length === 0) {
-      return [];
+    const options: { label: string; value: string }[] = [];
+    if (loggedInUserEmail) {
+      options.push({
+        label: `${loggedInUserEmail} (Me)`,
+        value: SELF_CONTACT_VALUE,
+      });
     }
-    return vendorContactsData.map((c) => ({
-      label: c.email ? `${c.name} (${c.email})` : c.name,
-      value: c.id,
-    }));
-  }, [vendorContactsData]);
+    if (vendorContactsData && vendorContactsData.length > 0) {
+      options.push(
+        ...vendorContactsData.map((c) => ({
+          label: c.email ? `${c.name} (${c.email})` : c.name,
+          value: c.id,
+        }))
+      );
+    }
+    return options;
+  }, [vendorContactsData, loggedInUserEmail, SELF_CONTACT_VALUE]);
+
+  // Default the Contact Person dropdown to the logged-in user once their
+  // email is available, so it's pre-populated instead of blank.
+  useEffect(() => {
+    if (!contactPerson && SELF_CONTACT_VALUE) {
+      setContactPerson(SELF_CONTACT_VALUE);
+    }
+  }, [contactPerson, SELF_CONTACT_VALUE]);
 
   // "Email Attachment" dropdown options
   const emailAttachmentOptions = useMemo(() => {
@@ -275,13 +317,13 @@ export const RequestStatementPage = () => {
     if (startDate && endDate && startDate >= endDate) {
       errors.endDate = 'End date must be after start date';
     }
-    if (selectedVendorIds.length === 0) {
+    if (vendorSelectionMode === 'manual' && selectedVendorIds.length === 0) {
       errors.vendors = 'At least one vendor must be selected';
     }
 
     setValidationErrors(errors);
     return Object.keys(errors).length === 0;
-  }, [title, startDate, endDate, selectedVendorIds]);
+  }, [title, startDate, endDate, selectedVendorIds, vendorSelectionMode]);
 
   // ─── Handlers ────────────────────────────────────────────────────────────────
   // Build YYYY-MM-DD from the LOCAL calendar date. Using toISOString() here
@@ -297,6 +339,14 @@ export const RequestStatementPage = () => {
 
   const handleSubmit = useCallback(() => {
     if (!validateForm()) return;
+
+    if (vendorSelectionMode === 'auto_detect') {
+      // No request exists yet — vendors (and therefore cases) are only
+      // created once the consolidated ledger is uploaded and confirmed.
+      // Just advance to the upload step.
+      setCurrentStep('upload');
+      return;
+    }
 
     createMutation.mutate(
       {
@@ -318,7 +368,7 @@ export const RequestStatementPage = () => {
     );
   }, [
     validateForm, createMutation, startDate, endDate, title,
-    selectedVendorIds, amountTolerance, tdsMax, gstPercentage,
+    selectedVendorIds, amountTolerance, tdsMax, gstPercentage, vendorSelectionMode, companyCode,
   ]);
 
   const handleVendorFilter = useCallback((e: { filter: string }) => {
@@ -376,16 +426,109 @@ export const RequestStatementPage = () => {
     createMutation.reset();
   }, [createMutation]);
 
+  // ─── Auto-detect (consolidated ledger) upload handlers ──────────────────
+  const handleAutoDetectFileUpload = useCallback(async (file: File) => {
+    setIsPreviewingLedger(true);
+    try {
+      const preview = await previewLedgerUpload(file, {
+        company_code: companyCode,
+        fiscal_year: DEFAULT_FISCAL_YEAR,
+        title: title || undefined,
+        period_start: formatDateToISO(startDate),
+        period_end: formatDateToISO(endDate),
+        tolerance_amount: parseFloat(amountTolerance) || 0,
+        tds_percentage: parseFloat(tdsMax) || 0,
+        gst_percentage: parseFloat(gstPercentage) || 0,
+      });
+      setLedgerPreview(preview);
+
+      if (preview.missing_vendors.length > 0) {
+        setMissingVendorsDialogVisible(true);
+      } else {
+        // No missing vendors — confirm immediately.
+        await handleConfirmLedgerUpload(preview.staging_id);
+      }
+    } catch (error: unknown) {
+      const errorMsg =
+        (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to parse the uploaded ledger. Please check the file and try again.';
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Upload Failed',
+        detail: errorMsg,
+        life: 8000,
+      });
+    } finally {
+      setIsPreviewingLedger(false);
+    }
+  }, [companyCode, title, startDate, endDate, amountTolerance, tdsMax, gstPercentage]);
+
+  const handleConfirmLedgerUpload = useCallback(async (stagingId: string, proceedWithMissing = false) => {
+    setIsConfirmingLedger(true);
+    try {
+      const result = await confirmLedgerUpload(stagingId, proceedWithMissing);
+      setAutoDetectRequestId(result.request_id);
+      setUploadComplete(true);
+      setMissingVendorsDialogVisible(false);
+      toast.current?.show({
+        severity: 'success',
+        summary: 'Request Created',
+        detail:
+          `Created request ${result.request_number || ''} for ${result.matched_vendor_count} vendor(s), ` +
+          `${result.entries_stored} entries loaded.` +
+          (result.skipped_missing_vendor_count > 0
+            ? ` ${result.skipped_missing_vendor_count} vendor(s) skipped (not in vendor master).`
+            : ''),
+        life: 8000,
+      });
+    } catch (error: unknown) {
+      const errorMsg =
+        (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to create the reconciliation request. Please try again.';
+      toast.current?.show({
+        severity: 'error',
+        summary: 'Confirm Failed',
+        detail: errorMsg,
+        life: 8000,
+      });
+    } finally {
+      setIsConfirmingLedger(false);
+    }
+  }, []);
+
+  const handleDiscardLedgerUpload = useCallback(async () => {
+    if (!ledgerPreview) return;
+    try {
+      await discardLedgerUpload(ledgerPreview.staging_id);
+    } catch {
+      // Best-effort — staging rows expire on their own after 24h regardless.
+    }
+    setMissingVendorsDialogVisible(false);
+    setLedgerPreview(null);
+    toast.current?.show({
+      severity: 'info',
+      summary: 'Upload Discarded',
+      detail: 'No request was created. Fix the missing vendors in the vendor master, then re-upload the ledger.',
+      life: 8000,
+    });
+  }, [ledgerPreview]);
+
   const handleSendInvites = useCallback(async () => {
     if (!requestId) return;
     setIsSendingInvites(true);
     try {
-      // Resolve the selected contact-person id to its email, sent as CC so the
+      // Resolve the selected contact-person to its email, sent as CC so the
       // chosen contact is copied alongside the vendor's primary contact.
-      const selectedContact = (vendorContactsData || []).find(
-        (c) => c.id === contactPerson
-      );
-      const ccEmails = selectedContact?.email ? [selectedContact.email] : [];
+      // "self:<email>" means the logged-in user chose themself.
+      let ccEmails: string[] = [];
+      if (contactPerson.startsWith('self:')) {
+        ccEmails = [contactPerson.slice('self:'.length)];
+      } else {
+        const selectedContact = (vendorContactsData || []).find(
+          (c) => c.id === contactPerson
+        );
+        ccEmails = selectedContact?.email ? [selectedContact.email] : [];
+      }
 
       const { data } = await apiClient.post(
         `/vlr/reconciliation-requests/${requestId}/send-vendor-invites`,
@@ -485,6 +628,39 @@ export const RequestStatementPage = () => {
           <div className="em-form-section">
             <div className="em-form-section-title">Vendor Selection</div>
             <div className="grid">
+              <div className="col-12">
+                <label className="block mb-2 font-medium text-sm">How do you want to select vendors?*</label>
+                <div className="flex gap-4 mt-1 mb-3">
+                  <div className="flex align-items-center gap-2">
+                    <RadioButton
+                      inputId="vendorModeManual"
+                      value="manual"
+                      onChange={(e) => setVendorSelectionMode(e.value)}
+                      checked={vendorSelectionMode === 'manual'}
+                    />
+                    <label htmlFor="vendorModeManual">Select vendors manually</label>
+                  </div>
+                  <div className="flex align-items-center gap-2">
+                    <RadioButton
+                      inputId="vendorModeAuto"
+                      value="auto_detect"
+                      onChange={(e) => setVendorSelectionMode(e.value)}
+                      checked={vendorSelectionMode === 'auto_detect'}
+                    />
+                    <label htmlFor="vendorModeAuto">Auto-detect from ledger (PAN / vendor code)</label>
+                  </div>
+                </div>
+                {vendorSelectionMode === 'auto_detect' && (
+                  <Message
+                    severity="info"
+                    className="w-full mb-2"
+                    text="Skip vendor selection — upload the consolidated ledger in the next step and vendors will be detected automatically from the PAN or vendor code column."
+                  />
+                )}
+              </div>
+            </div>
+            {vendorSelectionMode === 'manual' && (
+            <div className="grid">
               <div className="col-12 md:col-8">
                 <label className="block mb-2 font-medium text-sm">Select Vendors*</label>
                 {isVendorError && (
@@ -532,6 +708,7 @@ export const RequestStatementPage = () => {
                 )}
               </div>
             </div>
+            )}
           </div>
 
           {/* Sender Settings */}
@@ -803,10 +980,10 @@ export const RequestStatementPage = () => {
                   options={contactPersonOptions}
                   onChange={(e) => setContactPerson(e.value)}
                   className="w-full"
-                  placeholder={selectedVendorIds.length === 0 ? 'Select vendors first' : 'Select contact'}
-                  disabled={selectedVendorIds.length === 0 || isLoadingContacts}
+                  placeholder="Select contact"
+                  disabled={contactPersonOptions.length === 0 || isLoadingContacts}
                   loading={isLoadingContacts}
-                  emptyMessage={selectedVendorIds.length === 0 ? 'Select vendors first' : 'No contacts found'}
+                  emptyMessage={selectedVendorIds.length === 0 ? 'Select vendors to see vendor contacts' : 'No contacts found'}
                 />
                 {isLoadingContacts && (
                   <small className="text-color-secondary">
@@ -843,7 +1020,165 @@ export const RequestStatementPage = () => {
         </div>
       )}
 
-      {currentStep === 'upload' && (
+      {currentStep === 'upload' && vendorSelectionMode === 'auto_detect' && (
+        <div>
+          <div className="em-form-section">
+            <div className="em-form-section-title">Upload Consolidated Ledger*</div>
+            <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+              From {startDate ? startDate.toLocaleDateString('en-GB') : 'DD-MM-YYYY'} To {endDate ? endDate.toLocaleDateString('en-GB') : 'DD-MM-YYYY'}
+              {' '}— vendors will be detected automatically from the PAN / vendor code column.
+            </p>
+
+            {(isPreviewingLedger || isConfirmingLedger) && (
+              <div className="mt-3 mb-3 flex align-items-center gap-2">
+                <ProgressSpinner style={{ width: '20px', height: '20px' }} strokeWidth="4" />
+                <span className="text-sm">
+                  {isPreviewingLedger ? 'Parsing ledger and matching vendors...' : 'Creating request...'}
+                </span>
+              </div>
+            )}
+
+            {!uploadComplete && (
+              <div className="mt-4">
+                <FileUpload
+                  name="consolidatedLedger"
+                  customUpload
+                  uploadHandler={async (event: FileUploadHandlerEvent) => {
+                    const file = event.files[0];
+                    if (!file) return;
+                    await handleAutoDetectFileUpload(file);
+                  }}
+                  accept=".xlsx,.xls,.csv"
+                  maxFileSize={52428800}
+                  disabled={isPreviewingLedger || isConfirmingLedger}
+                  emptyTemplate={
+                    <div className="flex flex-column align-items-center p-4">
+                      <i
+                        className="pi pi-cloud-upload"
+                        style={{ fontSize: '3rem', color: 'var(--color-text-muted)' }}
+                      />
+                      <p style={{ color: 'var(--color-text-muted)', margin: '12px 0 0' }}>
+                        Drag and drop the consolidated ledger here, or click to browse
+                      </p>
+                      <p style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+                        Must include a PAN or Vendor Code column | .xlsx, .xls, .csv | Max size: 50MB
+                      </p>
+                    </div>
+                  }
+                  chooseLabel="Browse File"
+                  uploadLabel="Upload"
+                  cancelLabel="Clear"
+                />
+              </div>
+            )}
+
+            {/* Success — prompt to send vendor invites (same as manual flow) */}
+            {uploadComplete && requestId && !inviteSent && (
+              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--blue-50, #eff6ff)', borderRadius: 'var(--radius-md)', border: '1px solid var(--blue-200, #bfdbfe)' }}>
+                <i className="pi pi-envelope" style={{ fontSize: '1.5rem', color: 'var(--blue-500)' }} />
+                <div className="flex-1">
+                  <p className="m-0 font-medium">Request created from consolidated ledger</p>
+                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+                    Click "Send Vendor Invite" to email each detected vendor a link to upload their statement.
+                  </p>
+                </div>
+                <Button
+                  label="Send Vendor Invite"
+                  icon="pi pi-send"
+                  loading={isSendingInvites}
+                  onClick={handleSendInvites}
+                />
+              </div>
+            )}
+
+            {inviteSent && requestId && (
+              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--green-50, #f0fdf4)', borderRadius: 'var(--radius-md)', border: '1px solid var(--green-200, #bbf7d0)' }}>
+                <i className="pi pi-check-circle" style={{ fontSize: '1.5rem', color: 'var(--green-500)' }} />
+                <div className="flex-1">
+                  <p className="m-0 font-medium">Vendor invite sent successfully</p>
+                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+                    The vendor(s) have been emailed a unique link to upload their statement. You can track progress in Track Reconciliation.
+                  </p>
+                </div>
+                <Button
+                  label="View Reconciliation"
+                  icon="pi pi-arrow-right"
+                  iconPos="right"
+                  onClick={() => navigate(`/track-reconciliation/${requestId}`)}
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-content-end gap-3 mt-4">
+            <Button label="Back" className="p-button-outlined" onClick={() => setCurrentStep('configure')} />
+          </div>
+        </div>
+      )}
+
+      {/* Missing Vendors Confirmation Dialog */}
+      <Dialog
+        header="Some vendors in the ledger are not in the vendor master"
+        visible={missingVendorsDialogVisible}
+        onHide={handleDiscardLedgerUpload}
+        style={{ width: '600px' }}
+        modal
+        closable={!isConfirmingLedger}
+        footer={
+          <div className="flex justify-content-end gap-2">
+            <Button
+              label="Fix Vendor Master First"
+              className="p-button-outlined"
+              onClick={handleDiscardLedgerUpload}
+              disabled={isConfirmingLedger}
+            />
+            <Button
+              label={`Proceed with ${ledgerPreview?.matched_vendors.length ?? 0} Matched Vendor(s)`}
+              severity="warning"
+              loading={isConfirmingLedger}
+              disabled={isConfirmingLedger}
+              onClick={() => ledgerPreview && handleConfirmLedgerUpload(ledgerPreview.staging_id, true)}
+            />
+          </div>
+        }
+      >
+        {ledgerPreview && (
+          <div>
+            <p>
+              The uploaded ledger (<strong>{ledgerPreview.filename}</strong>) contains{' '}
+              <strong>{ledgerPreview.missing_vendors.length}</strong> PAN/vendor code value(s) that don't
+              match any vendor in your master data. These rows can't be reconciled until the corresponding
+              vendors are added.
+            </p>
+            <div style={{ maxHeight: '220px', overflowY: 'auto', border: '1px solid var(--surface-border)', borderRadius: '6px' }}>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr style={{ background: 'var(--surface-100, #f5f5f5)' }}>
+                    <th className="text-left p-2">Identifier ({ledgerPreview.identifier_column})</th>
+                    <th className="text-right p-2">Entries</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ledgerPreview.missing_vendors.map((mv) => (
+                    <tr key={mv.identifier_value}>
+                      <td className="p-2">{mv.identifier_value}</td>
+                      <td className="p-2 text-right">{mv.entry_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-3 mb-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
+              <strong>{ledgerPreview.matched_vendors.length}</strong> vendor(s) matched successfully and
+              can proceed now. Choose "Proceed" to create the request for just those vendors (the rows
+              above will be skipped), or "Fix Vendor Master First" to discard this upload and add the
+              missing vendors before re-uploading.
+            </p>
+          </div>
+        )}
+      </Dialog>
+
+      {currentStep === 'upload' && vendorSelectionMode === 'manual' && (
         <div>
           <div className="em-form-section">
             <div className="em-form-section-title">Upload Ledger*</div>
@@ -882,14 +1217,29 @@ export const RequestStatementPage = () => {
                   }
 
                   try {
-                    await uploadFile(file);
+                    const uploadResult = await uploadFile(file);
                     setUploadComplete(true);
-                    toast.current?.show({
-                      severity: 'success',
-                      summary: 'Upload Complete',
-                      detail: `${file.name} uploaded successfully. You can now track reconciliation.`,
-                      life: 5000,
-                    });
+                    if (uploadResult.split_by_vendor) {
+                      const unmatched = uploadResult.unmatched_entry_count || 0;
+                      toast.current?.show({
+                        severity: unmatched > 0 ? 'warn' : 'success',
+                        summary: 'Consolidated Ledger Split',
+                        detail:
+                          `Matched ${uploadResult.matched_vendor_count ?? 0} vendor(s) via ` +
+                          `'${uploadResult.identifier_column}'.` +
+                          (unmatched > 0
+                            ? ` ${unmatched} row(s) could not be matched to a vendor on this request.`
+                            : ''),
+                        life: 8000,
+                      });
+                    } else {
+                      toast.current?.show({
+                        severity: 'success',
+                        summary: 'Upload Complete',
+                        detail: `${file.name} uploaded successfully. You can now track reconciliation.`,
+                        life: 5000,
+                      });
+                    }
                   } catch (error: unknown) {
                     const errorMsg =
                       (error as { response?: { data?: { detail?: string } } })?.response?.data
