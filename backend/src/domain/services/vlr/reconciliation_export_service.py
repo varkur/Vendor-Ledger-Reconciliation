@@ -232,6 +232,59 @@ def _special_classification(entry) -> str | None:
     return None
 
 
+def _has_reversal_doc_marker(c, p) -> bool:
+    """
+    True when either side's invoice number literally reads like a reversal
+    placeholder (e.g. "Reversal Doc"), independent of the doc-type-based
+    _special_classification check above (which only inspects narration/type
+    fields, never the invoice number itself). This is intentionally a
+    Remark-only signal — it must NEVER change Status/Classification, only
+    flag the row for the reviewer.
+    """
+    for entry in (c, p):
+        if entry is None:
+            continue
+        inv = _invoice_number(entry)
+        if inv and "reversal" in str(inv).strip().lower():
+            return True
+    return False
+
+
+def _auto_remark(classification: str, existing_remark: str, c, p) -> str:
+    """
+    Rule-driven explanatory remark for the Remark column, matching the
+    client-annotated reference export (docs/Reconciliation-DYNAMIC-EVENTS---
+    PRODUCTION.xlsx, "Correct Remark" column) so every row's remark is
+    derived consistently from its Classification rather than left blank.
+
+    Never overwrites an existing remark — a reviewer's manual-link reason
+    (pass 8) always takes priority over any auto-generated text.
+
+    Priority (verified against every row of the reference export):
+      1. existing_remark (manual link) — always wins.
+      2. Classification == "Reversal Entries" (SA/AB same-side netting) ->
+         explain that this is an Emcure-internal entry showing as a reversal.
+      3. Either side's invoice number literally reads like a reversal
+         placeholder (e.g. "Reversal Doc") even when NOT auto-classified as
+         a Reversal Entry (matched cross-side by date+amount, or genuinely
+         one-sided/unmatched) -> flag it for the reviewer as "Reversal
+         Entries" without changing its actual Status/Classification.
+      4. Classification == "Date Range and Amount Matched" (fell back to
+         amount + date-range instead of an exact invoice-number match) ->
+         note that invoices should primarily be matched by invoice number.
+      5. Otherwise blank.
+    """
+    if existing_remark:
+        return existing_remark
+    if classification == "Reversal Entries":
+        return "Emcure internal transaction is being showing as a reversal"
+    if _has_reversal_doc_marker(c, p):
+        return "Reversal Entries"
+    if classification == "Date Range and Amount Matched":
+        return "Invoices should primarily be matched by invoice number"
+    return ""
+
+
 def _rule_code(pass_number: int | None) -> str:
     if pass_number is None:
         return ""
@@ -537,9 +590,17 @@ class ReconciliationExportService:
             "matched_id": str(match.id) if match else "",
             "status": status,
             "classification": classification,
-            # Reviewer-selected reason for a manual link (pass 8), shown in
-            # the Remark column. Blank for every auto-matched pass.
-            "remark": (getattr(match, "status_reason", "") or "") if match else "",
+            # Remark: a reviewer's manually-selected reason (pass 8) always
+            # wins; otherwise a rule-driven explanatory note is derived from
+            # the row's Classification (see _auto_remark) so auto-matched
+            # rows are no longer left blank when the client's reference
+            # export expects an explanation (e.g. Reversal Entries,
+            # invoice-number-matching guidance).
+            "remark": _auto_remark(
+                classification,
+                (getattr(match, "status_reason", "") or "") if match else "",
+                c, p,
+            ),
             "c_stmt": "ledger" if c else "",
             "c_date": _fmt_date(getattr(c, "posting_date", None)) if c else "",
             "c_invno": _invoice_number(c) if c else "",
