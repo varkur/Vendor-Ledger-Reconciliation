@@ -81,6 +81,17 @@ class Settings(BaseSettings):
         default="https://ad-prod-darwinsvc-prod.apps.emart.oneemcure.local/adintegratorservices/rest/v1",
         description="Base URL for the Darwin AD integrator service",
     )
+    DARWINBOX_DEFAULT_PASSWORD: str = Field(
+        default="",
+        description=(
+            "Fallback password for manual/Darwinbox-created users when none is supplied. "
+            "Treated as a secret — never logged, never returned in any response."
+        ),
+    )
+    DARWINBOX_DEFAULT_ROLE_CODE: str = Field(
+        default="Reconciliation_User",
+        description="Role code auto-assigned on Darwinbox import",
+    )
 
     # Encryption (for SAP credentials and other sensitive settings)
     ENCRYPTION_KEY: str = Field(

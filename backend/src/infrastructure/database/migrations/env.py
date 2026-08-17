@@ -17,6 +17,8 @@ from src.infrastructure.database.models.base_model import Base
 # Import all models so Alembic detects them
 from src.infrastructure.database.models.user_model import UserModel  # noqa: F401
 from src.infrastructure.database.models.user_details_model import UserDetailsModel  # noqa: F401
+from src.infrastructure.database.models.department_model import DepartmentModel  # noqa: F401
+from src.infrastructure.database.models.group_company_model import GroupCompanyModel  # noqa: F401
 from src.infrastructure.database.models.tenant_model import TenantModel  # noqa: F401
 from src.infrastructure.database.models.role_model import (  # noqa: F401
     PermissionModel,

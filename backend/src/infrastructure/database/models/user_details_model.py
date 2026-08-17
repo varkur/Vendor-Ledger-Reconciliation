@@ -29,8 +29,18 @@ class UserDetailsModel(BaseModel):
     email: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     designation_title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     department: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    department_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     business_unit: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     group_company: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    group_company_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("group_companies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     location: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     region: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     zone: Mapped[str] = mapped_column(String(255), nullable=False, default="")

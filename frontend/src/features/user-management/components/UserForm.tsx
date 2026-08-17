@@ -17,9 +17,22 @@ import type { CreateUserRequest } from '../models/User';
 
 const createUserSchema = z.object({
   username: z.string().min(3, 'Username must be at least 3 characters').max(255),
-  password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  password: z
+    .string()
+    .max(128)
+    .refine((val) => val.length === 0 || val.length >= 8, {
+      message: 'Password must be at least 8 characters',
+    })
+    .optional()
+    .or(z.literal('')),
   is_validate_ad: z.boolean(),
   role_id: z.string().min(1, 'Role is required'),
+  name: z.string().min(1, 'Name is required').max(255),
+  email: z.string().email('Enter a valid email address'),
+  department: z.string().min(1, 'Department is required').max(255),
+  designation_title: z.string().max(255).optional(),
+  reporting_manager: z.string().max(255).optional(),
+  employee_id: z.string().max(50).optional(),
 });
 
 type CreateUserFormData = z.infer<typeof createUserSchema>;
@@ -42,11 +55,24 @@ export const UserForm = ({ visible, onHide, onSubmit, loading }: UserFormProps) 
     formState: { errors },
   } = useForm<CreateUserFormData>({
     resolver: zodResolver(createUserSchema),
-    defaultValues: { is_validate_ad: true, role_id: '' },
+    defaultValues: {
+      is_validate_ad: true,
+      role_id: '',
+      name: '',
+      email: '',
+      department: '',
+      designation_title: '',
+      reporting_manager: '',
+      employee_id: '',
+    },
   });
 
   const handleFormSubmit = (data: CreateUserFormData) => {
-    onSubmit(data);
+    onSubmit({
+      ...data,
+      password: data.password ? data.password : null,
+      employee_id: data.employee_id || null,
+    });
     reset();
   };
 
@@ -94,7 +120,76 @@ export const UserForm = ({ visible, onHide, onSubmit, loading }: UserFormProps) 
         </div>
 
         <div className="flex flex-column gap-2">
-          <label htmlFor="new-password" className="font-medium">Password</label>
+          <label htmlFor="new-name" className="font-medium">Full Name</label>
+          <InputText
+            id="new-name"
+            {...register('name')}
+            placeholder="Enter full name"
+            className={errors.name ? 'p-invalid' : ''}
+            aria-describedby="new-name-error"
+          />
+          {errors.name && (
+            <small id="new-name-error" className="p-error">{errors.name.message}</small>
+          )}
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-email" className="font-medium">Email</label>
+          <InputText
+            id="new-email"
+            {...register('email')}
+            placeholder="Enter email address"
+            className={errors.email ? 'p-invalid' : ''}
+            aria-describedby="new-email-error"
+          />
+          {errors.email && (
+            <small id="new-email-error" className="p-error">{errors.email.message}</small>
+          )}
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-department" className="font-medium">Department</label>
+          <InputText
+            id="new-department"
+            {...register('department')}
+            placeholder="Enter department"
+            className={errors.department ? 'p-invalid' : ''}
+            aria-describedby="new-department-error"
+          />
+          {errors.department && (
+            <small id="new-department-error" className="p-error">{errors.department.message}</small>
+          )}
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-designation" className="font-medium">Designation (optional)</label>
+          <InputText
+            id="new-designation"
+            {...register('designation_title')}
+            placeholder="Enter designation"
+          />
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-reporting-manager" className="font-medium">Reporting Manager (optional)</label>
+          <InputText
+            id="new-reporting-manager"
+            {...register('reporting_manager')}
+            placeholder="Enter reporting manager"
+          />
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-employee-id" className="font-medium">Employee ID (optional)</label>
+          <InputText
+            id="new-employee-id"
+            {...register('employee_id')}
+            placeholder="Defaults to username when omitted"
+          />
+        </div>
+
+        <div className="flex flex-column gap-2">
+          <label htmlFor="new-password" className="font-medium">Password (optional)</label>
           <Controller
             name="password"
             control={control}
@@ -102,7 +197,7 @@ export const UserForm = ({ visible, onHide, onSubmit, loading }: UserFormProps) 
               <Password
                 id="new-password"
                 {...field}
-                placeholder="Enter password"
+                placeholder="Leave blank to use default password"
                 toggleMask
                 className={errors.password ? 'p-invalid' : ''}
                 inputClassName="w-full"

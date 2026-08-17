@@ -19,6 +19,7 @@ import { LinkUnmatchedPage } from '@features/track-reconciliation/pages/LinkUnma
 import { ReconciliationEntriesPage } from '@features/track-reconciliation/pages/ReconciliationEntriesPage';
 import { RolesPage } from '@features/rbac-admin/pages/RolesPage';
 import { AuditLogsPage } from '@features/rbac-admin/pages/AuditLogsPage';
+import { UserListPage } from '@features/user-management/pages/UserListPage';
 import { ExceptionListPage } from '@features/exceptions/ExceptionListPage';
 import { ApprovalsPage } from '@features/approvals/pages/ApprovalsPage';
 import { ReportsPage } from '@features/reports/pages/ReportsPage';
@@ -95,7 +96,8 @@ export const AppRouter = () => {
           <Route path="notifications" element={<NotificationHistoryPage />} />
 
           {/* Access Management */}
-          <Route path="access-management" element={<Navigate to="/access-management/roles" replace />} />
+          <Route path="access-management" element={<Navigate to="/access-management/users" replace />} />
+          <Route path="access-management/users" element={<UserListPage />} />
           <Route path="access-management/roles" element={<RolesPage />} />
           <Route path="access-management/audit-logs" element={<AuditLogsPage />} />
 

@@ -1,24 +1,37 @@
 ﻿"""
 User Application Service.
-Orchestrates user business logic — CRUD, role assignment, details, history.
+Orchestrates user business logic — CRUD, role assignment, details, history,
+manual full-profile creation, and Darwinbox/AD import.
 Controllers delegate here; this layer calls repositories.
 """
 
+import logging
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.v1.schemas.user_request import CreateUserRequest, UpdateUserRequest
+from src.api.v1.schemas.user_request import (
+    CreateUserRequest,
+    ImportFromDarwinboxRequest,
+    UpdateUserRequest,
+)
 from src.api.v1.schemas.user_response import UserDetailResponse, UserListResponse, UserResponse
+from src.config.settings import settings
 from src.domain.entities.user import User
+from src.domain.exceptions.domain_exceptions import ConfigurationError
 from src.domain.repositories.user_repository import IUserRepository
 from src.infrastructure.database.models.audit_log_model import AuditLogModel
+from src.infrastructure.database.models.department_model import DepartmentModel
+from src.infrastructure.database.models.group_company_model import GroupCompanyModel
 from src.infrastructure.database.models.role_model import RoleAssignmentModel, RoleModel
 from src.infrastructure.database.models.user_details_model import UserDetailsModel
 from src.infrastructure.database.models.user_model import UserModel
+from src.infrastructure.external.employee_ad.employee_ad_client import EmployeeADClient
 from src.infrastructure.security.password_encoder import hash_password
+
+logger = logging.getLogger(__name__)
 
 
 class UserService:
@@ -29,11 +42,23 @@ class UserService:
     - Orchestrate user CRUD operations
     - Manage role assignments
     - Aggregate data from multiple sources (users, user_details, audit_logs)
+    - Provision users manually with a full profile
+    - Import users from Darwinbox/AD by employee ID (idempotent, RBAC-correct)
+
+    Logging safety: this service MUST NOT log plaintext passwords (explicit,
+    resolved, or the DARWINBOX_DEFAULT_PASSWORD default) or raw Darwin PII
+    payloads. Only non-sensitive identifiers (employee_id, username) are logged.
     """
 
-    def __init__(self, session: AsyncSession, user_repo: IUserRepository) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        user_repo: IUserRepository,
+        ad_client: EmployeeADClient | None = None,
+    ) -> None:
         self._session = session
         self._user_repo = user_repo
+        self._ad_client = ad_client if ad_client is not None else EmployeeADClient()
 
     # ─── List Users ───
 
@@ -73,29 +98,128 @@ class UserService:
 
         return UserListResponse(users=users, total=len(users), skip=skip, limit=limit)
 
-    # ─── Create User ───
+    # ─── Create User (manual, full profile) ───
 
     async def create_user(self, request: CreateUserRequest, actor: User) -> UserResponse:
-        """Create a new user and optionally assign a role."""
+        """
+        Create a new user with full profile data and optional role assignment.
+
+        PRECONDITIONS:
+          - request.username is unique (checked below)
+          - request.role_id, if provided, references an existing active role
+
+        POSTCONDITIONS:
+          - Exactly one row exists in `users` with username == request.username
+          - Exactly one row exists in `user_details` with user_id == new user's id
+          - If request.role_id set: exactly one active role_assignments row for (user, role)
+          - Returned UserResponse never includes password_hash or plaintext password
+        """
         if await self._user_repo.exists_by_username(request.username):
             raise ValueError(f"Username '{request.username}' already exists")
+
+        # Validate role_id up front so an invalid role never results in a
+        # partially-created user (Req 1.9).
+        if request.role_id is not None:
+            role = await self._get_role_by_id(request.role_id)
+            if role is None:
+                raise ValueError(f"Role '{request.role_id}' does not exist or is not active")
+
+        password_hash = await self._resolve_password_hash(request.password)
 
         user = User(
             id=uuid4(),
             username=request.username,
-            password_hash=hash_password(request.password),
+            password_hash=password_hash,
             is_validate_ad=request.is_validate_ad,
             created_by=actor.username,
             modified_by=actor.username,
         )
-
         created = await self._user_repo.create(user)
 
-        # Assign role if provided
+        department = await self._get_or_create_department(request.department)
+
+        details = UserDetailsModel(
+            id=uuid4(),
+            user_id=created.id,
+            employee_id=request.employee_id or request.username,
+            employee_name=request.name,
+            email=str(request.email),
+            designation_title=request.designation_title,
+            department=request.department,
+            department_id=department.id,
+            reporting_manager=request.reporting_manager,
+            created_by=actor.username,
+            modified_by=actor.username,
+        )
+        self._session.add(details)
+
         if request.role_id:
             await self._assign_role(created.id, request.role_id, actor.username)
 
+        await self._session.flush()
+        logger.info("Created user username=%s id=%s", created.username, created.id)
         return self._to_response(created)
+
+    # ─── Darwinbox / AD Import ───
+
+    async def import_from_darwinbox(
+        self, request: ImportFromDarwinboxRequest, actor: User
+    ) -> UserResponse:
+        """
+        Import (create-or-update) a single user from Darwinbox/AD by employee ID.
+
+        PRECONDITIONS:
+          - request.employee_id is non-empty
+          - settings.DARWINBOX_DEFAULT_ROLE_CODE resolves to an existing active role
+            (checked before any writes — fail fast, no partial state)
+
+        POSTCONDITIONS:
+          - A `users` row exists with username == employee_id and is_validate_ad == True
+          - A `user_details` row exists for that user, populated from Darwin's response
+          - `departments` / `group_companies` rows exist for the employee's org data
+            (idempotent — no duplicates on re-import)
+          - The default role is assigned exactly once (idempotent)
+          - If the user already existed, its password_hash is left untouched
+        """
+        default_role = await self._get_role_by_code(settings.DARWINBOX_DEFAULT_ROLE_CODE)
+        if default_role is None:
+            raise ConfigurationError(
+                f"Default import role '{settings.DARWINBOX_DEFAULT_ROLE_CODE}' not found or inactive"
+            )
+
+        logger.info("Importing employee from Darwinbox: employee_id=%s", request.employee_id)
+        darwin_response = await self._ad_client.get_selected_employees([request.employee_id])
+        employee_data = self._extract_single_employee(darwin_response, request.employee_id)
+        if employee_data is None:
+            raise ValueError(f"Employee '{request.employee_id}' not found in Darwinbox")
+
+        existing = await self._user_repo.get_by_username(request.employee_id)
+
+        if existing is None:
+            password_hash = await self._resolve_password_hash(explicit_password=None)
+            new_user = User(
+                id=uuid4(),
+                username=request.employee_id,
+                password_hash=password_hash,
+                is_validate_ad=True,
+                created_by=actor.username,
+                modified_by=actor.username,
+            )
+            user = await self._user_repo.create(new_user)
+        else:
+            user = existing  # password_hash untouched
+
+        await self._upsert_user_details(
+            user_id=user.id,
+            employee_id=request.employee_id,
+            employee_data=employee_data,
+            actor_username=actor.username,
+        )
+        await self._ensure_role_assigned(user.id, default_role.id, actor.username)
+
+        await self._session.flush()
+        logger.info("Import complete for employee_id=%s user_id=%s", request.employee_id, user.id)
+        return self._to_response(user)
 
     # ─── Get User by ID ───
 
@@ -269,7 +393,7 @@ class UserService:
             for e in entries
         ]
 
-    # ─── Private Helpers ───
+    # ─── Private Helpers: shared ───
 
     async def _get_last_logins(self, user_ids: list[str]) -> dict[str, str]:
         """Batch fetch last login timestamps from audit_logs."""
@@ -318,9 +442,247 @@ class UserService:
         # Create new
         await self._assign_role(user_id, role_id, actor_username)
 
+    async def _get_role_by_id(self, role_id: UUID) -> RoleModel | None:
+        """Look up an active role by ID."""
+        stmt = select(RoleModel).where(
+            RoleModel.id == str(role_id),
+            RoleModel.is_active == True,  # noqa: E712
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    # ─── Private Helpers: password resolution (Req 1.3, 1.4, 1.5) ───
+
+    async def _resolve_password_hash(self, explicit_password: str | None) -> str:
+        """
+        Resolve and hash the effective password for a new user.
+
+        Returns the hash of `explicit_password` when provided; otherwise hashes
+        `settings.DARWINBOX_DEFAULT_PASSWORD`. Raises ConfigurationError when
+        neither is available (fails loudly instead of hashing an empty string).
+
+        NOTE: never logs the plaintext password or the default password value.
+        """
+        if explicit_password:
+            return hash_password(explicit_password)
+
+        if not settings.DARWINBOX_DEFAULT_PASSWORD:
+            raise ConfigurationError(
+                "No password was supplied and DARWINBOX_DEFAULT_PASSWORD is not configured"
+            )
+        return hash_password(settings.DARWINBOX_DEFAULT_PASSWORD)
+
+    # ─── Private Helpers: lookup get-or-create (Req 1.10, 2.7) ───
+
+    async def _get_or_create_department(self, name: str | None) -> DepartmentModel:
+        """
+        Case-insensitive, whitespace-trimmed get-or-create for departments.
+        Empty/blank names normalize to "Unspecified". Never creates two rows
+        for names differing only by case/whitespace.
+        """
+        normalized = (name or "").strip() or "Unspecified"
+        stmt = select(DepartmentModel).where(func.lower(DepartmentModel.name) == normalized.lower())
+        result = await self._session.execute(stmt)
+        dept = result.scalar_one_or_none()
+        if dept is None:
+            dept = DepartmentModel(id=uuid4(), name=normalized, is_active=True)
+            self._session.add(dept)
+            await self._session.flush()
+        return dept
+
+    async def _get_or_create_group_company(self, name: str | None) -> GroupCompanyModel:
+        """
+        Case-insensitive, whitespace-trimmed get-or-create for group companies.
+        Empty/blank names normalize to "Unspecified". Never creates two rows
+        for names differing only by case/whitespace.
+        """
+        normalized = (name or "").strip() or "Unspecified"
+        stmt = select(GroupCompanyModel).where(
+            func.lower(GroupCompanyModel.name) == normalized.lower()
+        )
+        result = await self._session.execute(stmt)
+        company = result.scalar_one_or_none()
+        if company is None:
+            company = GroupCompanyModel(id=uuid4(), name=normalized, is_active=True)
+            self._session.add(company)
+            await self._session.flush()
+        return company
+
+    # ─── Private Helpers: Darwinbox import (Req 2.1-2.12) ───
+
+    async def _get_role_by_code(self, code: str) -> RoleModel | None:
+        """Look up an active role by its code (used for DARWINBOX_DEFAULT_ROLE_CODE)."""
+        stmt = select(RoleModel).where(
+            RoleModel.code == code,
+            RoleModel.is_active == True,  # noqa: E712
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _is_error_response(darwin_response: object) -> bool:
+        """Detect a Darwin response that is error-shaped despite a successful HTTP call."""
+        if not isinstance(darwin_response, dict):
+            return False
+        for key in ("error", "Error", "ErrorMessage", "errorMessage"):
+            if key in darwin_response:
+                return True
+        for flag_key in ("IsSuccess", "isSuccess"):
+            if darwin_response.get(flag_key) is False:
+                return True
+        return False
+
+    def _extract_single_employee(self, darwin_response: object, employee_id: str) -> dict | None:
+        """
+        Parse Darwin's `/getselectedemployees` response and return the record
+        matching `employee_id`, or None if absent or the response is error-shaped.
+        """
+        if self._is_error_response(darwin_response):
+            return None
+
+        employee_data_list: list = []
+        if isinstance(darwin_response, dict):
+            employee_data_list = darwin_response.get("employeeData", []) or []
+            if not employee_data_list:
+                for value in darwin_response.values():
+                    if isinstance(value, list) and value:
+                        employee_data_list = value
+                        break
+        elif isinstance(darwin_response, list):
+            employee_data_list = darwin_response
+
+        target = str(employee_id).strip()
+        for emp in employee_data_list:
+            if not isinstance(emp, dict):
+                continue
+            emp_id = str(
+                emp.get("employee_id", emp.get("EmployeeId", emp.get("employeeId", "")))
+            ).strip()
+            if emp_id == target:
+                return emp
+        return None
+
+    async def _upsert_user_details(
+        self,
+        user_id: UUID,
+        employee_id: str,
+        employee_data: dict,
+        actor_username: str,
+    ) -> None:
+        """
+        Resolve department/group_company (creating lookup rows as needed) and
+        create-or-update exactly one `user_details` row for the user.
+
+        Raises ValueError before any writes if department/group_company data
+        is malformed (present but not a scalar string/number) — no partial
+        resolution per Req 2.9.
+        """
+        department_raw = employee_data.get("department")
+        group_company_raw = employee_data.get("group_company")
+
+        for label, value in (("department", department_raw), ("group_company", group_company_raw)):
+            if value is not None and not isinstance(value, (str, int, float)):
+                raise ValueError(f"Malformed '{label}' value in Darwin response: {type(value).__name__}")
+
+        department = await self._get_or_create_department(
+            str(department_raw) if department_raw is not None else ""
+        )
+        group_company = await self._get_or_create_group_company(
+            str(group_company_raw) if group_company_raw is not None else ""
+        )
+
+        details_fields = self._extract_employee_fields(
+            employee_data,
+            user_id=user_id,
+            fallback_employee_id=employee_id,
+            department_id=department.id,
+            group_company_id=group_company.id,
+            actor_username=actor_username,
+        )
+
+        stmt = select(UserDetailsModel).where(UserDetailsModel.user_id == user_id)
+        result = await self._session.execute(stmt)
+        details_model = result.scalar_one_or_none()
+
+        if details_model is None:
+            details_model = UserDetailsModel(**details_fields)
+            self._session.add(details_model)
+        else:
+            for key, value in details_fields.items():
+                if key not in ("id", "user_id", "created_by", "created_date"):
+                    setattr(details_model, key, value)
+            details_model.modified_by = actor_username
+
+        await self._session.flush()
+
+    @staticmethod
+    def _extract_employee_fields(
+        emp_data: dict,
+        user_id: UUID,
+        fallback_employee_id: str,
+        department_id: UUID,
+        group_company_id: UUID,
+        actor_username: str,
+    ) -> dict:
+        """Extract and normalize Darwin employee fields into user_details columns."""
+
+        def get(key: str) -> str:
+            val = emp_data.get(key, "")
+            return str(val).strip() if val is not None else ""
+
+        first = get("first_name")
+        middle = get("middle_name")
+        last = get("last_name")
+        full_name = " ".join(part for part in [first, middle, last] if part)
+
+        return {
+            "id": uuid4(),
+            "user_id": user_id,
+            "employee_id": get("employee_id") or fallback_employee_id,
+            "employee_name": full_name,
+            "first_name": first,
+            "middle_name": middle,
+            "last_name": last,
+            "email": get("company_email_id"),
+            "designation_title": get("designation_title"),
+            "department": get("department"),
+            "department_id": department_id,
+            "business_unit": get("business_unit"),
+            "group_company": get("group_company"),
+            "group_company_id": group_company_id,
+            "location": get("office_location"),
+            "region": get("office_state"),
+            "zone": get("office_city"),
+            "grade": get("job_level"),
+            "office_mobile_no": get("office_mobile_no"),
+            "personal_mobile_no": get("personal_mobile_no"),
+            "date_of_joining": get("date_of_joining") or get("date_of_birth"),
+            "reporting_manager": get("direct_manager_name"),
+            "direct_manager_employee_id": get("direct_manager_employee_id"),
+            "direct_manager_name": get("direct_manager_name"),
+            "direct_manager_email": get("direct_manager_email"),
+            "sap_user_id": get("cost_center_id"),
+            "division_id": get("division"),
+            "territory_id": get("territory_code_(sales_hq_code)"),
+            "created_by": actor_username,
+            "modified_by": actor_username,
+        }
+
+    async def _ensure_role_assigned(self, user_id: UUID, role_id: UUID, actor_username: str) -> None:
+        """Idempotently ensure exactly one active role_assignments row exists for (user, role)."""
+        stmt = select(RoleAssignmentModel).where(
+            RoleAssignmentModel.user_id == str(user_id),
+            RoleAssignmentModel.role_id == str(role_id),
+            RoleAssignmentModel.is_active == True,  # noqa: E712
+        )
+        result = await self._session.execute(stmt)
+        if result.scalar_one_or_none() is None:
+            await self._assign_role(user_id, role_id, actor_username)
+            await self._session.flush()
+
     @staticmethod
     def _to_response(user: User) -> UserResponse:
-        """Map domain entity to response DTO."""
+        """Map domain entity to response DTO. Never includes password_hash."""
         return UserResponse(
             id=user.id,
             username=user.username,

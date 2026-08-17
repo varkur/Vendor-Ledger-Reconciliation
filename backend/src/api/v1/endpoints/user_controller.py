@@ -9,12 +9,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user, get_user_repository
-from src.api.v1.schemas.user_request import CreateUserRequest, UpdateUserRequest
+from src.api.v1.schemas.user_request import (
+    CreateUserRequest,
+    ImportFromDarwinboxRequest,
+    UpdateUserRequest,
+)
 from src.api.v1.schemas.user_response import UserDetailResponse, UserListResponse, UserResponse
 from src.application.services.user_service import UserService
 from src.domain.entities.user import User
+from src.domain.exceptions.domain_exceptions import ConfigurationError
 from src.domain.repositories.user_repository import IUserRepository
 from src.infrastructure.database.session import get_db_session
+from src.infrastructure.external.employee_ad.employee_ad_client import EmployeeADError, EmployeeADUnavailableError
 from src.infrastructure.security.permission_manager import require_api_permission
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -59,7 +65,35 @@ async def create_user(
     try:
         return await service.create_user(request=request, actor=current_user)
     except ValueError as e:
+        # Distinguish duplicate username (409) from invalid/inactive role_id (422)
+        if "role" in str(e).lower():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ConfigurationError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post(
+    "/import",
+    response_model=UserResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Import a user from Darwinbox/AD by employee ID",
+    dependencies=[Depends(require_api_permission("users", "IMPORT"))],
+)
+async def import_from_darwinbox(
+    request: ImportFromDarwinboxRequest,
+    current_user: User = Depends(get_current_active_user),
+    service: UserService = Depends(_get_user_service),
+) -> UserResponse:
+    """POST /api/v1/users/import"""
+    try:
+        return await service.import_from_darwinbox(request=request, actor=current_user)
+    except ConfigurationError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (EmployeeADError, EmployeeADUnavailableError) as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
 
 
 @router.get(

@@ -55,7 +55,8 @@ const navModel: NavGroup[] = [
     label: 'Settings',
     icon: 'pi pi-cog',
     children: [
-      { label: 'Manage Users', path: '/access-management/roles' },
+      { label: 'Manage Users', path: '/access-management/users' },
+      { label: 'Roles & Permissions', path: '/access-management/roles' },
       { label: 'Company Profile', path: '/settings/company-profile' },
       { label: 'Email Templates', path: '/settings/email-templates' },
       { label: 'Document Types', path: '/settings/document-types' },

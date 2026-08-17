@@ -25,9 +25,15 @@ export interface UserListResponse {
 
 export interface CreateUserRequest {
   username: string;
-  password: string;
+  password?: string | null;
   is_validate_ad: boolean;
   role_id: string | null;
+  name: string;
+  email: string;
+  department: string;
+  designation_title?: string;
+  reporting_manager?: string;
+  employee_id?: string | null;
 }
 
 export interface UpdateUserRequest {
