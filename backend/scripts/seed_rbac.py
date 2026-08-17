@@ -15,6 +15,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sqlalchemy import select
+from src.config.settings import settings
 from src.infrastructure.database.session import async_session_factory
 from src.infrastructure.database.models.role_model import (
     PermissionModel,
@@ -184,6 +185,11 @@ ROLE_PERMISSIONS = {
     ],
     "IT_Admin": [
         "menu.vlr_dashboard", "menu.vlr_reconciliation", "menu.vlr_reports", "menu.vlr_settings",
+        "menu.users", "menu.roles", "menu.audit_logs",
+        "users.list", "users.create", "users.update", "users.delete",
+        "users.export", "users.import",
+        "roles.list", "roles.create", "roles.update", "roles.assign",
+        "audit.read", "rbac.read", "rbac.create", "rbac.update",
         "vlr.vendors.read", "vlr.vendors.write", "vlr.vendors.create", "vlr.vendors.update",
         "vlr.vendors.delete", "vlr.vendors.import",
         "vlr.requests.read", "vlr.requests.write", "vlr.requests.create", "vlr.requests.update", "vlr.requests.delete",
@@ -326,6 +332,27 @@ async def seed() -> None:
 
         await session.commit()
         print("\n✓ RBAC seed complete.")
+
+        # Fail fast if the configured Darwinbox default import role doesn't
+        # resolve to an active role — this is the role UserService.import_from_darwinbox
+        # assigns to every imported user (settings.DARWINBOX_DEFAULT_ROLE_CODE).
+        default_role_result = await session.execute(
+            select(RoleModel).where(
+                RoleModel.code == settings.DARWINBOX_DEFAULT_ROLE_CODE,
+                RoleModel.is_active == True,  # noqa: E712
+            )
+        )
+        if default_role_result.scalar_one_or_none() is None:
+            raise RuntimeError(
+                f"DARWINBOX_DEFAULT_ROLE_CODE='{settings.DARWINBOX_DEFAULT_ROLE_CODE}' does not "
+                "resolve to an existing active role after seeding. Darwinbox import will fail "
+                "with a ConfigurationError until this is fixed — either seed the role or update "
+                "the DARWINBOX_DEFAULT_ROLE_CODE setting."
+            )
+        print(
+            f"✓ Verified DARWINBOX_DEFAULT_ROLE_CODE='{settings.DARWINBOX_DEFAULT_ROLE_CODE}' "
+            "resolves to an active role."
+        )
 
     # 3. Assign ADMIN role to all existing users who don't have any role assignment
     async with async_session_factory() as session:
