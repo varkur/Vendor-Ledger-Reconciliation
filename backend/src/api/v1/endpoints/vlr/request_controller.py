@@ -1313,27 +1313,21 @@ async def _send_invites_for_cases(
             emails_failed += 1
             continue
 
-        # Get primary vendor contact email
-        contact_stmt = (
+        # Get all contacts for the vendor. The primary contact (or the first
+        # contact if none is marked primary) is used as the "To" recipient;
+        # every other contact with an email is CC'd so the invite reaches
+        # everyone listed for the vendor, not just the primary contact.
+        all_contacts_stmt = (
             select(VendorContactModel)
-            .where(
-                VendorContactModel.vendor_id == vendor.id,
-                VendorContactModel.is_primary == True,  # noqa: E712
-            )
-            .limit(1)
+            .where(VendorContactModel.vendor_id == vendor.id)
+            .order_by(VendorContactModel.is_primary.desc())
         )
-        contact_result = await session.execute(contact_stmt)
-        contact = contact_result.scalar_one_or_none()
+        all_contacts_result = await session.execute(all_contacts_stmt)
+        vendor_contacts = list(all_contacts_result.scalars().all())
 
-        # Fallback: get any contact
-        if not contact:
-            contact_stmt2 = (
-                select(VendorContactModel)
-                .where(VendorContactModel.vendor_id == vendor.id)
-                .limit(1)
-            )
-            contact_result2 = await session.execute(contact_stmt2)
-            contact = contact_result2.scalar_one_or_none()
+        contact = next((c for c in vendor_contacts if c.is_primary), None) or (
+            vendor_contacts[0] if vendor_contacts else None
+        )
 
         if not contact or not contact.email:
             details.append({
@@ -1345,6 +1339,14 @@ async def _send_invites_for_cases(
             })
             emails_failed += 1
             continue
+
+        # Every other vendor contact with an email gets CC'd alongside any
+        # explicitly requested cc_emails (e.g. the contact picked in the UI).
+        other_contact_emails = [
+            c.email for c in vendor_contacts
+            if c.id != contact.id and c.email
+        ]
+        case_cc_emails = list(cc_emails) + other_contact_emails
 
         # Set token expiry on the case
         case.token_expiry = token_expiry
@@ -1410,12 +1412,13 @@ async def _send_invites_for_cases(
 
         subject = f"Ledger Reconciliation Request - {period_start} to {period_end}"
 
-        # Send email to the vendor's primary contact, CC the selected contact(s)
+        # Send email to the vendor's primary contact, CC every other contact
+        # for that vendor plus any explicitly selected cc_emails.
         success = await email_sender.send_email(
             to_email=contact.email,
             subject=subject,
             body_html=body_html,
-            cc=cc_emails,
+            cc=case_cc_emails,
         )
 
         if success:
@@ -1425,7 +1428,7 @@ async def _send_invites_for_cases(
                 "vendor_code": vendor.vendor_code,
                 "vendor_name": vendor.name,
                 "email": contact.email,
-                "cc": cc_emails,
+                "cc": case_cc_emails,
                 "portal_url": portal_url,
                 "status": "sent",
             })
