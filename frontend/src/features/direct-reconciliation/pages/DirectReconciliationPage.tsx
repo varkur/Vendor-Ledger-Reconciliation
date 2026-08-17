@@ -248,13 +248,21 @@ export const DirectReconciliationPage = () => {
       createMutation.mutate(
         formData as any,
         {
-          onSuccess: () => {
+          onSuccess: (response) => {
             setShowNewDialog(false);
+            // Both ledgers are uploaded but not yet reconciled — send the user
+            // to the mapping page to review/map columns before they trigger
+            // reconciliation themselves.
+            const requestId = response?.request_id;
+            const caseId = response?.case_id;
+            if (requestId && caseId) {
+              navigate(`/track-reconciliation/${requestId}/${caseId}`);
+            }
           },
         }
       );
     },
-    [createMutation, companyCode, selectedFile, selectedVendorFile]
+    [createMutation, companyCode, selectedFile, selectedVendorFile, navigate]
   );
 
   const handleFileSelect = useCallback((e: FileUploadSelectEvent) => {

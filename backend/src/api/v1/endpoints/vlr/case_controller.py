@@ -784,64 +784,29 @@ async def create_direct_reconciliation(
 
     await ledger_repo.bulk_create(vendor_entries_data)
 
-    # Flush to ensure all records are persisted before triggering reconciliation
+    # Move the case to mapping_pending now that both ledgers are uploaded —
+    # reconciliation is NOT triggered automatically here. The user reviews/maps
+    # columns on the mapping page first, then explicitly starts reconciliation
+    # via POST /vlr/cases/{case_id}/start-reconciliation (Req 18.3 superseded:
+    # upload no longer auto-reconciles; it hands off to the mapping step).
+    case_repo_update = CaseRepositoryImpl(session)
+    await case_repo_update.update(case_id, {
+        "status": "mapping_pending",
+        "current_workflow_step": "mapping_pending",
+    })
     await session.commit()
 
-    # ─── Trigger reconciliation immediately (Req 18.3) ────────────────────
-    task_id = None
     reconciliation_triggered = False
-
-    # Run reconciliation synchronously (no Celery/Redis dependency)
-    try:
-        from src.domain.services.vlr.reconciliation_engine_service import ReconciliationEngineService
-
-        engine = ReconciliationEngineService(
-            ledger_entry_repository=LedgerEntryRepositoryImpl(session),
-            match_result_repository=MatchResultRepositoryImpl(session),
-            case_repository=CaseRepositoryImpl(session),
-            exception_repository=ExceptionRepositoryImpl(session),
-        )
-        await engine.execute(
-            case_id=case_id,
-            tolerance=__import__('decimal').Decimal(str(recon_config.tolerance_amount)),
-            fuzzy_threshold=recon_config.fuzzy_threshold,
-        )
-        # Update case status based on reconciliation result
-        # If all entries matched → auto_completed; otherwise → mapping_pending
-        case_repo_update = CaseRepositoryImpl(session)
-        case_obj = await case_repo_update.get_by_id(case_id)
-        match_stats = getattr(case_obj, "match_statistics", None) or {}
-        total_company = match_stats.get("total_company_entries", 0)
-        total_vendor = match_stats.get("total_vendor_entries", 0)
-        matched_company = match_stats.get("total_matched_company", 0)
-        matched_vendor = match_stats.get("total_matched_vendor", 0)
-        all_matched = (matched_company >= total_company and matched_vendor >= total_vendor)
-        new_status = "auto_completed" if all_matched else "mapping_pending"
-        await case_repo_update.update(case_id, {
-            "status": new_status,
-            "current_workflow_step": new_status,
-        })
-        await session.commit()
-        reconciliation_triggered = True
-        task_id = "sync-inline"
-    except Exception as exc:
-        logger.warning(
-            "Failed to run reconciliation for direct case: case_id=%s, error=%s",
-            case_id,
-            str(exc),
-            exc_info=True,
-        )
-        # Still return success — case is created, reconciliation can be retried
-        reconciliation_triggered = False
+    task_id = None
 
     logger.info(
         "Direct reconciliation case created: case_id=%s, vendor_id=%s, "
-        "company_entries=%d, vendor_entries=%d, reconciliation_triggered=%s",
+        "company_entries=%d, vendor_entries=%d, status=mapping_pending "
+        "(awaiting manual column mapping before reconciliation)",
         case_id,
         recon_config.vendor_id,
         len(company_result.entries),
         len(vendor_result.entries),
-        reconciliation_triggered,
     )
 
     return DirectReconciliationResponse(
@@ -849,7 +814,7 @@ async def create_direct_reconciliation(
         request_id=request_id,
         vendor_id=recon_config.vendor_id,
         case_type="direct",
-        status="auto_completed" if reconciliation_triggered else "statement_received",
+        status="mapping_pending",
         company_entries_count=len(company_result.entries),
         vendor_entries_count=len(vendor_result.entries),
         reconciliation_triggered=reconciliation_triggered,
@@ -857,11 +822,7 @@ async def create_direct_reconciliation(
         message=(
             f"Direct reconciliation case created with {len(company_result.entries)} "
             f"company entries and {len(vendor_result.entries)} vendor entries. "
-            + (
-                "Reconciliation triggered."
-                if reconciliation_triggered
-                else "Reconciliation could not be triggered automatically."
-            )
+            "Please review the column mapping before starting reconciliation."
         ),
         created_date=getattr(case_record, "created_date", None),
     )

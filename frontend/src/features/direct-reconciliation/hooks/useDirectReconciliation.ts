@@ -23,6 +23,21 @@ import {
 /** Query key prefix for direct reconciliation requests. */
 export const DIRECT_RECO_QUERY_KEY = 'vlr-direct-reconciliation';
 
+/** Response shape for POST /vlr/cases/direct (dual ledger upload). */
+export interface DirectCaseCreateResponse {
+  case_id: string;
+  request_id: string;
+  vendor_id: string;
+  case_type: string;
+  status: string;
+  company_entries_count: number;
+  vendor_entries_count: number;
+  reconciliation_triggered: boolean;
+  task_id: string | null;
+  message: string;
+  created_date: string | null;
+}
+
 /**
  * Query hook to list reconciliation requests with pagination and filtering.
  * Implements retry (2 attempts) and exponential backoff per design spec.
@@ -46,11 +61,11 @@ export function useReconciliationRequests(params: ListRequestsParams) {
 export function useCreateReconciliationRequest() {
   const queryClient = useQueryClient();
 
-  return useMutation<any, Error, FormData>({
+  return useMutation<DirectCaseCreateResponse, Error, FormData>({
     mutationFn: async (formData: FormData) => {
-      const { data } = await apiClient.post('/vlr/cases/direct', formData, {
+      const { data } = await apiClient.post<DirectCaseCreateResponse>('/vlr/cases/direct', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 120000, // 2 minutes — file parsing + DB inserts + reconciliation trigger
+        timeout: 120000, // 2 minutes — file parsing + DB inserts (no longer triggers reconciliation inline)
       });
       return data;
     },
