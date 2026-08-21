@@ -127,8 +127,6 @@ export const RequestStatementPage = () => {
 
   // Success state
   const [showSuccess, setShowSuccess] = useState(false);
-  const [inviteSent, setInviteSent] = useState(false);
-  const [isSendingInvites, setIsSendingInvites] = useState(false);
 
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -422,7 +420,6 @@ export const RequestStatementPage = () => {
     setEndDate(null);
     setRemarks('');
     setCurrentStep('configure');
-    setInviteSent(false);
     createMutation.reset();
   }, [createMutation]);
 
@@ -513,59 +510,10 @@ export const RequestStatementPage = () => {
     });
   }, [ledgerPreview]);
 
-  const handleSendInvites = useCallback(async () => {
-    if (!requestId) return;
-    setIsSendingInvites(true);
-    try {
-      // Resolve the selected contact-person to its email, sent as CC so the
-      // chosen contact is copied alongside the vendor's primary contact.
-      // "self:<email>" means the logged-in user chose themself.
-      let ccEmails: string[] = [];
-      if (contactPerson.startsWith('self:')) {
-        ccEmails = [contactPerson.slice('self:'.length)];
-      } else {
-        const selectedContact = (vendorContactsData || []).find(
-          (c) => c.id === contactPerson
-        );
-        ccEmails = selectedContact?.email ? [selectedContact.email] : [];
-      }
-
-      const { data } = await apiClient.post(
-        `/vlr/reconciliation-requests/${requestId}/send-vendor-invites`,
-        { cc_emails: ccEmails, remarks: remarks || '' },
-        { params: { company_code: companyCode } }
-      );
-      setInviteSent(true);
-      const sent = data.emails_sent || 0;
-      const failed = data.emails_failed || 0;
-      if (sent > 0) {
-        setInviteSent(true);
-        toast.current?.show({
-          severity: 'success',
-          summary: 'Invites Sent',
-          detail: `${sent} vendor invite email(s) sent successfully.${failed > 0 ? ` ${failed} failed.` : ''}`,
-          life: 5000,
-        });
-      } else {
-        toast.current?.show({
-          severity: 'warn',
-          summary: 'No Emails Sent',
-          detail: data.details?.[0]?.reason || 'No vendor contacts found. Please add contacts to your vendors first.',
-          life: 8000,
-        });
-      }
-    } catch (error: any) {
-      const detail = error.response?.data?.detail || 'Failed to send vendor invites.';
-      toast.current?.show({
-        severity: 'error',
-        summary: 'Send Failed',
-        detail,
-        life: 8000,
-      });
-    } finally {
-      setIsSendingInvites(false);
-    }
-  }, [requestId, companyCode, contactPerson, vendorContactsData]);
+  // Note: vendor invite emails are now sent automatically by the backend
+  // the moment a request/case is created (both the plain create-request
+  // flow and the consolidated-ledger confirm flow), so there is no longer
+  // a manual "Send Vendor Invite" trigger on this page.
 
   // ─── Main Render ────────────────────────────────────────────────────────────
   return (
@@ -1072,32 +1020,18 @@ export const RequestStatementPage = () => {
               </div>
             )}
 
-            {/* Success — prompt to send vendor invites (same as manual flow) */}
-            {uploadComplete && requestId && !inviteSent && (
-              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--blue-50, #eff6ff)', borderRadius: 'var(--radius-md)', border: '1px solid var(--blue-200, #bfdbfe)' }}>
-                <i className="pi pi-envelope" style={{ fontSize: '1.5rem', color: 'var(--blue-500)' }} />
-                <div className="flex-1">
-                  <p className="m-0 font-medium">Request created from consolidated ledger</p>
-                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                    Click "Send Vendor Invite" to email each detected vendor a link to upload their statement.
-                  </p>
-                </div>
-                <Button
-                  label="Send Vendor Invite"
-                  icon="pi pi-send"
-                  loading={isSendingInvites}
-                  onClick={handleSendInvites}
-                />
-              </div>
-            )}
-
-            {inviteSent && requestId && (
+            {/* Success — invites are auto-sent the moment the request was
+                created from the consolidated ledger (primary contact "To",
+                every other vendor contact CC'd), so there's nothing left
+                to manually trigger here. */}
+            {uploadComplete && requestId && (
               <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--green-50, #f0fdf4)', borderRadius: 'var(--radius-md)', border: '1px solid var(--green-200, #bbf7d0)' }}>
                 <i className="pi pi-check-circle" style={{ fontSize: '1.5rem', color: 'var(--green-500)' }} />
                 <div className="flex-1">
-                  <p className="m-0 font-medium">Vendor invite sent successfully</p>
+                  <p className="m-0 font-medium">Request created from consolidated ledger</p>
                   <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                    The vendor(s) have been emailed a unique link to upload their statement. You can track progress in Track Reconciliation.
+                    Vendor invite email(s) were sent automatically to each detected vendor.
+                    You can track progress in Track Reconciliation.
                   </p>
                 </div>
                 <Button
@@ -1275,32 +1209,17 @@ export const RequestStatementPage = () => {
               />
             </div>
 
-            {/* Success — View Reconciliation */}
-            {uploadComplete && requestId && !inviteSent && (
-              <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--blue-50, #eff6ff)', borderRadius: 'var(--radius-md)', border: '1px solid var(--blue-200, #bfdbfe)' }}>
-                <i className="pi pi-envelope" style={{ fontSize: '1.5rem', color: 'var(--blue-500)' }} />
-                <div className="flex-1">
-                  <p className="m-0 font-medium">Company ledger uploaded</p>
-                  <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                    Click "Send Vendor Invite" to email the vendor(s) a link to upload their statement.
-                  </p>
-                </div>
-                <Button
-                  label="Send Vendor Invite"
-                  icon="pi pi-send"
-                  loading={isSendingInvites}
-                  onClick={handleSendInvites}
-                />
-              </div>
-            )}
-
-            {inviteSent && requestId && (
+            {/* Success — invites are auto-sent the moment the request was
+                created in Step 1 (primary contact "To", every other vendor
+                contact CC'd), so there's nothing left to manually trigger here. */}
+            {uploadComplete && requestId && (
               <div className="flex align-items-center gap-3 mt-4 p-3" style={{ background: 'var(--green-50, #f0fdf4)', borderRadius: 'var(--radius-md)', border: '1px solid var(--green-200, #bbf7d0)' }}>
                 <i className="pi pi-check-circle" style={{ fontSize: '1.5rem', color: 'var(--green-500)' }} />
                 <div className="flex-1">
-                  <p className="m-0 font-medium">Vendor invite sent successfully</p>
+                  <p className="m-0 font-medium">Company ledger uploaded</p>
                   <p className="m-0 text-sm" style={{ color: 'var(--color-text-muted)' }}>
-                    The vendor(s) have been emailed a unique link to upload their statement. You can track progress in Track Reconciliation.
+                    Vendor invite email(s) were sent automatically when this request was created.
+                    You can track progress in Track Reconciliation.
                   </p>
                 </div>
                 <Button

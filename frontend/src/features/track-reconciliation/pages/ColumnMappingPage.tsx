@@ -17,10 +17,12 @@ import { ProgressSpinner } from 'primereact/progressspinner';
 import { Message } from 'primereact/message';
 import { DataTable } from 'primereact/datatable';
 import { Column } from 'primereact/column';
+import { Dialog } from 'primereact/dialog';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import { downloadBlob, filenameFromDisposition } from '@shared/utils/downloadBlob';
+import { MappingFormContent } from '../components/MappingFormContent';
 
 interface CaseDetail {
   id: string;
@@ -52,6 +54,7 @@ export const ColumnMappingPage = () => {
   const [showVendor, setShowVendor] = useState(false);
   const [busySide, setBusySide] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [mappingSide, setMappingSide] = useState<'company' | 'vendor' | null>(null);
   const companyFileRef = useRef<HTMLInputElement>(null);
   const vendorFileRef = useRef<HTMLInputElement>(null);
 
@@ -217,14 +220,24 @@ export const ColumnMappingPage = () => {
         params: { side, company_code: companyCode },
         responseType: 'blob',
       });
-      // Filename: partycode_partyname_ledger.csv (sanitized for filesystem)
+      // Filename: partycode_partyname_ledger.<original-ext> (sanitized for filesystem)
       const partyCode = (vendorData as any)?.vendor_code || 'party';
       const partyName = (vendorData as any)?.name || side;
       const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      // Preserve the original file's extension/content-type instead of forcing CSV,
+      // so an uploaded .xlsx ledger is downloaded back as .xlsx, not .csv.
+      const originalFilename = filenameFromDisposition(
+        response.headers['content-disposition'],
+        `${side}_ledger.csv`,
+      );
+      const ext = originalFilename.includes('.')
+        ? originalFilename.slice(originalFilename.lastIndexOf('.'))
+        : '.csv';
+      const contentType = response.headers['content-type'] || 'application/octet-stream';
       downloadBlob(
         response.data,
-        `${sanitize(partyCode)}_${sanitize(partyName)}_ledger.csv`,
-        'text/csv',
+        `${sanitize(partyCode)}_${sanitize(partyName)}_ledger${ext}`,
+        contentType,
       );
     } catch (error: any) {
       const detail = error.response?.status === 404
@@ -271,10 +284,13 @@ export const ColumnMappingPage = () => {
           headers: { 'Content-Type': 'multipart/form-data' },
         }
       );
-      toast.current?.show({ severity: 'success', summary: 'Uploaded', detail: data.message, life: 4000 });
+      toast.current?.show({ severity: 'success', summary: 'Uploaded', detail: data.message, life: 3000 });
       queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
       queryClient.invalidateQueries({ queryKey: ['ledger-entries', caseId, side] });
       queryClient.invalidateQueries({ queryKey: ['ledger-present', caseId, side] });
+      // Open the column-mapping form in a popup for the side just uploaded,
+      // so the user maps + saves columns immediately without leaving this page.
+      setMappingSide(side);
     } catch (error: any) {
       const detail = error.response?.data?.detail || 'Upload failed.';
       toast.current?.show({ severity: 'error', summary: 'Upload Failed', detail, life: 8000 });
@@ -386,7 +402,7 @@ export const ColumnMappingPage = () => {
                     label="Map"
                     icon="pi pi-cog"
                     className="p-button-text p-button-sm"
-                    onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/company`)}
+                    onClick={() => setMappingSide('company')}
                   />
                   <Button
                     label={showCompany ? 'Hide' : 'Preview'}
@@ -484,7 +500,7 @@ export const ColumnMappingPage = () => {
                     label="Map"
                     icon="pi pi-cog"
                     className="p-button-text p-button-sm"
-                    onClick={() => navigate(`/track-reconciliation/${requestId}/${caseId}/mapping/vendor`)}
+                    onClick={() => setMappingSide('vendor')}
                   />
                   <Button
                     label={showVendor ? 'Hide' : 'Preview'}
@@ -671,6 +687,28 @@ export const ColumnMappingPage = () => {
           </div>
         </div>
       </div>
+
+      {/* Column Mapping Popup */}
+      <Dialog
+        header={`Map Columns — ${mappingSide === 'company' ? 'Company Ledger' : 'Vendor Ledger'}`}
+        visible={!!mappingSide}
+        onHide={() => setMappingSide(null)}
+        style={{ width: '900px', maxWidth: '95vw' }}
+        modal
+        aria-label="Column mapping dialog"
+      >
+        {mappingSide && caseId && (
+          <MappingFormContent
+            caseId={caseId}
+            side={mappingSide}
+            onCancel={() => setMappingSide(null)}
+            onSubmitted={() => {
+              setMappingSide(null);
+              queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
+            }}
+          />
+        )}
+      </Dialog>
     </div>
   );
 };

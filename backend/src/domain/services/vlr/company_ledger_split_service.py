@@ -219,6 +219,75 @@ def build_split_ledger_csv(
     return buffer.getvalue().encode("utf-8-sig")
 
 
+def build_split_ledger_excel(
+    entries: list[ParsedLedgerEntry],
+    raw_headers: list[str],
+) -> bytes:
+    """
+    Same as `build_split_ledger_csv`, but writes an .xlsx workbook instead of
+    CSV — used when the original consolidated upload was an Excel file, so a
+    vendor's split-off slice keeps the same format the user uploaded instead
+    of silently turning into a CSV on download.
+
+    Falls back to CSV-as-bytes only if openpyxl is unavailable (should not
+    happen in normal deployments; the upload parser itself requires it).
+    """
+    lower_to_original = {h.strip().lower(): h.strip() for h in raw_headers if h and h.strip()}
+
+    ordered_lower_headers = [h.strip().lower() for h in raw_headers if h and h.strip()]
+    if not ordered_lower_headers:
+        seen: dict[str, None] = {}
+        for entry in entries:
+            for k in (entry.raw_data or {}):
+                seen.setdefault(k, None)
+        ordered_lower_headers = list(seen.keys())
+
+    try:
+        import io
+
+        from openpyxl import Workbook
+    except ImportError:
+        return build_split_ledger_csv(entries, raw_headers)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Ledger"
+
+    ws.append([lower_to_original.get(h, h) for h in ordered_lower_headers])
+    for entry in entries:
+        raw = entry.raw_data or {}
+        ws.append([raw.get(h, "") for h in ordered_lower_headers])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def build_split_ledger_file(
+    entries: list[ParsedLedgerEntry],
+    raw_headers: list[str],
+    original_filename: str,
+) -> tuple[bytes, str]:
+    """
+    Build a per-vendor split ledger file, preserving the original upload's
+    format (Excel stays Excel, CSV stays CSV) instead of always emitting CSV.
+
+    Returns a (file_bytes, filename) tuple, where filename has the same
+    extension as `original_filename` and a "_split" suffix before it.
+    """
+    import os
+
+    stem, ext = os.path.splitext(original_filename or "")
+    ext_lower = ext.lower()
+
+    if ext_lower in (".xlsx", ".xls"):
+        content = build_split_ledger_excel(entries, raw_headers)
+        return content, f"{stem}_split.xlsx"
+
+    content = build_split_ledger_csv(entries, raw_headers)
+    return content, f"{stem}_split.csv"
+
+
 def match_entries_to_vendors(
     entries: list[ParsedLedgerEntry],
     raw_headers: list[str],

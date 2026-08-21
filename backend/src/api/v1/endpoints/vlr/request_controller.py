@@ -170,8 +170,16 @@ async def create_request(
     request: CreateRequestRequest,
     current_user: User = Depends(get_current_active_user),
     service: RequestManagerService = Depends(_get_request_manager_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> ReconciliationRequestResponse:
-    """POST /api/v1/vlr/requests — Create a new reconciliation request with cases."""
+    """POST /api/v1/vlr/requests — Create a new reconciliation request with cases.
+
+    Automatically emails every selected vendor's case as soon as the request
+    is created — primary contact in "To", every other contact on that vendor
+    CC'd — so no separate manual "Send Vendor Invite" step is needed. If
+    email isn't configured (or sending fails for a vendor), the request is
+    still created; the failure is logged rather than blocking creation.
+    """
     matching_prefs = None
     if request.matching_preferences:
         matching_prefs = MatchingPreferences(
@@ -217,6 +225,36 @@ async def create_request(
             status_code=500,
             detail=f"An unexpected error occurred while creating the request: {str(e)}",
         )
+
+    # Auto-send the vendor ledger request invite to every case just created
+    # for this request — primary contact "To", every other vendor contact
+    # CC'd. Best-effort: email misconfiguration or SMTP failure must not
+    # roll back or fail request creation, since the request/cases are
+    # already committed by this point (get_db_session commits on success).
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        request_id = getattr(result, "id")
+        case_repo = CaseRepositoryImpl(session)
+        cases_page = await case_repo.list_by_request(
+            request_id, PaginationParams(page=1, page_size=1000)
+        )
+        if cases_page.items:
+            await _send_invites_for_cases(
+                session, request_id, request.company_code, result,
+                list(cases_page.items), [], "",
+            )
+    except HTTPException as e:
+        # e.g. SMTP not configured — don't fail request creation over it.
+        logger.warning(
+            "Auto-invite skipped for request %s: %s",
+            getattr(result, "id", None), e.detail,
+        )
+    except Exception:
+        logger.exception(
+            "Auto-invite failed for request %s", getattr(result, "id", None)
+        )
+
     return ReconciliationRequestResponse.model_validate(result)
 
 
@@ -862,7 +900,7 @@ async def upload_company_ledger(
     from src.domain.exceptions.vlr import FileValidationException
     from src.domain.services.vlr.file_parser_service import FileParserService
     from src.domain.services.vlr.company_ledger_split_service import (
-        build_split_ledger_csv,
+        build_split_ledger_file,
         detect_identifier_header,
         normalize_identifier,
         split_entries_by_identifier,
@@ -1097,17 +1135,19 @@ async def upload_company_ledger(
             notified_case_ids.append(case_id)
         matched_vendor_count = len(entries_by_case)
 
-        # Save headers + a PER-VENDOR CSV (that vendor's rows only) against
-        # each case that received rows. We deliberately do NOT store the
-        # original consolidated file's raw bytes here — that would contain
-        # every other vendor's rows too, and "Download" would return the
-        # whole ledger instead of just this vendor's slice.
+        # Save headers + a PER-VENDOR split file (that vendor's rows only)
+        # against each case that received rows. We deliberately do NOT store
+        # the original consolidated file's raw bytes here — that would
+        # contain every other vendor's rows too, and "Download" would return
+        # the whole ledger instead of just this vendor's slice. The split
+        # file preserves the original upload's format (xlsx stays xlsx).
         for case_id, entries in entries_by_case.items():
             await _save_headers_setting(case_id, result.raw_headers)
-            split_csv_bytes = build_split_ledger_csv(entries, result.raw_headers)
-            split_filename = f"{os.path.splitext(filename)[0]}_split.csv"
+            split_bytes, split_filename = build_split_ledger_file(
+                entries, result.raw_headers, filename,
+            )
             await _store_original(
-                session, case_id, "company", split_filename, split_csv_bytes,
+                session, case_id, "company", split_filename, split_bytes,
                 modified_by=current_user.username,
             )
 

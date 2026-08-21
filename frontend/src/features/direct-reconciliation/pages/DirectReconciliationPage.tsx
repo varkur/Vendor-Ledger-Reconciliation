@@ -36,6 +36,7 @@ import type { ReconciliationRequestResponse } from '../api/directReconciliationA
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import { useVendors } from '@features/vendor-management/hooks/useVendors';
 import { StatusBadge } from '@shared/components/StatusBadge';
+import { MappingFormContent } from '@features/track-reconciliation/components/MappingFormContent';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -121,6 +122,13 @@ export const DirectReconciliationPage = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedVendorFile, setSelectedVendorFile] = useState<File | null>(null);
   const fileUploadRef = useRef<FileUpload>(null);
+  // Popup-style column mapping shown right after a successful upload —
+  // walks the user through company then vendor mapping without leaving this page.
+  const [mappingPopup, setMappingPopup] = useState<{
+    requestId: string;
+    caseId: string;
+    side: 'company' | 'vendor';
+  } | null>(null);
 
   // ─── API Hooks ───────────────────────────────────────────────────────────────
   const {
@@ -250,13 +258,14 @@ export const DirectReconciliationPage = () => {
         {
           onSuccess: (response) => {
             setShowNewDialog(false);
-            // Both ledgers are uploaded but not yet reconciled — send the user
-            // to the mapping page to review/map columns before they trigger
-            // reconciliation themselves.
+            // Both ledgers are uploaded but not yet reconciled — open the
+            // column-mapping form in a popup (company side first) right away
+            // so the user maps + saves columns immediately, rather than
+            // landing on the case summary page and having to click "Map".
             const requestId = response?.request_id;
             const caseId = response?.case_id;
             if (requestId && caseId) {
-              navigate(`/track-reconciliation/${requestId}/${caseId}`);
+              setMappingPopup({ requestId, caseId, side: 'company' });
             }
           },
         }
@@ -405,6 +414,7 @@ export const DirectReconciliationPage = () => {
           </div>
         </div>
         {renderNewReconciliationDialog()}
+        {renderMappingPopup()}
       </div>
     );
   }
@@ -501,8 +511,49 @@ export const DirectReconciliationPage = () => {
 
       {/* Create Reconciliation Dialog */}
       {renderNewReconciliationDialog()}
+      {renderMappingPopup()}
     </div>
   );
+
+  // ─── Mapping Popup Render ───────────────────────────────────────────────────
+
+  function renderMappingPopup() {
+    if (!mappingPopup) return null;
+    const { requestId, caseId, side } = mappingPopup;
+    const sideLabel = side === 'company' ? 'Company Ledger' : 'Vendor Ledger';
+
+    return (
+      <Dialog
+        header={`Map Columns — ${sideLabel}`}
+        visible={!!mappingPopup}
+        onHide={() => setMappingPopup(null)}
+        style={{ width: '900px', maxWidth: '95vw' }}
+        modal
+        aria-label="Column mapping dialog"
+      >
+        <MappingFormContent
+          caseId={caseId}
+          side={side}
+          submitLabel={side === 'company' ? 'Save & Map Vendor Ledger' : 'Save & Finish'}
+          onCancel={() => {
+            // Skip mapping for now — land on the case summary so the user
+            // can map later via the "Map" button.
+            setMappingPopup(null);
+            navigate(`/track-reconciliation/${requestId}/${caseId}`);
+          }}
+          onSubmitted={() => {
+            if (side === 'company') {
+              // Chain straight into the vendor side mapping.
+              setMappingPopup({ requestId, caseId, side: 'vendor' });
+            } else {
+              setMappingPopup(null);
+              navigate(`/track-reconciliation/${requestId}/${caseId}`);
+            }
+          }}
+        />
+      </Dialog>
+    );
+  }
 
   // ─── Dialog Render ──────────────────────────────────────────────────────────
 

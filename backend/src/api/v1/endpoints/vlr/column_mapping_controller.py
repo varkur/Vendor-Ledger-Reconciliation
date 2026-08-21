@@ -21,7 +21,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.dependencies import get_current_active_user
@@ -49,6 +49,16 @@ router = APIRouter(prefix="/vlr/column-mapping", tags=["VLR - Column Mapping"])
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+class DocTypeSummary(PydanticBaseModel):
+    """Per-document-type line item count and total amount, for the Map
+    Document Type table (lets the reviewer verify entry counts/amounts
+    line up with the source file before committing the mapping)."""
+
+    doc_type: str
+    count: int
+    amount: float
+
+
 class HeadersResponse(PydanticBaseModel):
     """Response schema for file headers endpoint."""
 
@@ -56,6 +66,7 @@ class HeadersResponse(PydanticBaseModel):
     sample_values: dict[str, list[str]]
     row_count: int
     distinct_doc_types: list[str] = []
+    doc_type_summary: list[DocTypeSummary] = []
 
 
 class ColumnMappingConfig(PydanticBaseModel):
@@ -141,21 +152,34 @@ class ApplyMappingResponse(PydanticBaseModel):
 # Known header aliases for auto-detection
 HEADER_ALIASES: dict[str, list[str]] = {
     "invoice_no": [
+        # On SAP-style company ledgers, "Assignment" (SAP field ZUONR) is
+        # where the vendor's actual invoice number is recorded — "Document
+        # Number" (BELNR) is SAP's own internal accounting document number,
+        # NOT the vendor's invoice number. Checked first so it wins over the
+        # generic/legacy aliases below whenever a file has both columns.
+        "assignment", "assignment number", "zuonr",
         "invoice no", "invoice_no", "invoice number", "inv no", "bill no",
-        "document number", "doc no", "belnr", "xblnr", "zuonr", "reference",
+        "document number", "doc no", "belnr", "xblnr", "reference",
         "ref no", "reference number", "voucher no", "voucher number",
     ],
     "invoice_date": [
-        "invoice date", "invoice_date", "doc date", "document date",
-        "budat", "bldat", "posting date", "date", "voucher date", "bill date",
+        # "Document Date" (BLDAT) is the invoice's own date; "Posting Date"
+        # (BUDAT) is when it was posted into the books, which is often
+        # several days later and skews date-based matching if used instead.
+        # Checked first so it wins whenever a file has both columns.
+        "document date", "doc date", "invoice date", "invoice_date",
+        "bldat", "voucher date", "bill date",
+        "budat", "posting date", "date",
     ],
     "document_type": [
         "document type", "doc type", "blart", "voucher type", "type",
         "transaction type", "txn type",
     ],
     "amount_field": [
-        "amount", "net amount", "total amount", "value", "dmbtr", "wrbtr",
-        "transaction amount", "txn amount", "invoice amount", "bill amount",
+        "amount", "amount in local currency", "amount in doc. curr",
+        "amount in doc curr", "net amount", "total amount", "value",
+        "dmbtr", "wrbtr", "transaction amount", "txn amount",
+        "invoice amount", "bill amount",
     ],
     "debit_field": [
         "debit", "debit amount", "dr", "dr amount", "debit value",
@@ -554,9 +578,17 @@ async def get_file_headers(
                 headers.append(display_name)
                 sample_values[display_name] = values[:5]
 
-    # Compute DISTINCT document types directly from the DB (the actual doc type codes)
+    # Compute DISTINCT document types directly from the DB (the actual doc
+    # type codes), together with the line-item count and total signed
+    # amount for each — shown as "Count"/"Amount" columns on the Map
+    # Document Type table so the reviewer can verify the file's totals per
+    # doc type before committing the mapping.
     dt_stmt = (
-        select(LedgerEntryModel.document_type)
+        select(
+            LedgerEntryModel.document_type,
+            func.count(LedgerEntryModel.id),
+            func.coalesce(func.sum(LedgerEntryModel.amount), 0),
+        )
         .where(
             and_(
                 LedgerEntryModel.case_id == str(case_id),
@@ -564,10 +596,15 @@ async def get_file_headers(
                 LedgerEntryModel.document_type.isnot(None),
             )
         )
-        .distinct()
+        .group_by(LedgerEntryModel.document_type)
     )
     dt_result = await session.execute(dt_stmt)
-    distinct_doc_types = [r[0] for r in dt_result.all() if r[0]]
+    dt_rows = [r for r in dt_result.all() if r[0]]
+    distinct_doc_types = [r[0] for r in dt_rows]
+    doc_type_summary = [
+        DocTypeSummary(doc_type=r[0], count=r[1], amount=float(r[2]))
+        for r in dt_rows
+    ]
 
     logger.info(
         "Headers extracted: case_id=%s, side=%s, headers=%d, doc_types=%d, rows=%d, user=%s",
@@ -579,6 +616,7 @@ async def get_file_headers(
         sample_values=sample_values,
         row_count=row_count,
         distinct_doc_types=distinct_doc_types,
+        doc_type_summary=doc_type_summary,
     )
 
 
@@ -610,51 +648,44 @@ async def get_column_mapping(
     setting = await setting_repo.get_by_key(company_code, key)
 
     if setting:
-        # Return saved mapping
+        # Return saved mapping. A small number of legacy rows persisted a
+        # field as the raw dropdown option object (e.g. {"label": "Select",
+        # "value": ""}) instead of a plain string — self-heal those on read
+        # so the mapping screen doesn't 500/422-loop for that case forever.
         mapping_data = json.loads(setting.value)
+        raw_mappings = mapping_data.get("mappings", {})
+        cleaned_mappings = {
+            k: (v if isinstance(v, str) or v is None else None)
+            for k, v in raw_mappings.items()
+        }
         return GetColumnMappingResponse(
             case_id=str(case_id),
             side=side,
-            mappings=ColumnMappingConfig(**mapping_data.get("mappings", {})),
+            mappings=ColumnMappingConfig(**cleaned_mappings),
             doc_type_mappings=mapping_data.get("doc_type_mappings", {}),
             is_default=False,
         )
 
-    # No saved mapping — attempt auto-detection
-    stmt = (
-        select(LedgerEntryModel)
-        .where(
-            and_(
-                LedgerEntryModel.case_id == str(case_id),
-                LedgerEntryModel.side == side,
-            )
-        )
-        .limit(10)
+    # No saved mapping — attempt auto-detection using the REAL original file
+    # headers (the same list the Map Columns dropdowns are populated from —
+    # see get_file_headers above), not a hardcoded pseudo-header list. The
+    # previous fallback built its own generic field-name list ("Document
+    # Number", "Posting Date", "Assignment Number", ...) that never
+    # included "Document Date" and could never match a real "Assignment"
+    # header, so the default could never land on the columns this business
+    # rule requires (Assignment -> Invoice No, Document Date -> Invoice
+    # Date) no matter what HEADER_ALIASES said — it always fell back to
+    # Document Number / Posting Date because those were the only names
+    # available to match against.
+    file_headers: list[str] = []
+    headers_setting = await setting_repo.get_by_key(
+        "__global__", f"file_headers.{case_id}.{side}"
     )
-    result = await session.execute(stmt)
-    entries = list(result.scalars().all())
+    if headers_setting:
+        file_headers = json.loads(headers_setting.value)
 
-    if entries:
-        # Build a pseudo-header list from fields that have data
-        field_mapping = {
-            "document_number": "Document Number",
-            "document_type": "Document Type",
-            "reference_number": "Reference Number",
-            "posting_date": "Posting Date",
-            "clearing_date": "Clearing Date",
-            "clearing_document": "Clearing Document",
-            "amount": "Amount",
-            "assignment_number": "Assignment Number",
-            "description": "Description/Narration",
-        }
-        available_headers = []
-        for field_name, display_name in field_mapping.items():
-            for entry in entries:
-                if getattr(entry, field_name, None) is not None:
-                    available_headers.append(display_name)
-                    break
-
-        auto_mapping = _auto_detect_mappings(available_headers)
+    if file_headers:
+        auto_mapping = _auto_detect_mappings(file_headers)
         if auto_mapping:
             return GetColumnMappingResponse(
                 case_id=str(case_id),

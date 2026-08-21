@@ -44,7 +44,7 @@ from src.api.v1.schemas.vlr.request_schemas import (
 from src.domain.entities.user import User
 from src.domain.exceptions.vlr import FileValidationException, OverlappingPeriodException
 from src.domain.services.vlr.company_ledger_split_service import (
-    build_split_ledger_csv,
+    build_split_ledger_file,
     match_entries_to_vendors,
 )
 from src.domain.services.vlr.file_parser_service import FileParserService
@@ -489,30 +489,49 @@ async def confirm_ledger_upload(
         await save_company_file_headers(session, case.id, result.raw_headers)
         # Store ONLY this vendor's rows, not the consolidated file's raw
         # bytes — otherwise "Download" would return every other vendor's
-        # entries too (see build_split_ledger_csv).
-        split_csv_bytes = build_split_ledger_csv(entries, result.raw_headers)
-        split_filename = f"{_os.path.splitext(staging.filename)[0]}_split.csv"
+        # entries too (see build_split_ledger_file). Format (xlsx/csv) is
+        # preserved from the original upload instead of always writing CSV.
+        split_bytes, split_filename = build_split_ledger_file(
+            entries, result.raw_headers, staging.filename,
+        )
         await store_original_ledger_file(
-            session, case.id, "company", split_filename, split_csv_bytes,
+            session, case.id, "company", split_filename, split_bytes,
             modified_by=current_user.username,
         )
         notified_case_ids.append(case.id)
 
     await session.delete(staging)
     await session.flush()
+    await session.commit()
 
+    # Auto-send the vendor ledger request invite to every case just created
+    # from this consolidated upload — primary contact "To", every other
+    # vendor contact CC'd — same as the plain create-request flow. No
+    # longer gated behind auto_notify_vendors (which defaulted to false and
+    # every frontend call site omitted it, so invites never went out
+    # automatically here). Best-effort: email misconfiguration or SMTP
+    # failure must not fail the upload confirmation, since the request/
+    # cases are already committed above.
     invites_sent = 0
-    if body.auto_notify_vendors and notified_case_ids:
+    if notified_case_ids:
         from src.api.v1.endpoints.vlr.request_controller import _send_invites_for_cases
 
         notify_cases = [c for c in cases if c.id in notified_case_ids]
-        invite_response = await _send_invites_for_cases(
-            session, request_id, request_config.company_code, request_obj,
-            notify_cases, [], "",
-        )
-        invites_sent = invite_response.emails_sent
-    else:
-        await session.commit()
+        try:
+            invite_response = await _send_invites_for_cases(
+                session, request_id, request_config.company_code, request_obj,
+                notify_cases, [], "",
+            )
+            invites_sent = invite_response.emails_sent
+        except HTTPException as e:
+            logger.warning(
+                "Auto-invite skipped for consolidated-upload request %s: %s",
+                request_id, e.detail,
+            )
+        except Exception:
+            logger.exception(
+                "Auto-invite failed for consolidated-upload request %s", request_id
+            )
 
     return ConfirmLedgerUploadResponse(
         request_id=request_id,

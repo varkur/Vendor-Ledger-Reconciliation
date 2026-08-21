@@ -84,7 +84,11 @@ export const AddPartyDialog = ({ visible, onHide }: AddPartyDialogProps) => {
         pan: data.pan || undefined,
         gstin: data.gstin || undefined,
         city: data.city || undefined,
-        status: data.status,
+        // Backend only accepts lowercase 'active'/'inactive' (validated via
+        // regex pattern) — the form/dropdown uses 'Active'/'Inactive' for
+        // display, so it must be lowercased before hitting the API or every
+        // single vendor creation 422s on the status field.
+        status: data.status.toLowerCase(),
         contacts: [
           {
             name: data.contactName,

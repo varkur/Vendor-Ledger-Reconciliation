@@ -174,6 +174,21 @@ class VendorService:
             ]
             await self._vendor_repo.add_contacts(vendor_id, contact_dicts)
 
+            # Re-fetch instead of returning the freshly-flushed `vendor`
+            # object as-is: `VendorModel.contacts` is lazy="selectin", which
+            # only eager-loads when the object comes back from a SELECT.
+            # The object here was populated via session.add()+flush(), so
+            # its `contacts` collection was never loaded. The API layer
+            # (VendorResponse.model_validate) accesses `.contacts`
+            # synchronously — SQLAlchemy's async lazy-load has no greenlet
+            # context to run in at that point and raises MissingGreenlet
+            # ("greenlet_spawn has not been called"), which the exception
+            # middleware doesn't recognize and surfaces as a raw 500 on
+            # every single vendor creation that includes a contact.
+            refreshed = await self._vendor_repo.get_by_id(vendor_id, data.company_code)
+            if refreshed is not None:
+                vendor = refreshed
+
         return vendor
 
     async def get_vendor(self, vendor_id: UUID, company_code: str) -> object:
@@ -222,6 +237,7 @@ class VendorService:
             vendor = await self.get_vendor(vendor_id, company_code)
 
         # Handle contact updates if provided
+        contacts_changed = False
         if data.contacts is not None:
             # Replace ALL contacts with the new set (user explicitly provided the full list)
             await self._vendor_repo.remove_all_contacts(vendor_id)
@@ -238,6 +254,20 @@ class VendorService:
             ]
             if contact_dicts:
                 await self._vendor_repo.add_contacts(vendor_id, contact_dicts)
+            contacts_changed = True
+
+        # Re-fetch when contacts were touched — same MissingGreenlet issue as
+        # create_vendor: VendorModel.contacts is lazy="selectin", which only
+        # eager-loads on a fresh SELECT. `vendor` here may be the object
+        # returned by repo.update() (mutated in place, contacts never
+        # (re)loaded) or a stale get_vendor() snapshot from before the
+        # contacts were replaced — either way it doesn't reflect the new
+        # contacts, and touching `.contacts` outside an async context would
+        # crash the same way on serialization.
+        if contacts_changed:
+            refreshed = await self._vendor_repo.get_by_id(vendor_id, company_code)
+            if refreshed is not None:
+                vendor = refreshed
 
         return vendor
 
