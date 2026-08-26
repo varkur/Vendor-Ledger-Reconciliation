@@ -1896,9 +1896,21 @@ class TestCategoryGating:
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 1
 
-    def test_payment_matches_receipt(self, service: ReconciliationEngineService):
+    def test_payment_does_not_match_receipt(self, service: ReconciliationEngineService):
+        """Cross-category matching should not occur except where the mapping
+        doc explicitly requires it (Debit Note <-> Credit Note). The doc
+        never actually describes a Payment<->Receipt cross-match — that was
+        an unverified assumption in CATEGORY_COMPATIBILITY, corrected per
+        explicit user instruction: "invoice should only match with invoice,
+        payment should only match with payment.\""""
         company = [_cat_entry("500", "Payment", date(2024, 3, 15))]
         vendor = [_cat_entry("-500", "Receipt", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0
+
+    def test_payment_matches_payment(self, service: ReconciliationEngineService):
+        company = [_cat_entry("500", "Payment", date(2024, 3, 15))]
+        vendor = [_cat_entry("-500", "Payment", date(2024, 3, 15))]
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 1
 
@@ -2198,9 +2210,14 @@ class TestUTRPaymentGrouping:
     def test_split_payments_same_utr_combine_and_match(
         self, service: ReconciliationEngineService
     ):
+        """Vendor-side entry uses the SAME category ("Payment"), not
+        "Receipt" — cross-category matching was removed per explicit user
+        correction ("invoice should only match with invoice, payment should
+        only match with payment"), so this now reflects a real UTR-grouped
+        pairing rather than the old Payment<->Receipt assumption."""
         c1 = _cat_entry("600", "Payment", date(2024, 3, 10), assignment_number="UTR123")
         c2 = _cat_entry("400", "Payment", date(2024, 3, 12), assignment_number="UTR123")
-        v1 = _cat_entry("-1000", "Receipt", date(2024, 3, 15))
+        v1 = _cat_entry("-1000", "Payment", date(2024, 3, 15))
         groups = service._utr_payment_match([c1, c2], [v1], date_tolerance_days=15)
         assert len(groups) == 1
         assert set(groups[0].company_entry_ids) == {c1.id, c2.id}
@@ -2210,7 +2227,7 @@ class TestUTRPaymentGrouping:
         """A UTR with only one entry doesn't need combining — leave it to the
         normal 1:1 passes."""
         c1 = _cat_entry("600", "Payment", date(2024, 3, 10), assignment_number="UTR123")
-        v1 = _cat_entry("-600", "Receipt", date(2024, 3, 10))
+        v1 = _cat_entry("-600", "Payment", date(2024, 3, 10))
         groups = service._utr_payment_match([c1], [v1], date_tolerance_days=15)
         assert len(groups) == 0
 
@@ -2219,7 +2236,7 @@ class TestUTRPaymentGrouping:
     ):
         c1 = _cat_entry("600", "Payment", date(2024, 1, 1), assignment_number="UTR9")
         c2 = _cat_entry("400", "Payment", date(2024, 1, 1), assignment_number="UTR9")
-        v1 = _cat_entry("-1000", "Receipt", date(2024, 6, 1))  # far outside window
+        v1 = _cat_entry("-1000", "Payment", date(2024, 6, 1))  # far outside window
         groups = service._utr_payment_match([c1, c2], [v1], date_tolerance_days=15)
         assert len(groups) == 0
 
@@ -2238,8 +2255,11 @@ class TestPaymentDateDirectionality:
     def test_vendor_receipt_after_payment_date_matches(
         self, service: ReconciliationEngineService
     ):
+        """Vendor-side entry uses the SAME category ("Payment") — see
+        TestUTRPaymentGrouping for why Payment<->Receipt cross-matching was
+        removed."""
         company = [_cat_entry("1000", "Payment", date(2024, 3, 1))]
-        vendor = [_cat_entry("-1000", "Receipt", date(2024, 3, 10))]  # +9 days
+        vendor = [_cat_entry("-1000", "Payment", date(2024, 3, 10))]  # +9 days
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
         assert len(pairs) == 1
 
@@ -2249,7 +2269,7 @@ class TestPaymentDateDirectionality:
         """Bug fix: previously used abs(date_diff), which incorrectly allowed
         a vendor receipt dated BEFORE the company payment to match."""
         company = [_cat_entry("1000", "Payment", date(2024, 3, 10))]
-        vendor = [_cat_entry("-1000", "Receipt", date(2024, 3, 1))]  # -9 days (before)
+        vendor = [_cat_entry("-1000", "Payment", date(2024, 3, 1))]  # -9 days (before)
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
         assert len(pairs) == 0
 
@@ -2448,3 +2468,104 @@ class TestTdsSequentialLink:
         assert c_invoice.id not in result.unmatched_company_ids
         assert v_invoice.id not in result.unmatched_vendor_ids
         assert v_tds.id not in result.unmatched_vendor_ids
+
+
+class TestAmountMismatchMatch:
+    """
+    Per explicit correction: a same invoice number + same DOCUMENT date
+    (Invoice Date, not raw SAP posting date — see _amount_mismatch_match's
+    docstring) pair whose amount gap is NOT explained by the configured
+    TDS/GST rate must still be matched (not left as two separate open
+    items), classified as an "Amount Mismatch" — the one case where the
+    automated engine itself emits that label.
+
+    `_cat_entry`'s `posting_date` param is used directly here since
+    LedgerEntryData.posting_date is populated with the DOCUMENT DATE post
+    column-mapping (see column_mapping_controller.py) — the field name is
+    legacy, not a raw SAP posting date in this context.
+    """
+
+    def test_same_invoice_same_document_date_unexplained_gap_is_matched(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry(
+            "-100000", "Invoice", date(2024, 3, 15), reference_number="INV-100",
+        )]
+        vendor = [_cat_entry(
+            "95000", "Invoice", date(2024, 3, 15), reference_number="INV-100",
+        )]
+        pairs = service._amount_mismatch_match(company, vendor)
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.AMOUNT_MISMATCH
+
+    def test_gap_explained_by_configured_tds_is_not_amount_mismatch(
+        self, service: ReconciliationEngineService
+    ):
+        """A 10% TDS-sized gap on the same invoice/date IS explained, so
+        this pass must defensively skip it (an earlier pass should already
+        have claimed it as TDS Booked, not Amount Mismatch)."""
+        company = [_cat_entry(
+            "-100000", "Invoice", date(2024, 3, 15), reference_number="INV-200",
+        )]
+        vendor = [_cat_entry(
+            "90000", "Invoice", date(2024, 3, 15), reference_number="INV-200",
+        )]
+        pairs = service._amount_mismatch_match(
+            company, vendor, tds_percentage=Decimal("10"),
+        )
+        assert len(pairs) == 0
+
+    def test_different_document_date_is_not_matched_by_this_pass(
+        self, service: ReconciliationEngineService
+    ):
+        """Same invoice number but a DIFFERENT document date doesn't
+        qualify — this pass specifically requires both invoice number AND
+        document date to match."""
+        company = [_cat_entry(
+            "-100000", "Invoice", date(2024, 3, 15), reference_number="INV-300",
+        )]
+        vendor = [_cat_entry(
+            "95000", "Invoice", date(2024, 3, 20), reference_number="INV-300",
+        )]
+        pairs = service._amount_mismatch_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_no_real_gap_is_not_matched_by_this_pass(
+        self, service: ReconciliationEngineService
+    ):
+        """An exact (no-gap) same-invoice-same-date pair belongs to
+        _exact_match, not this pass."""
+        company = [_cat_entry(
+            "-100000", "Invoice", date(2024, 3, 15), reference_number="INV-400",
+        )]
+        vendor = [_cat_entry(
+            "100000", "Invoice", date(2024, 3, 15), reference_number="INV-400",
+        )]
+        pairs = service._amount_mismatch_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_category_incompatible_entries_not_matched(
+        self, service: ReconciliationEngineService
+    ):
+        """An invoice can't be paired against a payment even with the same
+        invoice-number string and date."""
+        company = [_cat_entry(
+            "-100000", "Invoice", date(2024, 3, 15), reference_number="INV-500",
+        )]
+        vendor = [_cat_entry(
+            "95000", "Payment", date(2024, 3, 15), reference_number="INV-500",
+        )]
+        pairs = service._amount_mismatch_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_end_to_end_execute_flags_needs_confirmation(self):
+        """An Amount Mismatch pair must set needs_confirmation=True on the
+        overall result, since the gap is always unexplained."""
+        # Covered at the unit level above; full execute() requires DB
+        # repositories, so this is exercised via the export-service test
+        # confirming the pass number rolls up into needs_confirmation
+        # correctly through the _NEEDS_CONFIRMATION_PASSES list.
+        from src.api.v1.endpoints.vlr.reconciliation_output_controller import (
+            _NEEDS_CONFIRMATION_PASSES,
+        )
+        assert MatchPassType.AMOUNT_MISMATCH in _NEEDS_CONFIRMATION_PASSES

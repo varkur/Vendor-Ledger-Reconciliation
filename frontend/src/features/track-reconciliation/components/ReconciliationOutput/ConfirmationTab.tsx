@@ -5,7 +5,7 @@
  * Requirements: 19.1, 19.2, 19.3, 19.4
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Button } from 'primereact/button';
 import { Column } from 'primereact/column';
 import { DataTable, type DataTablePageEvent, type DataTableSortEvent } from 'primereact/datatable';
@@ -14,6 +14,7 @@ import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
 import { Tag } from 'primereact/tag';
 
+import { useDebouncedValue } from '@shared/hooks/useDebouncedValue';
 import { useConfirmationItems, useConfirmMatch } from './useReconciliationOutput';
 import type { ConfirmAction, ConfirmationItem, ListParams } from './reconciliationOutputApi';
 
@@ -38,9 +39,16 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
   });
   const [searchInput, setSearchInput] = useState('');
 
-  const { data, isLoading, error, refetch } = useConfirmationItems(caseId, {
+  // Debounce the search box so it only queries the server after the user
+  // pauses typing, not on every keystroke.
+  const debouncedSearch = useDebouncedValue(searchInput, 400);
+  useEffect(() => {
+    setParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+  }, [debouncedSearch]);
+
+  const { data, isLoading, isFetching, error, refetch } = useConfirmationItems(caseId, {
     ...params,
-    search: searchInput || undefined,
+    search: debouncedSearch || undefined,
   });
 
   const confirmMutation = useConfirmMatch(caseId);
@@ -61,12 +69,6 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
       sort_by: event.sortField as string,
       sort_order: event.sortOrder === 1 ? 'asc' : 'desc',
     }));
-  };
-
-  const onSearchKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      setParams((prev) => ({ ...prev, page: 1 }));
-    }
   };
 
   const handleAction = (itemId: string, action: ConfirmAction) => {
@@ -159,14 +161,6 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
     );
   }
 
-  if (!data || data.items.length === 0) {
-    return (
-      <div className="p-4 text-center">
-        <Message severity="info" text="No items require finance confirmation at this time." className="w-full" />
-      </div>
-    );
-  }
-
   return (
     <div>
       {/* Mutation feedback */}
@@ -192,16 +186,19 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
             placeholder="Search by reference..."
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
-            onKeyDown={onSearchKeyDown}
             style={{ border: 'none', boxShadow: 'none', width: 200 }}
             aria-label="Search confirmation items"
           />
-          <i className="pi pi-search" />
+          <i className={isFetching ? 'pi pi-spin pi-spinner' : 'pi pi-search'} />
         </div>
       </div>
 
-      {/* DataTable */}
-      <div className="em-card" style={{ padding: 0 }}>
+      {!data || data.items.length === 0 ? (
+        <div className="p-4 text-center">
+          <Message severity="info" text="No items require finance confirmation at this time." className="w-full" />
+        </div>
+      ) : (
+      <div className="em-card" style={{ padding: 0, opacity: isFetching ? 0.6 : 1, transition: 'opacity 150ms' }}>
         <DataTable
           value={data.items}
           paginator
@@ -227,6 +224,7 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
           <Column field="reason" header="Reason" sortable style={{ width: '12%' }} />
         </DataTable>
       </div>
+      )}
     </div>
   );
 };

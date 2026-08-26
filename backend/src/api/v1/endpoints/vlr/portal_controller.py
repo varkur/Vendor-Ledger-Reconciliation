@@ -339,8 +339,16 @@ async def upload_vendor_statement(
         parent_request = (await session.execute(req_stmt)).scalar_one_or_none()
         tolerance_pct = float(parent_request.tolerance_amount or 0) if parent_request else 0
         tds_pct = float(parent_request.tds_percentage or 0) if parent_request else 0
+        tds_pct_min = float(getattr(parent_request, "tds_percentage_min", 0) or 0) if parent_request else 0
         gst_pct = float(parent_request.gst_percentage or 0) if parent_request else 0
         tolerance_fraction = RDecimal(str(tolerance_pct / 100)) if tolerance_pct > 0 else RDecimal("0")
+        # Same fix as case_controller.py's start_reconciliation — this was
+        # also hardcoded to 15, ignoring the request's configured Date Range
+        # Min/Max entirely.
+        date_tolerance_days = (
+            int(getattr(parent_request, "date_tolerance_days_max", None) or 15)
+            if parent_request else 15
+        )
 
         engine = ReconciliationEngineService(
             ledger_entry_repository=ledger_repo,
@@ -353,9 +361,10 @@ async def upload_vendor_statement(
             case_id=case.id,
             tolerance=tolerance_fraction,
             fuzzy_threshold=0.8,
-            date_tolerance_days=15,
+            date_tolerance_days=date_tolerance_days,
             tds_percentage=RDecimal(str(tds_pct)),
             gst_percentage=RDecimal(str(gst_pct)),
+            tds_percentage_min=RDecimal(str(tds_pct_min)),
         )
 
         has_unmatched = (
@@ -803,21 +812,84 @@ async def request_new_link(
         vendor = vendor_result.scalar_one_or_none()
         vendor_name = vendor.name if vendor else "Vendor"
 
-        # Dispatch send_vendor_invite via notification service
+        # Send the new-link email using the same rendering pipeline as the
+        # original invite (real entity company name + the entity's stored
+        # "Ledger Request" template), instead of NotificationService's
+        # send_vendor_invite — that method doesn't actually exist on
+        # NotificationService (it's defined on a different, unused
+        # EmailNotificationService class), so this call always silently
+        # failed and no "new link" email was ever sent.
         try:
-            from src.domain.services.vlr.notification_service import NotificationService
-            from src.infrastructure.database.repositories.vlr.notification_repository_impl import (
-                NotificationRepositoryImpl,
+            from src.infrastructure.external.email.vlr_mailer import _load_email_sender
+            from src.infrastructure.database.repositories.vlr.setting_repository_impl import (
+                SettingRepositoryImpl,
+            )
+            from src.api.v1.endpoints.vlr.company_profile_controller import (
+                resolve_company_display_name,
+            )
+            from src.api.v1.endpoints.vlr.email_template_controller import (
+                get_template_for_category,
+                render_email_template,
             )
 
-            notification_repo = NotificationRepositoryImpl(session)
-            notification_service = NotificationService(notification_repository=notification_repo)
+            email_sender = await _load_email_sender(session)
+            if email_sender is None:
+                raise RuntimeError("Email is not configured (SMTP settings missing).")
 
-            await notification_service.send_vendor_invite(
-                case_id=case.id,
-                vendor_email=email,
-                vendor_name=vendor_name,
-                portal_token=new_token,
+            request_stmt2 = select(ReconciliationRequestModel).where(
+                ReconciliationRequestModel.id == case.request_id
+            )
+            request_result2 = await session.execute(request_stmt2)
+            recon_request = request_result2.scalar_one_or_none()
+            company_code = recon_request.company_code if recon_request else ""
+
+            setting_repo = SettingRepositoryImpl(session)
+            company_name = await resolve_company_display_name(setting_repo, company_code)
+            template = await get_template_for_category(setting_repo, company_code, "ledger_request")
+            if template is None:
+                raise RuntimeError("No 'Ledger Request' email template is configured.")
+
+            # Resolve the portal base URL the same way as the original
+            # invite flow: DB setting -> PORTAL_BASE_URL env var -> first
+            # non-localhost configured CORS origin -> localhost fallback.
+            portal_setting = await setting_repo.get_by_key("__global__", "email.__global__.portal_base_url")
+            portal_base_url = (portal_setting.value if portal_setting else "").rstrip("/")
+            if not portal_base_url:
+                import os as _os
+                portal_base_url = _os.getenv("PORTAL_BASE_URL", "").rstrip("/")
+            if not portal_base_url:
+                from src.config.settings import settings as _app_settings
+                cors_origins = [
+                    o.rstrip("/")
+                    for o in (_app_settings.CORS_ORIGINS or [])
+                    if o and "localhost" not in o and "127.0.0.1" not in o
+                ]
+                if cors_origins:
+                    portal_base_url = cors_origins[0]
+            if not portal_base_url:
+                portal_base_url = "http://localhost:3000"
+
+            portal_url = f"{portal_base_url}/portal/access/{new_token}"
+
+            def _fmt_period(d) -> str:
+                try:
+                    return d.strftime("%d-%b-%Y")
+                except AttributeError:
+                    return str(d) if d else ""
+
+            subject, body_html = render_email_template(template, {
+                "vendor_name": vendor_name,
+                "vendor_code": (vendor.vendor_code if vendor else ""),
+                "company_name": company_name,
+                "portal_link": portal_url,
+                "period_start": _fmt_period(recon_request.period_start) if recon_request else "",
+                "period_end": _fmt_period(recon_request.period_end) if recon_request else "",
+                "contact_person": vendor_name,
+                "remarks": "",
+            })
+
+            await email_sender.send_email(
+                to_email=email, subject=subject, body_html=body_html,
             )
         except Exception as exc:
             logger.warning(

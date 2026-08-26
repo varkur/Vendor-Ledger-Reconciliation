@@ -102,6 +102,29 @@ async def send_signoff_request_email(
 
     portal_url = f"{PORTAL_BASE_URL}/portal/access/{case.portal_token}"
 
+    # Resolve the real requesting company's entity name for this case's
+    # request, instead of hardcoding "Emcure Pharmaceuticals Limited" —
+    # same bug/fix as the vendor invite email (see request_controller.py's
+    # _send_invites_for_cases).
+    from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+        ReconciliationRequestModel,
+    )
+    from src.api.v1.endpoints.vlr.company_profile_controller import (
+        resolve_company_display_name,
+    )
+
+    company_name = "your company"
+    request_row = (await session.execute(
+        select(ReconciliationRequestModel).where(
+            ReconciliationRequestModel.id == case.request_id
+        )
+    )).scalar_one_or_none()
+    if request_row is not None:
+        setting_repo = SettingRepositoryImpl(session)
+        company_name = await resolve_company_display_name(
+            setting_repo, request_row.company_code, fallback=request_row.company_code,
+        )
+
     body_html = f"""
     <html>
     <body style="font-family: Segoe UI, Arial, sans-serif; line-height: 1.6; color: #333;">
@@ -109,7 +132,7 @@ async def send_signoff_request_email(
             <h2 style="color: #C41E3A;">Reconciliation Sign-off Request</h2>
             <p>Dear {contact.name or vendor.name},</p>
             <p>
-                The ledger reconciliation between <strong>Emcure Pharmaceuticals Limited</strong>
+                The ledger reconciliation between <strong>{company_name}</strong>
                 and <strong>{vendor.name}</strong> has been reviewed and is ready for your sign-off.
             </p>
             <p>Please review the reconciliation statement and confirm your sign-off using the link below:</p>

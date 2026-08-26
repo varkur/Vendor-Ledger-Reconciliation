@@ -1316,8 +1316,18 @@ async def start_reconciliation(
 
     tolerance_pct = float(parent_request.tolerance_amount or 0) if parent_request else 0
     tds_pct = float(parent_request.tds_percentage or 0) if parent_request else 0
+    tds_pct_min = float(getattr(parent_request, "tds_percentage_min", 0) or 0) if parent_request else 0
     gst_pct = float(parent_request.gst_percentage or 0) if parent_request else 0
     tolerance_fraction = RDecimal(str(tolerance_pct / 100)) if tolerance_pct > 0 else RDecimal("0")
+    # Date tolerance was previously hardcoded to a flat 15 days below,
+    # ignoring whatever the user configured on the Reconciliation Settings
+    # screen (Date Range Min/Max) entirely. Use the request's configured
+    # max (the window size the date-proximity/date-range passes search
+    # within); fall back to 15 only if the request predates this column.
+    date_tolerance_days = (
+        int(getattr(parent_request, "date_tolerance_days_max", None) or 15)
+        if parent_request else 15
+    )
 
     # Set status to in_progress
     case.status = "in_progress"
@@ -1343,9 +1353,10 @@ async def start_reconciliation(
             case_id=case_id,
             tolerance=tolerance_fraction,
             fuzzy_threshold=0.8,
-            date_tolerance_days=15,
+            date_tolerance_days=date_tolerance_days,
             tds_percentage=RDecimal(str(tds_pct)),
             gst_percentage=RDecimal(str(gst_pct)),
+            tds_percentage_min=RDecimal(str(tds_pct_min)),
         )
 
         # After manual mapping + reconciliation, the case is 'statement_mapped'

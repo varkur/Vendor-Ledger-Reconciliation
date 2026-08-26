@@ -1146,6 +1146,15 @@ async def delete_ledger(
         )
     )
 
+    # Clear the saved column mapping AND cached file headers for this side —
+    # neither was being cleared here before, so after deleting a ledger the
+    # Map Columns screen would still show the PREVIOUS file's saved mapping
+    # (pointing at header names that may not exist in whatever gets
+    # re-uploaded next) instead of resetting to fresh auto-detection.
+    setting_repo = SettingRepositoryImpl(session)
+    await setting_repo.delete_by_key(company_code, _setting_key(str(case_id), side))
+    await setting_repo.delete_by_key("__global__", f"file_headers.{case_id}.{side}")
+
     # Move the case back to mapping_pending and clear stale match statistics so
     # the UI's Match Results panel refreshes (shows nothing) after deletion.
     case.status = "mapping_pending"
@@ -1273,9 +1282,18 @@ async def reupload_ledger(
         session, case_id, side, filename, content, modified_by=current_user.username,
     )
 
+    # Clear the PREVIOUS file's saved column mapping before storing the new
+    # headers — otherwise GET .../column-mapping/{case_id} keeps returning
+    # the old mapping (pointing at header names from the previous file) since
+    # that lookup returns the saved mapping unconditionally whenever one
+    # exists, regardless of whether the underlying file/headers changed.
+    # Clearing it here forces fresh auto-detection against the new file's
+    # actual headers, same as a case that's never been mapped before.
+    headers_repo = SettingRepositoryImpl(session)
+    await headers_repo.delete_by_key(company_code, _setting_key(str(case_id), side))
+
     # Save raw headers for the column-mapping UI.
     if result.raw_headers:
-        headers_repo = SettingRepositoryImpl(session)
         await headers_repo.upsert(
             company_code="__global__",
             key=f"file_headers.{case_id}.{side}",

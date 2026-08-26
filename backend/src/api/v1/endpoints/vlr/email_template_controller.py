@@ -97,7 +97,7 @@ AVAILABLE_PLACEHOLDERS = [
     "{{vendor_name}}", "{{vendor_code}}", "{{company_name}}", "{{portal_link}}",
     "{{period_start}}", "{{period_end}}", "{{due_date}}", "{{contact_person}}",
     "{{sender_name}}", "{{sender_email}}", "{{case_id}}", "{{fiscal_year}}",
-    "{{reminder_count}}", "{{branch_name}}",
+    "{{reminder_count}}", "{{branch_name}}", "{{remarks}}",
 ]
 
 
@@ -106,23 +106,153 @@ def _extract_placeholders(text: str) -> list[str]:
     return list(set(re.findall(r'\{\{(\w+)\}\}', text)))
 
 
+# Category -> heading shown at the top of the rendered email (the red "Vendor
+# Ledger Reconciliation Request" banner in the reference format). Templates
+# store plain-text bodies (rendered through the same Jinja2 engine as the
+# preview endpoint), and this heading is layered on by build_email_html so
+# every template in a category keeps a consistent, recognizable look without
+# each template author needing to hand-write HTML.
+CATEGORY_EMAIL_HEADINGS: dict[str, str] = {
+    "ledger_request": "Vendor Ledger Reconciliation Request",
+    "reminder": "Ledger Confirmation Reminder",
+    "escalation": "Escalation - Overdue Response",
+    "general": "Notification",
+}
+
+
+async def get_template_for_category(
+    repo: SettingRepositoryImpl,
+    company_code: str,
+    category: str,
+    template_id: str | None = None,
+) -> dict | None:
+    """
+    Resolve which stored template to use for a given category.
+
+    If `template_id` is given, returns that exact template (regardless of
+    category) when found. Otherwise returns the entity's default template
+    for `category` (is_default=True), falling back to the first template of
+    that category if none is marked default. Returns None if no template of
+    that category exists at all.
+    """
+    templates = await _load_templates(repo, company_code)
+    if template_id:
+        match = next((t for t in templates if t["id"] == template_id), None)
+        if match:
+            return match
+    same_category = [t for t in templates if t.get("category") == category]
+    if not same_category:
+        return None
+    default = next((t for t in same_category if t.get("is_default")), None)
+    return default or same_category[0]
+
+
+def render_email_template(template: dict, context: dict) -> tuple[str, str]:
+    """
+    Render a stored template's subject + body with `context` via Jinja2, and
+    wrap the body in the standard HTML shell (red heading matching the
+    template's category, portal-link call-to-action button when
+    `include_portal_link` is set on the template, letterhead-style
+    margins/typography). Returns (rendered_subject, rendered_html_body).
+
+    This is the single place that turns a plain-text, placeholder-driven
+    template into the actual outbound email HTML, so every category (ledger
+    request, reminder, escalation) — including any NEW template a user
+    creates — renders consistently instead of each call site hand-building
+    its own HTML string.
+    """
+    from jinja2 import Environment, BaseLoader, TemplateSyntaxError, UndefinedError
+
+    env = Environment(
+        loader=BaseLoader(),
+        variable_start_string="{{",
+        variable_end_string="}}",
+        autoescape=False,
+    )
+
+    try:
+        rendered_subject = env.from_string(template.get("subject", "")).render(**context)
+        rendered_body = env.from_string(template.get("body", "")).render(**context)
+    except (TemplateSyntaxError, UndefinedError):
+        # A malformed/edited template must never crash email sending —
+        # fall back to the raw (unrendered) text rather than losing the
+        # email entirely.
+        rendered_subject = template.get("subject", "")
+        rendered_body = template.get("body", "")
+
+    # Collapse 3+ consecutive blank lines (e.g. an empty {{remarks}} leaving
+    # a gap) down to a single paragraph break before converting to HTML.
+    rendered_body = re.sub(r"\n{3,}", "\n\n", rendered_body.strip())
+
+    def _linkify(text: str) -> str:
+        """Turn bare http(s) URLs (e.g. a rendered {{portal_link}}) into
+        clickable anchors so templates that embed the link inline still
+        produce a real link, not just plain text."""
+        return re.sub(
+            r"(https?://[^\s<]+)",
+            r'<a href="\1">\1</a>',
+            text,
+        )
+
+    body_html_paragraphs = "".join(
+        f"<p>{_linkify(para.replace(chr(10), '<br/>'))}</p>"
+        for para in rendered_body.split("\n\n")
+        if para.strip()
+    )
+
+    heading = CATEGORY_EMAIL_HEADINGS.get(template.get("category", ""), "Notification")
+
+    # Only auto-append the button + raw-link footer when the template body
+    # doesn't already reference {{portal_link}} inline (e.g. the reminder/
+    # escalation defaults write "...convenience:\n{{portal_link}}" directly)
+    # — otherwise the link would appear twice.
+    portal_section = ""
+    portal_url = context.get("portal_link", "")
+    body_references_portal_link = "{{portal_link}}" in (template.get("body") or "")
+    if template.get("include_portal_link", True) and portal_url and not body_references_portal_link:
+        portal_section = f"""
+                <p style="text-align: center; margin: 30px 0;">
+                    <a href="{portal_url}"
+                       style="background-color: #C41E3A; color: white; padding: 12px 30px;
+                              text-decoration: none; border-radius: 5px; font-weight: bold;">
+                        Upload Statement
+                    </a>
+                </p>
+                <p style="font-size: 12px; color: #666;">
+                    Portal Link: <a href="{portal_url}">{portal_url}</a>
+                </p>"""
+
+    rendered_html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #C41E3A;">{heading}</h2>
+                {body_html_paragraphs}{portal_section}
+            </div>
+        </body>
+        </html>
+        """
+
+    return rendered_subject, rendered_html
+
+
 # Default templates
 DEFAULT_TEMPLATES: list[dict] = [
     {
         "id": "tpl-ledger-request",
         "name": "Ledger Request - Standard",
-        "subject": "Ledger Confirmation Request - {{company_name}} - {{period_start}} to {{period_end}}",
+        "subject": "Ledger Reconciliation Request - {{period_start}} to {{period_end}}",
         "body": (
-            "Dear {{contact_person}},\n\n"
-            "We request you to confirm your ledger balance with {{company_name}} "
-            "for the period {{period_start}} to {{period_end}}.\n\n"
-            "Please click the link below to respond:\n{{portal_link}}\n\n"
-            "Note:\n"
-            "1. The link is encrypted and secured with HTTPS.\n"
-            "2. In case of mismatch, kindly attach the ledger/outstanding statement "
-            "in Excel format through the portal.\n"
-            "3. If you are not the right recipient, please forward to the authorised person.\n\n"
-            "Regards,\n{{sender_name}}\n{{company_name}}"
+            "Dear Sir/Madam,\n\n"
+            "You have been invited to participate in a ledger reconciliation by "
+            "{{company_name}}.\n\n"
+            "Vendor: {{vendor_name}} ({{vendor_code}})\n"
+            "Reconciliation Period: {{period_start}} to {{period_end}}\n\n"
+            "{{remarks}}\n\n"
+            "Please click the link below to access the portal and upload your "
+            "ledger statement:\n\n"
+            "This link is valid for 90 days. If you have any questions, please "
+            "contact the reconciliation team."
         ),
         "category": "ledger_request",
         "include_portal_link": True,
@@ -442,6 +572,7 @@ async def preview_template(
         "fiscal_year": "2024-25",
         "reminder_count": "1",
         "branch_name": "Head Office",
+        "remarks": "",
     }
 
     # Render subject

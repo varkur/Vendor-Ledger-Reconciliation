@@ -66,7 +66,17 @@ export const ReconciliationEntriesPage = () => {
     enabled: !!caseId && !!companyCode,
   });
   const caseStatus = (caseData as any)?.status || '';
-  const canEditLinks = caseStatus === 'review_pending' || caseStatus === 'statement_mapped';
+  // Link/unlink is allowed for the entire window between reconciliation
+  // finishing and sign-off being requested — a reviewer should be able to
+  // adjust matches whether the run auto-completed cleanly, left unmatched
+  // entries (statement_mapped), or has already been advanced into the
+  // review step. 'auto_completed' was missing here — the exact status a
+  // case lands in when everything matched with no residual differences —
+  // which meant the link/delink controls silently never appeared for the
+  // most common successful-reconciliation outcome.
+  const canEditLinks = [
+    'auto_completed', 'statement_mapped', 'review_pending', 'review', 'reviewed',
+  ].includes(caseStatus);
 
   const renderView = () => {
     if (!caseId) return null;
@@ -74,7 +84,7 @@ export const ReconciliationEntriesPage = () => {
       case 'recommended':
         return <ConfirmationTab caseId={caseId} />;
       case 'unmatched':
-        return <UnmatchedAllTab caseId={caseId} />;
+        return <UnmatchedAllTab caseId={caseId} editable={canEditLinks} />;
       case 'knocking':
         return <KnockingTab caseId={caseId} />;
       case 'unmatched-company':

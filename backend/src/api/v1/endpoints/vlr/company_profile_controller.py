@@ -48,6 +48,17 @@ CP_LETTERHEAD_FOOTER_KEY = f"{CP_PREFIX}.letterhead_footer"
 CP_LOGO_KEY = f"{CP_PREFIX}.logo"
 CP_VERIFIED_KEY = f"{CP_PREFIX}.verified"
 
+# Default entities used both as the /entities fallback response AND by
+# resolve_company_display_name below when the "entities.list" setting has
+# never been saved (fresh install). Kept as a single source of truth so the
+# two lookups never disagree about what an unconfigured company_code maps to.
+DEFAULT_ENTITIES: list[dict] = [
+    {"id": "1", "company_code": "1000", "name": "Emcure Pharmaceuticals Limited", "entity_type": "Public company", "pan_card": "AAACE4574C", "is_active": True},
+    {"id": "2", "company_code": "2000", "name": "Gennova Biopharmaceuticals Ltd", "entity_type": "Private company", "pan_card": "AABCG1234A", "is_active": True},
+    {"id": "3", "company_code": "3000", "name": "ZUVENTUS HEALTHCARE LIMITED", "entity_type": "Private company", "pan_card": "AAACZ5678B", "is_active": True},
+    {"id": "4", "company_code": "4000", "name": "EMCUTIX BIOPHARMACEUTICALS LTD", "entity_type": "Private company", "pan_card": "AABCE9012C", "is_active": True},
+]
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Schemas
@@ -139,6 +150,52 @@ async def _upsert_setting(
         description=description,
         modified_by=modified_by,
     )
+
+
+async def resolve_company_display_name(
+    repo: SettingRepositoryImpl, company_code: str, fallback: str = "",
+) -> str:
+    """
+    Resolve the human-readable entity name for a `company_code` (e.g. "1000"
+    -> "Emcure Pharmaceuticals Limited", "2000" -> "Gennova Biopharmaceuticals
+    Ltd") by looking it up in the stored `entities.list` setting — the same
+    list the entity switcher and Company Profile screen read from.
+
+    Bug fix: every outbound vendor email (ledger request invite, sign-off
+    request) had "Emcure Pharmaceuticals Limited" hardcoded regardless of
+    which company entity the request was actually created under, so a
+    request created from e.g. Gennova's entity still told the vendor they'd
+    been invited by Emcure. This is the single shared lookup all outbound
+    email builders should use instead of a literal string.
+
+    Falls back to `fallback` (or the raw company_code if no fallback is
+    given) when the code isn't found in the entities list — this can happen
+    for a company_code that predates the entities list being populated, or
+    hasn't been configured yet.
+    """
+    import json
+
+    if not company_code:
+        return fallback or company_code
+
+    entities_json = await _get_setting_value(repo, "entities.list", "")
+    entities_data: list[dict] | None = None
+    if entities_json:
+        try:
+            entities_data = json.loads(entities_json)
+        except (json.JSONDecodeError, TypeError):
+            entities_data = None
+    if not entities_data:
+        entities_data = DEFAULT_ENTITIES
+
+    entity = next(
+        (e for e in entities_data if e.get("company_code") == company_code),
+        None,
+    )
+    if entity and entity.get("name"):
+        return entity["name"]
+
+    return fallback or company_code
 
 
 async def _load_company_profile(repo: SettingRepositoryImpl) -> CompanyProfileResponse:
@@ -244,40 +301,7 @@ async def list_entities(
             pass
 
     # Return default entities if none stored
-    return [
-        CompanyEntityResponse(
-            id="1",
-            company_code="1000",
-            name="Emcure Pharmaceuticals Limited",
-            entity_type="Public company",
-            pan_card="AAACE4574C",
-            is_active=True,
-        ),
-        CompanyEntityResponse(
-            id="2",
-            company_code="2000",
-            name="Gennova Biopharmaceuticals Ltd",
-            entity_type="Private company",
-            pan_card="AABCG1234A",
-            is_active=True,
-        ),
-        CompanyEntityResponse(
-            id="3",
-            company_code="3000",
-            name="ZUVENTUS HEALTHCARE LIMITED",
-            entity_type="Private company",
-            pan_card="AAACZ5678B",
-            is_active=True,
-        ),
-        CompanyEntityResponse(
-            id="4",
-            company_code="4000",
-            name="EMCUTIX BIOPHARMACEUTICALS LTD",
-            entity_type="Private company",
-            pan_card="AABCE9012C",
-            is_active=True,
-        ),
-    ]
+    return [CompanyEntityResponse(**e) for e in DEFAULT_ENTITIES]
 
 
 @router.put(
@@ -395,12 +419,7 @@ async def create_entity(
 
     # If no stored entities, seed with defaults
     if not entities:
-        entities = [
-            {"id": "1", "company_code": "1000", "name": "Emcure Pharmaceuticals Limited", "entity_type": "Public company", "pan_card": "AAACE4574C", "is_active": True},
-            {"id": "2", "company_code": "2000", "name": "Gennova Biopharmaceuticals Ltd", "entity_type": "Private company", "pan_card": "AABCG1234A", "is_active": True},
-            {"id": "3", "company_code": "3000", "name": "ZUVENTUS HEALTHCARE LIMITED", "entity_type": "Private company", "pan_card": "AAACZ5678B", "is_active": True},
-            {"id": "4", "company_code": "4000", "name": "EMCUTIX BIOPHARMACEUTICALS LTD", "entity_type": "Private company", "pan_card": "AABCE9012C", "is_active": True},
-        ]
+        entities = [e.copy() for e in DEFAULT_ENTITIES]
 
     # Company code is user-provided and mandatory; must be unique.
     new_code = request.company_code.strip().upper()

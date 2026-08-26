@@ -199,7 +199,10 @@ async def create_request(
         title=request.title,
         tolerance_amount=request.tolerance_amount,
         tds_percentage=request.tds_percentage,
+        tds_percentage_min=request.tds_percentage_min,
         gst_percentage=request.gst_percentage,
+        date_tolerance_days_min=request.date_tolerance_days_min,
+        date_tolerance_days_max=request.date_tolerance_days_max,
         matching_preferences=matching_prefs,
         assigned_manager_id=request.assigned_manager_id,
         created_by=current_user.username or str(current_user.id),
@@ -242,7 +245,7 @@ async def create_request(
         if cases_page.items:
             await _send_invites_for_cases(
                 session, request_id, request.company_code, result,
-                list(cases_page.items), [], "",
+                list(cases_page.items), [], "", request.email_template_id,
             )
     except HTTPException as e:
         # e.g. SMTP not configured — don't fail request creation over it.
@@ -1235,10 +1238,15 @@ class SendInviteRequest(BaseModel):
     primary contact.
 
     `remarks` is an optional free-text message included in each invite email.
+
+    `email_template_id` selects which stored "Ledger Request" template
+    (Settings > Email Templates) to render the invite from. When omitted,
+    the entity's default ledger-request template is used.
     """
 
     cc_emails: list[str] = Field(default_factory=list)
     remarks: str = Field(default="", description="Optional remarks/message shown in the invite email")
+    email_template_id: str | None = Field(default=None, description="Email template ID to render the invite from")
 
 
 async def _send_invites_for_cases(
@@ -1249,6 +1257,7 @@ async def _send_invites_for_cases(
     cases: list,
     cc_emails: list[str],
     remarks: str,
+    email_template_id: str | None = None,
 ) -> SendInviteResponse:
     """
     Shared implementation for sending vendor invite emails to a given list of
@@ -1257,6 +1266,16 @@ async def _send_invites_for_cases(
     Extracted so both the manual "Send Vendor Invites" endpoint and the
     optional auto-notify path on consolidated ledger upload can reuse the
     exact same email-building / SMTP logic instead of duplicating it.
+
+    The email body/subject are rendered from the entity's stored "ledger
+    request" email template (see email_template_controller.py) rather than
+    a hardcoded HTML string — this is what lets a user create/edit a
+    template in the Email Templates screen and have it actually be used for
+    outbound invites, and fixes "Emcure Pharmaceuticals Limited" being
+    hardcoded regardless of which company entity the request belongs to.
+    `email_template_id` selects a specific template (e.g. the one chosen on
+    the Request Statement Configure screen); when omitted, the entity's
+    default "ledger_request" template is used.
     """
     import logging
     from datetime import datetime, timedelta, timezone
@@ -1268,6 +1287,13 @@ async def _send_invites_for_cases(
         SettingRepositoryImpl,
     )
     from src.infrastructure.external.email.smtp_provider import SmtpEmailSender
+    from src.api.v1.endpoints.vlr.company_profile_controller import (
+        resolve_company_display_name,
+    )
+    from src.api.v1.endpoints.vlr.email_template_controller import (
+        get_template_for_category,
+        render_email_template,
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -1338,6 +1364,23 @@ async def _send_invites_for_cases(
     # Set token expiry (90 days from now)
     token_expiry = datetime.now(timezone.utc) + timedelta(days=90)
 
+    # Resolve the real requesting company's display name for this
+    # request's company_code (falls back to the raw code if the entity
+    # isn't configured), and the ledger-request template to render every
+    # invite through.
+    company_name = await resolve_company_display_name(setting_repo, company_code)
+    template = await get_template_for_category(
+        setting_repo, company_code, "ledger_request", email_template_id,
+    )
+    if template is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "No 'Ledger Request' email template is configured. Please "
+                "create one under Settings > Email Templates."
+            ),
+        )
+
     for case in cases:
         # Get vendor info
         vendor_stmt = select(VendorModel).where(VendorModel.id == case.vendor_id)
@@ -1395,7 +1438,7 @@ async def _send_invites_for_cases(
         # Build portal URL (uses configurable base so it works off-localhost)
         portal_url = f"{portal_base_url}/portal/access/{case.portal_token}"
 
-        # Build email body. Format the period as dd-Mon-yyyy to match the UI.
+        # Format the period as dd-Mon-yyyy to match the UI.
         def _fmt_period(d) -> str:
             try:
                 return d.strftime("%d-%b-%Y")
@@ -1405,52 +1448,23 @@ async def _send_invites_for_cases(
         period_start = _fmt_period(request_obj.period_start)
         period_end = _fmt_period(request_obj.period_end)
 
-        # Optional remarks block (only rendered when remarks were provided).
-        remarks_block = (
-            f"""<p style="margin: 16px 0; padding: 12px; background:#f8f8f8;
-                    border-left: 3px solid #C41E3A;">
-                    <strong>Remarks:</strong> {remarks}
-                </p>"""
-            if remarks else ""
-        )
-
-        body_html = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h2 style="color: #C41E3A;">Vendor Ledger Reconciliation Request</h2>
-                <p>Dear {contact.name or vendor.name},</p>
-                <p>
-                    You have been invited to participate in a ledger reconciliation by
-                    <strong>Emcure Pharmaceuticals Limited</strong>.
-                </p>
-                <p><strong>Vendor:</strong> {vendor.name} ({vendor.vendor_code})</p>
-                <p><strong>Reconciliation Period:</strong> {period_start} to {period_end}</p>
-                {remarks_block}
-                <p>
-                    Please click the link below to access the portal and upload your
-                    ledger statement:
-                </p>
-                <p style="text-align: center; margin: 30px 0;">
-                    <a href="{portal_url}"
-                       style="background-color: #C41E3A; color: white; padding: 12px 30px;
-                              text-decoration: none; border-radius: 5px; font-weight: bold;">
-                        Upload Statement
-                    </a>
-                </p>
-                <p style="font-size: 12px; color: #666;">
-                    This link is valid for 90 days. If you have any questions, please
-                    contact the reconciliation team.
-                </p>
-                <p style="font-size: 12px; color: #666;">
-                    Portal Link: <a href="{portal_url}">{portal_url}</a>
-                </p>
-            </div>
-        </body>
-        </html>
-        """
-
-        subject = f"Ledger Reconciliation Request - {period_start} to {period_end}"
+        subject, body_html = render_email_template(template, {
+            "vendor_name": vendor.name,
+            "vendor_code": vendor.vendor_code,
+            "company_name": company_name,
+            "portal_link": portal_url,
+            "period_start": period_start,
+            "period_end": period_end,
+            "contact_person": contact.name or vendor.name,
+            "sender_name": sender_name or company_name,
+            "sender_email": sender_email,
+            "case_id": str(case.id),
+            "fiscal_year": getattr(request_obj, "fiscal_year", "") or "",
+            "reminder_count": "",
+            "branch_name": "",
+            "due_date": "",
+            "remarks": f"Remarks: {remarks}" if remarks else "",
+        })
 
         # Send email to the vendor's primary contact, CC every other contact
         # for that vendor plus any explicitly selected cc_emails.
@@ -1550,7 +1564,9 @@ async def send_vendor_invites(
 
     cc_emails = [e.strip() for e in (body.cc_emails if body else []) if e and e.strip()]
     remarks = (body.remarks if body else "").strip()
+    email_template_id = body.email_template_id if body else None
 
     return await _send_invites_for_cases(
         session, request_id, company_code, request_obj, cases, cc_emails, remarks,
+        email_template_id,
     )

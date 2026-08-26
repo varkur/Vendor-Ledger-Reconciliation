@@ -100,13 +100,28 @@ class TestPassTwoStatusTdsVsWriteOff:
         assert result == "Write off / Rounding off"
 
     def test_large_tds_sized_gap_is_tds_booked_by_party(self):
+        """The gap must actually match the configured TDS/GST% (within a
+        tight +/-1% band) to be labelled TDS — passing the case's real
+        6% TDS rate here (1794.78 / 29729.22 ~= 6.0%)."""
+        c_entry = FakeEntry()
+        c_entry.amount = -29729.22  # type: ignore[attr-defined]
+        p_entry = FakeEntry()
+        p_entry.amount = 31524.0  # type: ignore[attr-defined]
+        result = _status(2, c_entry, p_entry, difference=1794.78, tds_percentage=5.69)
+        # Company has the SMALLER absolute amount -> company booked the TDS.
+        assert result == "TDS Booked by Company"
+
+    def test_gap_not_matching_any_configured_rate_is_unexplained(self):
+        """Without a configured TDS/GST rate that actually explains the gap,
+        a real (non-rounding) amount difference must NOT be silently
+        labelled as TDS — this is the fix for the flat 'difference > Rs 5'
+        bug that mislabelled arbitrary mismatches as TDS."""
         c_entry = FakeEntry()
         c_entry.amount = -29729.22  # type: ignore[attr-defined]
         p_entry = FakeEntry()
         p_entry.amount = 31524.0  # type: ignore[attr-defined]
         result = _status(2, c_entry, p_entry, difference=1794.78)
-        # Company has the SMALLER absolute amount -> company booked the TDS.
-        assert result == "TDS Booked by Company"
+        assert result == "Unexplained Amount Gap"
 
 
 class TestManualLinkStatusAndRemark:
@@ -304,3 +319,170 @@ class TestMultiEntryGroupDifference:
 
         assert len(rows) == 1
         assert rows[0]["difference"] == -5.0
+
+
+class TestMatchedResidualBucket:
+    """
+    Client-reported bug: the Summary sheet's "Amount Unsettled by
+    Company/Vendor" line showed a large plug value with no linked annexure
+    and no entry count ("the differential amount is not getting
+    linked/mapped in the output file"). Root cause: matched-pair residuals
+    (TDS deducted, rounding write-offs, unexplained gaps) were never
+    itemised on the Summary sheet — only one-sided (unmatched) entries were
+    — so their combined difference silently fell into the generic residual
+    plug at the bottom instead of a real, traceable summary line.
+    """
+
+    def test_tds_booked_row_is_bucketed_under_tds_group(self):
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "TDS Booked by Company", "difference": 1794.78},
+        ]
+        out = matched_residual_bucket(rows)
+        key = ("TDS / TCS Difference", "TDS Booked by Company",
+               "Company to confirm TDS deducted and share the TDS certificate")
+        assert key in out
+        assert float(out[key][0]) == 1794.78
+        assert out[key][1] == 1
+
+    def test_write_off_row_is_bucketed_separately_from_tds(self):
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "Write off / Rounding off", "difference": 2.5},
+            {"status": "TDS Booked by Party", "difference": 500.0},
+        ]
+        out = matched_residual_bucket(rows)
+        assert len(out) == 2
+
+    def test_reconciled_rows_are_excluded(self):
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "Reconciled", "difference": 0.0},
+            {"status": "Manually Mapped", "difference": 0.0},
+        ]
+        assert matched_residual_bucket(rows) == {}
+
+    def test_zero_difference_rows_are_excluded(self):
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [{"status": "TDS Booked by Company", "difference": 0.0}]
+        assert matched_residual_bucket(rows) == {}
+
+    def test_multiple_rows_same_status_aggregate_amount_and_count(self):
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "TDS Booked by Company", "difference": 1000.0},
+            {"status": "TDS Booked by Company", "difference": 500.0},
+        ]
+        out = matched_residual_bucket(rows)
+        assert len(out) == 1
+        amt, cnt = next(iter(out.values()))
+        assert amt == 1500.0
+        assert cnt == 2
+
+    def test_summary_sheet_links_matched_residuals_to_annexure_with_zero_final_difference(self):
+        """
+        End-to-end: a matched pair with a genuine TDS-sized residual must
+        show up as its own linked, counted Summary line (not the unlinked
+        "Amount Unsettled" plug), and the final Difference row must still
+        net to zero.
+        """
+        c1 = FakeEntry(document_category="Invoice", amount=-90000.0, pass_number=2)
+        p1 = FakeEntry(document_category="Invoice", amount=100000.0, pass_number=2)
+        match = FakeMatch(
+            company_entry_ids=[c1.id], vendor_entry_ids=[p1.id],
+            difference_amount=10000.0,
+        )
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        service = ReconciliationExportService()
+        service._tds_percentage_value = 10.0
+        service._gst_percentage_value = 0.0
+        service._reco_dt = "24-Aug-26 12:00 PM"
+        service._party_code = ""
+
+        rows = service._build_recon_rows([c1], [p1], [match], by_id)
+        assert rows[0]["status"] == "TDS Booked by Company"
+
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+
+        class FakeVendor:
+            name = "Test Vendor"
+
+        annexure_map = service._compute_summary(
+            ws, FakeVendor(), [c1], [p1], [match],
+            None, None, "1.0 Rs", "0.0 - 10.0", "0 - 15",
+            rows,
+        )
+
+        # The TDS residual must appear as its own linked annexure line, not
+        # folded silently into an unlinked "Amount Unsettled" plug.
+        labels = {v[0] for v in annexure_map.values()}
+        assert "TDS Booked by Company" in labels
+
+        # Locate the final "Difference" row and confirm it nets to zero.
+        diff_row = None
+        for row in ws.iter_rows():
+            if row[0].value == "Difference":
+                diff_row = row
+                break
+        assert diff_row is not None
+        assert abs(diff_row[2].value) < 0.01
+
+
+class TestAmountMismatchPassClassification:
+    """
+    Pass 15 (AMOUNT_MISMATCH) — same invoice number + same date, gap not
+    explained by TDS/GST — is the one case where the automated engine
+    itself emits "Amount Mismatch" as both Status and Classification.
+    """
+
+    def test_status_is_amount_mismatch(self):
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(amount=-100000.0)
+        p_entry = FakeEntry(amount=95000.0)
+        result = _status(MatchPassType.AMOUNT_MISMATCH, c_entry, p_entry, difference=-5000.0)
+        assert result == "Amount Mismatch"
+
+    def test_classification_is_invoice_number_matched(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        assert _classification(MatchPassType.AMOUNT_MISMATCH) == "Invoice Number Matched"
+
+    def test_row_status_via_build_recon_rows(self):
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c1 = FakeEntry(
+            document_category="Invoice", amount=-100000.0,
+            pass_number=MatchPassType.AMOUNT_MISMATCH,
+        )
+        p1 = FakeEntry(
+            document_category="Invoice", amount=95000.0,
+            pass_number=MatchPassType.AMOUNT_MISMATCH,
+        )
+        match = FakeMatch(
+            company_entry_ids=[c1.id], vendor_entry_ids=[p1.id],
+            difference_amount=-5000.0,
+        )
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "Amount Mismatch"
+        assert rows[0]["classification"] == "Invoice Number Matched"

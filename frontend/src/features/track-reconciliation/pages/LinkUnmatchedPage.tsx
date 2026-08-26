@@ -18,6 +18,7 @@ import { Message } from 'primereact/message';
 import { Tag } from 'primereact/tag';
 import { Dialog } from 'primereact/dialog';
 import { Dropdown } from 'primereact/dropdown';
+import { InputText } from 'primereact/inputtext';
 import { InputTextarea } from 'primereact/inputtextarea';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
@@ -65,6 +66,7 @@ export const LinkUnmatchedPage = () => {
   const [showReasonDialog, setShowReasonDialog] = useState(false);
   const [selectedReason, setSelectedReason] = useState<string | null>(null);
   const [linkNotes, setLinkNotes] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
 
   // Fixed list of reasons the reviewer must choose from (docs/Update Status.xlsx).
   const { data: statusReasons, isLoading: reasonsLoading } = useQuery({
@@ -100,6 +102,27 @@ export const LinkUnmatchedPage = () => {
     () => [...(companyData ?? []), ...(vendorData ?? [])],
     [companyData, vendorData]
   );
+
+  // Search across document/reference number, description, and every raw
+  // column value shown in the table (LEDGER_COLUMN_DEFS) — with hundreds of
+  // rows to scroll through, this is what actually lets a reviewer jump
+  // straight to the transaction they're trying to link instead of manually
+  // scrolling/scanning the whole grid.
+  const filteredRows = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return allRows;
+    return allRows.filter((row) => {
+      const haystack: string[] = [
+        row.document_number, row.reference, row.description, row.document_type,
+      ];
+      if (row.columns) {
+        for (const v of Object.values(row.columns as Record<string, unknown>)) {
+          if (v !== null && v !== undefined) haystack.push(String(v));
+        }
+      }
+      return haystack.some((v) => (v || '').toLowerCase().includes(term));
+    });
+  }, [allRows, searchTerm]);
 
   const companySelection = useMemo(
     () => selection.filter((r) => r.source === 'Company'),
@@ -217,13 +240,23 @@ export const LinkUnmatchedPage = () => {
       <div className="em-card" style={{ padding: 0 }}>
         <div className="p-3 flex align-items-center justify-content-between">
           <h4 className="m-0">Unmatched Data</h4>
-          <div className="flex align-items-center gap-2">
+          <div className="flex align-items-center gap-3">
+            <div className="em-search-bar">
+              <InputText
+                placeholder="Search unmatched entries..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                style={{ border: 'none', boxShadow: 'none', width: 220 }}
+                aria-label="Search unmatched entries"
+              />
+              <i className="pi pi-search" />
+            </div>
             <Tag value={`${companySelection.length} company`} />
             <Tag value={`${vendorSelection.length} party`} severity="warning" />
           </div>
         </div>
         <DataTable
-          value={allRows}
+          value={filteredRows}
           selection={selection}
           onSelectionChange={(e) => setSelection(e.value as UnmatchedRow[])}
           dataKey="id"

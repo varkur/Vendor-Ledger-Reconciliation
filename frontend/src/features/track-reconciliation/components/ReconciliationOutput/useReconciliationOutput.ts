@@ -4,7 +4,7 @@
  * Requirements: 18.1-18.4, 19.1-19.4, 20.1-20.3, 21.1-21.3, 22.1-22.4
  */
 
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
   confirmMatch,
@@ -38,6 +38,10 @@ export function useMatchedItems(caseId: string, params?: ListParams) {
     enabled: !!caseId,
     retry: 2,
     retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+    // Keep showing the previous page's rows while a new search/filter/page
+    // request is in flight, instead of blanking the table back to the
+    // full-page loading spinner on every change.
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -52,6 +56,7 @@ export function useConfirmationItems(caseId: string, params?: ListParams) {
     enabled: !!caseId,
     retry: 2,
     retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
+    placeholderData: keepPreviousData,
   });
 }
 

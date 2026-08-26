@@ -356,7 +356,11 @@ export const RequestStatementPage = () => {
         vendor_ids: selectedVendorIds,
         tolerance_amount: parseFloat(amountTolerance) || 0,
         tds_percentage: parseFloat(tdsMax) || 0,
+        tds_percentage_min: parseFloat(tdsMin) || 0,
         gst_percentage: parseFloat(gstPercentage) || 0,
+        date_tolerance_days_min: parseInt(dateRangeMin, 10) || 0,
+        date_tolerance_days_max: parseInt(dateRangeMax, 10) || 15,
+        email_template_id: emailTemplate || undefined,
       },
       {
         onSuccess: () => {
@@ -366,7 +370,8 @@ export const RequestStatementPage = () => {
     );
   }, [
     validateForm, createMutation, startDate, endDate, title,
-    selectedVendorIds, amountTolerance, tdsMax, gstPercentage, vendorSelectionMode, companyCode,
+    selectedVendorIds, amountTolerance, tdsMin, tdsMax, gstPercentage,
+    dateRangeMin, dateRangeMax, vendorSelectionMode, companyCode, emailTemplate,
   ]);
 
   const handleVendorFilter = useCallback((e: { filter: string }) => {

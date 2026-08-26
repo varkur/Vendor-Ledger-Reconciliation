@@ -47,8 +47,20 @@ class ReconciliationRequestModel(BaseModel):
     # When vendor invites were sent (null = "Not Sent").
     sent_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tolerance_amount: Mapped[float | None] = mapped_column(Numeric(15, 2), nullable=True)
+    # tds_percentage is kept as the MAX of the configured TDS range for
+    # backward compatibility (existing rows / callers treat it as a single
+    # rate). tds_percentage_min is the range's lower bound — the engine now
+    # tries every rate between min and max (see mapping doc: TDS gaps are
+    # checked against 0.1%, 2%, 10% tiers, not one fixed rate).
     tds_percentage: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    tds_percentage_min: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     gst_percentage: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    # Date-tolerance range (in days) for date-proximity/date-range matching
+    # passes. Previously hardcoded to a flat 15 days in case_controller.py,
+    # ignoring whatever the user configured on the Reconciliation Settings
+    # screen entirely.
+    date_tolerance_days_min: Mapped[int | None] = mapped_column(nullable=True)
+    date_tolerance_days_max: Mapped[int | None] = mapped_column(nullable=True)
     matching_preferences: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     assigned_manager_id: Mapped[str | None] = mapped_column(

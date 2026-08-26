@@ -60,6 +60,11 @@ PASS_CLASSIFICATION: dict[int, str] = {
     MatchPassType.AMOUNT_DATE: "Date and Amount Matched",              # amount exact, reference NEVER checked
     MatchPassType.TDS_GST: "Invoice Number Matched",                   # reference similarity >= 0.5 required
     MatchPassType.TOLERANCE_DATE: "Date Range and Amount Matched",     # neither exact amount nor reference matched
+    # Same invoice number AND same date on both sides, but the amount gap
+    # doesn't match the configured TDS/GST rate — per explicit correction,
+    # still matched (not left as two separate open items) and classified
+    # as an invoice-number match with a genuine, reviewable discrepancy.
+    MatchPassType.AMOUNT_MISMATCH: "Invoice Number Matched",
 }
 
 # Match pass → derived rule code (our own taxonomy, prefixed VLR-)
@@ -73,6 +78,7 @@ PASS_RULE_CODE: dict[int, str] = {
     MatchPassType.AMOUNT_DATE: "VLR-AMTDATE-1.5",
     MatchPassType.TDS_GST: "VLR-TDSGST-2.5",
     MatchPassType.TOLERANCE_DATE: "VLR-TOLDATE-6.5",
+    MatchPassType.AMOUNT_MISMATCH: "VLR-AMTMISMATCH-15.0",
 }
 
 
@@ -95,19 +101,41 @@ def _classification(pass_number: int | None) -> str:
     return PASS_CLASSIFICATION.get(int(pass_number), "Date and Amount Matched")
 
 
-def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str:
+def _status(
+    pass_number: int | None,
+    c_entry,
+    p_entry,
+    difference: float,
+    tds_percentage: float = 0.0,
+    gst_percentage: float = 0.0,
+) -> str:
     """
     Row-level Status (distinct from Classification). Reconciled unless the
     match carries a genuine residual difference, in which case Firmway
     reports the specific reason:
       - Pass 2/TOLERANCE (reference matched exactly, amount off by a small
-        rounding/write-off amount) -> "Write off / Rounding off"
+        rounding/write-off amount, OR a gap that fits the configured
+        TDS%/GST%) -> "Write off / Rounding off" or "TDS Booked by ..."
       - Pass TDS_GST (amount gap explained by a TDS/GST rate) -> "TDS Booked
         by Company" or "TDS Booked by Party", whichever side shows the
         SMALLER absolute amount (i.e. the side that had tax withheld/deducted)
       - Pass 8 (manual link) -> "Manually Mapped" (the reviewer's own
         selected reason is shown separately in the Remark column)
       - Everything else that matched -> "Reconciled"
+
+    A gap is only ever labelled "TDS Booked by ..." if it matches the
+    case's configured TDS% or GST% of the base amount almost EXACTLY
+    (within +/-1%, just enough to absorb paise-level rounding — same
+    precision as the matching engine's _is_tax_band_gap / pass 11's
+    _tds_gst_match). Client-confirmed bug: a flat "difference > Rs 5"
+    check with no upper bound mislabelled gaps of tens/hundreds of
+    thousands of rupees as "TDS Booked by Company" — those are a genuine
+    amount mismatch, not a tax adjustment, and must not be silently
+    absorbed into the TDS bucket. The root cause has since been fixed in
+    the matching engine itself (passes 2/TOLERANCE and TOLERANCE_DATE no
+    longer match on an unexplained gap at all), so this bound is now
+    mostly a defensive fallback for any pair that still reaches this
+    function unexplained.
     """
     if pass_number is None:
         return ""
@@ -125,6 +153,35 @@ def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str
         if c_entry and p_entry:
             return "Reconciled"
         return "TDS Booked by Company" if c_entry else "TDS Booked by Party"
+
+    c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
+    p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
+    base_amount = max(c_amt, p_amt)
+
+    def _matches_tax_amount(gap: float) -> bool:
+        """+/-1% band around EACH configured rate's computed amount —
+        checked independently so a real TDS-sized gap isn't missed just
+        because GST% happens to be configured larger, or vice versa."""
+        for pct in (tds_percentage, gst_percentage):
+            if not pct or pct <= 0:
+                continue
+            expected = base_amount * (pct / 100.0)
+            if expected <= 0:
+                continue
+            if abs(gap - expected) <= expected * 0.01:
+                return True
+        return False
+
+    if pn == MatchPassType.AMOUNT_MISMATCH:
+        # Same invoice number AND same date on both sides (see
+        # _amount_mismatch_match in reconciliation_engine_service.py) — the
+        # engine only reaches this pass when the gap did NOT match the
+        # configured TDS/GST rate, so it's always a genuine, unexplained
+        # discrepancy on what is otherwise clearly the same transaction.
+        # This is the ONE case where the automated engine itself emits
+        # "Amount Mismatch" (elsewhere that label is reserved for a
+        # reviewer's manually-selected link reason).
+        return "Amount Mismatch"
     if pn == 2 and abs(difference) > 0.005:
         # Pass 2 (_tolerance_match) now covers both small rounding
         # differences AND TDS/GST-sized gaps on an exact invoice-number
@@ -132,18 +189,26 @@ def _status(pass_number: int | None, c_entry, p_entry, difference: float) -> str
         # amount-only pass 12 and lose their invoice-number classification).
         # A gap in the TDS/GST range should report as TDS booked, not a
         # generic write-off — the same side-attribution logic as TDS_GST.
-        c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
-        p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
+        # But it must actually MATCH the configured TDS%/GST% almost
+        # exactly — otherwise it's a real amount mismatch.
         if abs(difference) > 5 and c_amt > 0 and p_amt > 0:
-            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            if _matches_tax_amount(abs(difference)):
+                return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            # Defensive fallback only — a same-invoice-number, same-date
+            # pair with an unexplained gap should already have been
+            # claimed by pass 15 (AMOUNT_MISMATCH) before reaching here;
+            # this covers a pair matched on invoice number alone with a
+            # DIFFERENT date, where "Amount Mismatch" would overstate how
+            # confidently these are the same transaction.
+            return "Unexplained Amount Gap"
         return "Write off / Rounding off"
     if pn == MatchPassType.TDS_GST:
-        c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
-        p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
         # The side with the SMALLER absolute amount had tax withheld/deducted
         # from it, so that side is the one that "booked" the TDS.
         if c_amt > 0 and p_amt > 0:
-            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            if _matches_tax_amount(abs(difference)):
+                return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            return "Unexplained Amount Gap"
         return "Reconciled"
     return "Reconciled"
 
@@ -397,6 +462,13 @@ DEFAULT_SUMMARY = {
 class ReconciliationExportService:
     """Builds the reconciliation export workbook from persisted case data."""
 
+    # Class-level defaults so `_build_recon_rows`/`_row` never crash with an
+    # AttributeError when called directly (e.g. from tests, or any future
+    # caller) without first going through `build()`, which is the only place
+    # that normally sets these to the request's actual configured values.
+    _tds_percentage_value: float = 0.0
+    _gst_percentage_value: float = 0.0
+
     # Full 46-column header for the Reconciliation sheet (matches reference).
     RECON_HEADERS = [
         "Company Id", "Party Id", "Matched Id", "Status", "Classification",
@@ -442,6 +514,8 @@ class ReconciliationExportService:
         tolerance_amount: str = "1.0 Rs",
         tds_percentage: str = "0.0 - 10.0",
         date_tolerance: str = "0 - 15",
+        tds_percentage_value: float = 0.0,
+        gst_percentage_value: float = 0.0,
     ) -> bytes:
         wb = Workbook()
         # Index entries by id for quick lookup.
@@ -449,6 +523,12 @@ class ReconciliationExportService:
 
         self._reco_dt = reco_datetime.strftime("%d-%b-%y %I:%M %p")
         self._party_code = party_code
+        # Real numeric TDS%/GST% (as configured on the request) — used to
+        # bound the "TDS Booked by ..." status so it's never applied to a
+        # gap larger than what the actual configured rate could explain.
+        # `tds_percentage`/`tolerance_amount` above are display-only strings.
+        self._tds_percentage_value = float(tds_percentage_value or 0)
+        self._gst_percentage_value = float(gst_percentage_value or 0)
 
         # Build match linkage: entry_id -> match record
         entry_match: dict[str, object] = {}
@@ -466,6 +546,7 @@ class ReconciliationExportService:
         annexure_map = self._compute_summary(
             ws_summary, vendor, company_entries, vendor_entries, match_results,
             period_start, period_end, tolerance_amount, tds_percentage, date_tolerance,
+            rows,
         )
 
         # ── Sheet: Reconciliation ──
@@ -524,7 +605,11 @@ class ReconciliationExportService:
                 row_diff = group_diff if group_diff is not None else (
                     (c_amt + p_amt) if (c and p) else 0.0
                 )
-                rows.append(self._row(c, p, m, status=_status(pn, c, p, row_diff), row_difference=group_diff))
+                status = _status(
+                    pn, c, p, row_diff,
+                    self._tds_percentage_value, self._gst_percentage_value,
+                )
+                rows.append(self._row(c, p, m, status=status, row_difference=group_diff))
 
         # One-sided (unmatched) entries.
         for e in company_entries:
@@ -751,7 +836,10 @@ class ReconciliationExportService:
             ws.append([
                 str(e.id),
                 str(m.id) if m else "",
-                _status(pass_number, None, e, row_diff) if m else self._unmatched_status(e, "party"),
+                _status(
+                    pass_number, None, e, row_diff,
+                    self._tds_percentage_value, self._gst_percentage_value,
+                ) if m else self._unmatched_status(e, "party"),
                 _classification(pass_number) if m else "Unmatched",
                 "ledger",
                 _fmt_date(getattr(e, "posting_date", None)),
@@ -773,6 +861,7 @@ class ReconciliationExportService:
     def _compute_summary(
         self, ws, vendor, company_entries, vendor_entries, match_results,
         period_start, period_end, tolerance_amount, tds_percentage, date_tolerance,
+        rows: list[dict] | None = None,
     ) -> dict:
         """Write the Summary sheet; return {annexure_no: (status_label, side)}."""
         vname = getattr(vendor, "name", "") or ""
@@ -885,6 +974,8 @@ class ReconciliationExportService:
             "Payment / receipt Difference",
             "Other Differences",
             "TDS / TCS Difference",
+            "Write Off / Rounding Off Difference",
+            "Unexplained Amount Gap Difference",
         ]
         # Collect detail lines per group. Company side is shown as a positive
         # "owed" amount and party side as negative so the section total reflects
@@ -896,6 +987,17 @@ class ReconciliationExportService:
             side = "company" if "Company" in label else "party"
             annexure_map[annex_no] = (label, side)
             lines_by_group[grp].append((label, annex_no, amt, cnt, action, side))
+
+        # Matched pairs that still carry a genuine residual (TDS deducted,
+        # rounding write-off, or an unexplained gap) were previously invisible
+        # here — only one-sided (unmatched) entries were itemised above. Fold
+        # them into the same groups so they get their own linked annexure and
+        # entry count instead of vanishing into the "Amount Unsettled" plug.
+        for (grp, label, action), (amt, cnt) in matched_residual_bucket(rows).items():
+            lines_by_group.setdefault(grp, [])
+            annex_no = next_annex()
+            annexure_map[annex_no] = (label, "both")
+            lines_by_group[grp].append((label, annex_no, amt, cnt, action, "both"))
 
         # ── Closing balance section ──
         company_closing = _company_closing(company_entries)
@@ -1085,3 +1187,65 @@ def _closing_count(entries) -> int:
 
 def _company_closing(entries) -> Decimal:
     return _closing(entries)
+
+
+# Row Status -> (Summary group, Action Required text) for MATCHED pairs that
+# still carry a genuine residual difference. Previously these were invisible
+# on the Summary sheet: only UNMATCHED (one-sided) entries were itemised by
+# `bucket()` above, so a matched pair's own leftover gap (TDS withheld,
+# rounding write-off, or an unexplained amount gap) never appeared anywhere
+# — it just inflated the generic "Amount Unsettled by Company/Vendor" plug
+# at the bottom with no annexure and no entry count.
+_MATCHED_RESIDUAL_INFO: dict[str, tuple[str, str]] = {
+    "TDS Booked by Company": (
+        "TDS / TCS Difference",
+        "Company to confirm TDS deducted and share the TDS certificate",
+    ),
+    "TDS Booked by Party": (
+        "TDS / TCS Difference",
+        "Vendor to confirm TDS deducted and share the TDS certificate",
+    ),
+    "Write off / Rounding off": (
+        "Write Off / Rounding Off Difference",
+        "No action required - within configured tolerance",
+    ),
+    "Unexplained Amount Gap": (
+        "Unexplained Amount Gap Difference",
+        "Finance to review - matched pair's gap does not match the configured TDS/GST rate",
+    ),
+}
+
+
+def matched_residual_bucket(rows: list[dict] | None) -> dict:
+    """
+    Aggregate MATCHED rows that still carry a genuine residual difference
+    into the same (group, label, action) -> [amount, count] shape the
+    unmatched `bucket()` helper produces, so they can be merged into the
+    same Summary sections and get their own linked annexure sheet + entry
+    count instead of silently inflating the generic "Amount Unsettled" plug.
+
+    Client-reported bug: "the values appearing under 'To Be Settled' and
+    'Adjust Between Our Side and Vendor Side' show a large difference...
+    however, the differential amount is not getting linked/mapped in the
+    output file." Root cause: matched-pair residuals (TDS deducted,
+    rounding write-offs, unexplained gaps) were never itemised on the
+    Summary sheet at all — only one-sided (unmatched) entries were. The
+    gap between the itemised total and the closing-balance difference was
+    dumped wholesale into the unlinked "Amount Unsettled" line.
+    """
+    out: dict = {}
+    if not rows:
+        return out
+    for r in rows:
+        info = _MATCHED_RESIDUAL_INFO.get(r.get("status"))
+        if info is None:
+            continue
+        diff = Decimal(str(_num(r.get("difference", 0))))
+        if abs(diff) < Decimal("0.005"):
+            continue
+        grp, action = info
+        key = (grp, r["status"], action)
+        agg = out.setdefault(key, [Decimal("0"), 0])
+        agg[0] += diff
+        agg[1] += 1
+    return out

@@ -248,9 +248,13 @@ export const ReconciliationOutputPage = () => {
   const isUnderReview = caseStatus === 'review_pending';
   const isReviewed = caseStatus === 'reviewed';
   const isStatementMapped = caseStatus === 'statement_mapped';
-  // Link/unlink is allowed both while under review and at the statement_mapped
-  // stage (the step before review).
-  const canEditLinks = isUnderReview || isStatementMapped;
+  const isAutoCompleted = caseStatus === 'auto_completed';
+  // Link/unlink is allowed for the whole window from reconciliation
+  // finishing through the review step — auto_completed (everything matched
+  // cleanly, no residual differences) was missing here, which meant the
+  // "Link Unmatched" button never showed up for the most common
+  // successful-reconciliation outcome.
+  const canEditLinks = isUnderReview || isStatementMapped || isAutoCompleted || isReviewed;
 
   const handleReviewDone = async () => {
     setIsActing(true);

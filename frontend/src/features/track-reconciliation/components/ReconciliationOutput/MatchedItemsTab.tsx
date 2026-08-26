@@ -5,7 +5,7 @@
  * Requirements: 18.1, 18.2, 18.3, 18.4
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Column } from 'primereact/column';
 import { DataTable, type DataTablePageEvent, type DataTableSortEvent } from 'primereact/datatable';
 import { Dropdown } from 'primereact/dropdown';
@@ -18,6 +18,7 @@ import { useRef } from 'react';
 import { Button } from 'primereact/button';
 import { Toast } from 'primereact/toast';
 import { useQueryClient } from '@tanstack/react-query';
+import { useDebouncedValue } from '@shared/hooks/useDebouncedValue';
 import { useMatchedItems } from './useReconciliationOutput';
 import { manualUnlink, LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
 import type { ListParams, MatchedItem, MatchType } from './reconciliationOutputApi';
@@ -108,10 +109,19 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
     }
   };
 
+  // Debounce the search box so it only queries the server after the user
+  // pauses typing, not on every keystroke — typing each letter previously
+  // fired a brand-new request/query-key, which reset the loading state and
+  // made the whole table flash/reload on every character.
+  const debouncedSearch = useDebouncedValue(searchInput, 400);
+  useEffect(() => {
+    setParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+  }, [debouncedSearch]);
+
   const isReasonScoped = !!statusReasonFilter || manualOnly;
-  const { data, isLoading, error, refetch } = useMatchedItems(caseId, {
+  const { data, isLoading, isFetching, error, refetch } = useMatchedItems(caseId, {
     ...params,
-    search: isReasonScoped ? undefined : (searchInput || undefined),
+    search: isReasonScoped ? undefined : (debouncedSearch || undefined),
     match_type: isReasonScoped ? undefined : ((matchTypeFilter as MatchType) || undefined),
     status_reason: statusReasonFilter || undefined,
     manual_only: manualOnly || undefined,
@@ -133,12 +143,6 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
       sort_by: event.sortField as string,
       sort_order: event.sortOrder === 1 ? 'asc' : 'desc',
     }));
-  };
-
-  const onSearchKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      setParams((prev) => ({ ...prev, page: 1 }));
-    }
   };
 
   // ─── Column Templates ────────────────────────────────────────────────────────
@@ -193,14 +197,6 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
     );
   }
 
-  if (!data || data.items.length === 0) {
-    return (
-      <div className="p-4 text-center">
-        <Message severity="info" text="No matched items found for this reconciliation case." className="w-full" />
-      </div>
-    );
-  }
-
   return (
     <div>
       <Toast ref={toast} />
@@ -216,11 +212,10 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
               placeholder="Search by reference..."
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              onKeyDown={onSearchKeyDown}
               style={{ border: 'none', boxShadow: 'none', width: 200 }}
               aria-label="Search matched items"
             />
-            <i className="pi pi-search" />
+            <i className={isFetching ? 'pi pi-spin pi-spinner' : 'pi pi-search'} />
           </div>
           <Dropdown
             value={matchTypeFilter}
@@ -236,8 +231,12 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
         </div>
       )}
 
-      {/* DataTable */}
-      <div className="em-card" style={{ padding: 0 }}>
+      {!data || data.items.length === 0 ? (
+        <div className="p-4 text-center">
+          <Message severity="info" text="No matched items found for this reconciliation case." className="w-full" />
+        </div>
+      ) : (
+      <div className="em-card" style={{ padding: 0, opacity: isFetching ? 0.6 : 1, transition: 'opacity 150ms' }}>
         <DataTable
           value={data.items}
           paginator
@@ -254,38 +253,11 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
           emptyMessage="No matched items found."
           aria-label="Matched items table"
         >
-          <Column field="match_type" header="Match Type" sortable body={matchTypeTemplate} style={{ minWidth: '9rem' }} />
-          <Column field="matched_rule" header="Matched Rule" style={{ minWidth: '10rem' }} body={(row: MatchedItem) => row.matched_rule || '—'} />
-          {isReasonScoped && (
-            <Column field="status_reason" header="Reason" style={{ minWidth: '12rem' }} body={(row: MatchedItem) => row.status_reason || '—'} />
-          )}
-          <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ minWidth: '8rem', textAlign: 'center' }} />
-          {LEDGER_COLUMN_DEFS.map((c) => (
-            <Column
-              key={`co_${c.field}`}
-              header={`Company ${c.header}`}
-              body={(row: MatchedItem) => {
-                const v = row.company_columns ? (row.company_columns as any)[c.field] : undefined;
-                return v === undefined || v === null || v === '' ? '—' : String(v);
-              }}
-              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
-            />
-          ))}
-          {LEDGER_COLUMN_DEFS.map((c) => (
-            <Column
-              key={`pa_${c.field}`}
-              header={`Party ${c.header}`}
-              body={(row: MatchedItem) => {
-                const v = row.party_columns ? (row.party_columns as any)[c.field] : undefined;
-                return v === undefined || v === null || v === '' ? '—' : String(v);
-              }}
-              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
-            />
-          ))}
           {editable && (
             <Column
               header="Action"
-              style={{ width: '9%', textAlign: 'center' }}
+              frozen
+              style={{ width: '9rem', minWidth: '9rem', textAlign: 'center' }}
               body={(row: MatchedItem) => (
                 <button
                   onClick={() => handleUnlink((row as any).id)}
@@ -317,8 +289,37 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
               )}
             />
           )}
+          <Column field="match_type" header="Match Type" sortable body={matchTypeTemplate} style={{ minWidth: '9rem' }} />
+          <Column field="matched_rule" header="Matched Rule" style={{ minWidth: '10rem' }} body={(row: MatchedItem) => row.matched_rule || '—'} />
+          {isReasonScoped && (
+            <Column field="status_reason" header="Reason" style={{ minWidth: '12rem' }} body={(row: MatchedItem) => row.status_reason || '—'} />
+          )}
+          <Column field="confidence_score" header="Confidence" sortable body={confidenceTemplate} style={{ minWidth: '8rem', textAlign: 'center' }} />
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={`co_${c.field}`}
+              header={`Company ${c.header}`}
+              body={(row: MatchedItem) => {
+                const v = row.company_columns ? (row.company_columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
+          {LEDGER_COLUMN_DEFS.map((c) => (
+            <Column
+              key={`pa_${c.field}`}
+              header={`Party ${c.header}`}
+              body={(row: MatchedItem) => {
+                const v = row.party_columns ? (row.party_columns as any)[c.field] : undefined;
+                return v === undefined || v === null || v === '' ? '—' : String(v);
+              }}
+              style={{ minWidth: '9rem', whiteSpace: 'nowrap' }}
+            />
+          ))}
         </DataTable>
       </div>
+      )}
     </div>
   );
 };

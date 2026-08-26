@@ -130,7 +130,10 @@ class RequestCreateDTO:
     title: str | None = None
     tolerance_amount: Decimal = Decimal("0")
     tds_percentage: Decimal = Decimal("0")
+    tds_percentage_min: Decimal = Decimal("0")
     gst_percentage: Decimal = Decimal("0")
+    date_tolerance_days_min: int = 0
+    date_tolerance_days_max: int = 15
     matching_preferences: MatchingPreferences | None = None
     assigned_manager_id: UUID | None = None
     created_by: UUID | None = None
@@ -250,7 +253,10 @@ class RequestManagerService:
             "title": data.title,
             "tolerance_amount": data.tolerance_amount,
             "tds_percentage": data.tds_percentage,
+            "tds_percentage_min": data.tds_percentage_min,
             "gst_percentage": data.gst_percentage,
+            "date_tolerance_days_min": data.date_tolerance_days_min,
+            "date_tolerance_days_max": data.date_tolerance_days_max,
             "matching_preferences": matching_prefs,
             "assigned_manager_id": data.assigned_manager_id,
             "created_by": data.created_by,

@@ -38,20 +38,32 @@ class CreateRequestRequest(BaseModel):
     vendor_ids: list[UUID] = Field(..., min_length=1, description="List of vendor IDs to include")
     title: str | None = Field(default=None, max_length=255, description="Request title/name")
     tolerance_amount: Decimal = Field(default=Decimal("0"), ge=0, description="Tolerance amount for matching")
-    tds_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="TDS percentage")
+    tds_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="TDS percentage (upper bound of the configured range)")
+    tds_percentage_min: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="TDS percentage (lower bound of the configured range)")
     gst_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, description="GST percentage")
+    date_tolerance_days_min: int = Field(default=0, ge=0, description="Minimum days for date-proximity/date-range matching")
+    date_tolerance_days_max: int = Field(default=15, ge=0, description="Maximum days for date-proximity/date-range matching")
     matching_preferences: MatchingPreferencesSchema | None = Field(
         default=None, description="Matching pass configuration"
     )
     assigned_manager_id: UUID | None = Field(default=None, description="Assigned manager user ID")
+    email_template_id: str | None = Field(
+        default=None,
+        description="Email template ID (Settings > Email Templates) to render the auto-sent vendor invite from",
+    )
 
     @model_validator(mode="after")
     def validate_date_range(self) -> Self:
-        """Ensure period_start < period_end and period_end is not in the future."""
+        """Ensure period_start < period_end, period_end is not in the future,
+        and every configured range (TDS%, date tolerance) has min <= max."""
         if self.period_start >= self.period_end:
             raise ValueError("period_start must be before period_end")
         if self.period_end > date.today():
             raise ValueError("period_end cannot be in the future")
+        if self.tds_percentage_min > self.tds_percentage:
+            raise ValueError("tds_percentage_min must be <= tds_percentage (max)")
+        if self.date_tolerance_days_min > self.date_tolerance_days_max:
+            raise ValueError("date_tolerance_days_min must be <= date_tolerance_days_max")
         return self
 
 
@@ -90,7 +102,10 @@ class ReconciliationRequestResponse(BaseModel):
     sent_date: datetime | None = None
     tolerance_amount: Decimal | None = None
     tds_percentage: Decimal | None = None
+    tds_percentage_min: Decimal | None = None
     gst_percentage: Decimal | None = None
+    date_tolerance_days_min: int | None = None
+    date_tolerance_days_max: int | None = None
     matching_preferences: dict | None = None
     assigned_manager_id: UUID | None = None
     created_by: str | None = None

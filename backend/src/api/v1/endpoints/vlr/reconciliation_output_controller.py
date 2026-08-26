@@ -132,6 +132,10 @@ _NEEDS_CONFIRMATION_PASSES = [
     MatchPassType.FUZZY_REFERENCE, MatchPassType.ONE_TO_MANY,
     MatchPassType.MANY_TO_ONE, MatchPassType.DATE_PROXIMITY,
     MatchPassType.TOLERANCE_DATE,
+    # Same invoice number + same date, but the gap is unexplained (see
+    # _amount_mismatch_match) — always needs Finance review, never
+    # auto-accepted.
+    MatchPassType.AMOUNT_MISMATCH,
 ]
 
 
@@ -1380,6 +1384,8 @@ async def export_reconciliation(
         party_code=party_code,
         tolerance_amount=tol_amt,
         tds_percentage=tds_pct,
+        tds_percentage_value=float(getattr(parent, "tds_percentage", 0) or 0) if parent else 0.0,
+        gst_percentage_value=float(getattr(parent, "gst_percentage", 0) or 0) if parent else 0.0,
     )
 
     def _san(s: str) -> str:

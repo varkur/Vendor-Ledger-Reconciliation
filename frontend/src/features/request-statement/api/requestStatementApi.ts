@@ -38,9 +38,13 @@ export interface CreateStatementRequest {
   vendor_ids: string[];
   tolerance_amount?: number;
   tds_percentage?: number;
+  tds_percentage_min?: number;
   gst_percentage?: number;
+  date_tolerance_days_min?: number;
+  date_tolerance_days_max?: number;
   matching_preferences?: MatchingPreferences;
   assigned_manager_id?: string;
+  email_template_id?: string;
 }
 
 /** A single reconciliation request response from the backend. */
@@ -53,7 +57,10 @@ export interface StatementRequestResponse {
   status: string;
   tolerance_amount: number | null;
   tds_percentage: number | null;
+  tds_percentage_min: number | null;
   gst_percentage: number | null;
+  date_tolerance_days_min: number | null;
+  date_tolerance_days_max: number | null;
   matching_preferences: Record<string, boolean> | null;
   assigned_manager_id: string | null;
   created_by: string | null;

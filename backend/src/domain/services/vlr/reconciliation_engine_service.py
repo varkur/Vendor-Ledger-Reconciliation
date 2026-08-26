@@ -27,6 +27,71 @@ from decimal import Decimal
 from enum import IntEnum
 from uuid import UUID, uuid4
 
+
+def _is_tax_band_gap(
+    diff: Decimal,
+    c_amt: Decimal,
+    v_amt: Decimal,
+    tds_min_frac: Decimal,
+    tds_max_frac: Decimal,
+    gst_frac: Decimal,
+    band_pct: Decimal = Decimal("0.01"),
+) -> bool:
+    """
+    True if `diff` corresponds to a tax rate that falls within the
+    configured TDS range [tds_min_frac, tds_max_frac] (inclusive, with a
+    tiny +/-1% margin on the boundary to absorb paise-level rounding), OR
+    matches the single configured GST rate (also within a tight +/-1%
+    band). This is a RANGE check for TDS, not "does it match one exact
+    number" — the mapping doc calls out multiple real-world TDS tiers
+    (e.g. 0.1%, 2%, 10%), and the Reconciliation Settings screen has
+    always presented TDS as a Min/Max range for exactly this reason. A
+    flat single-rate check meant a real TDS-driven gap at any tier other
+    than whichever one number the user happened to type into "Max" could
+    never be recognized as tax and would fall through to an unexplained
+    gap.
+
+    Still NOT "any gap smaller than the largest possible tax amount" —
+    the older ceiling-based bug this replaced would auto-match arbitrary
+    unrelated amount mismatches as long as they happened to be under the
+    ceiling. Every candidate rate in the range must actually explain the
+    observed gap within a tight band, not merely be larger than it.
+
+    TDS and GST are computed off DIFFERENT base amounts, mirroring
+    `_tds_gst_match`'s own logic: TDS is withheld FROM the larger
+    (pre-deduction) amount, so its base is max(c_amt, v_amt); GST is
+    added ON TOP OF the smaller (pre-tax) amount, so its base is
+    min(c_amt, v_amt). Using a single shared `base_amount` (as an
+    earlier version of this function did) silently broke every
+    configured-GST gap check, since `base_amount * gst_frac` computed
+    off the LARGER amount never matches the actual GST added to the
+    smaller one.
+    """
+    if diff <= 0 or c_amt <= 0 or v_amt <= 0:
+        return False
+
+    tds_base = max(c_amt, v_amt)
+    implied_rate = diff / tds_base  # e.g. 0.02 for a 2% gap
+
+    # TDS range check: does the gap's implied rate fall within
+    # [tds_min_frac, tds_max_frac] (with rounding margin on each edge)?
+    if tds_max_frac > 0:
+        lo = min(tds_min_frac, tds_max_frac)
+        hi = max(tds_min_frac, tds_max_frac)
+        margin = max(hi * band_pct, Decimal("0.0001"))
+        if (lo - margin) <= implied_rate <= (hi + margin):
+            return True
+
+    # GST is still a single configured rate, not a range — tight +/-1% band
+    # around the exact computed amount (base = the SMALLER/pre-tax amount).
+    if gst_frac > 0:
+        gst_base = min(c_amt, v_amt)
+        expected_gst = gst_base * gst_frac
+        if expected_gst > 0 and abs(diff - expected_gst) <= expected_gst * band_pct:
+            return True
+
+    return False
+
 from src.domain.repositories.vlr.case_repository import ICaseRepository
 from src.domain.repositories.vlr.exception_repository import IExceptionRepository
 from src.domain.repositories.vlr.ledger_entry_repository import ILedgerEntryRepository
@@ -53,6 +118,14 @@ class MatchPassType(IntEnum):
     AMOUNT_DATE = 10
     TDS_GST = 11
     TOLERANCE_DATE = 12
+    # Same invoice number AND same date on both sides, but the amount gap
+    # is NOT explained by the configured TDS/GST rate (see
+    # _amount_mismatch_match). Per explicit correction: these must still be
+    # matched (not left as two separate open items) so the reviewer sees
+    # them as one linked pair with a genuine, reviewable discrepancy —
+    # labelled "Amount Mismatch", the one case where the engine itself
+    # emits that classification (see reconciliation_export_service.py).
+    AMOUNT_MISMATCH = 15
 
 
 # BRD Section 5.6.10 - Matching Priority Rules confidence scores (normalized to 0.0-1.0)
@@ -79,6 +152,10 @@ CONFIDENCE_SCORES: dict[int, float] = {
     MatchPassType.TDS_GST: 0.85,
     MatchPassType.TOLERANCE_DATE: 0.70,
     14: 0.90,  # TDS_LINK_PASS (constant defined further below in this module)
+    # Same invoice number + same date is strong identification evidence,
+    # but the gap is unexplained — always needs Finance review, never
+    # auto-accepted (see _persist_results).
+    MatchPassType.AMOUNT_MISMATCH: 0.60,
 }
 
 
@@ -134,10 +211,12 @@ class LedgerEntryData:
 
 # ── Document-category matching rules (Vendor Ledger Mapping Rules doc) ────
 # Cross-side matching must respect the economic nature of each entry: an
-# invoice may only reconcile against an invoice, a debit note only against a
-# credit note, etc. Matching purely on amount/date produced false matches
-# such as an invoice knocking off against a vendor receipt, or a debit note
-# against an unrelated knock-off entry.
+# invoice may only reconcile against an invoice, a payment only against a
+# payment, etc. Matching purely on amount/date produced false matches such
+# as an invoice knocking off against a vendor payment, or a debit note
+# against an unrelated knock-off entry. The ONE explicit cross-category
+# exception is Debit Note <-> Credit Note, called out directly in the
+# mapping doc — every other category matches only itself.
 
 # Categories that are entry-intrinsic and must NEVER cross-match with the
 # other side. Opening/closing balances are summary rows; knock-off (AB) and
@@ -152,8 +231,23 @@ NON_MATCHABLE_CATEGORIES: frozenset[str] = frozenset(
 
 # Explicit compatibility groups per the mapping doc:
 #   Invoice -> Invoice only
-#   Debit Note -> Credit Note only (and vice versa)
-#   Payment -> Receipt only (and vice versa)
+#   Debit Note -> Credit Note only (and vice versa) — this is the ONE
+#     deliberate cross-category exception, because the mapping doc is
+#     explicit and unambiguous: "Emcure debit note (KG) map with the
+#     vendor credit note on the basis of Invoice no, date, amount." A
+#     debit note and credit note are the SAME adjustment recorded from
+#     each side's own perspective (Emcure debits the vendor, the vendor
+#     simultaneously credits Emcure for the identical amount) — there is
+#     no such thing as a debit note ever appearing on both sides for the
+#     same transaction, so same-category matching would never find a
+#     pair here at all.
+#   Payment -> Payment only, Receipt -> Receipt only — previously this
+#     also cross-matched Payment<->Receipt as an assumption (the mapping
+#     doc never actually says this; it only describes Emcure's KZ
+#     payment matching by date+amount and doesn't name a vendor-side
+#     "Receipt" counterpart type at all). Removed per explicit
+#     correction: cross-category matching should not occur except where
+#     the doc explicitly requires it (Debit Note/Credit Note above).
 #   TDS Adjusted -> TDS Adjusted only
 # A category not listed here is a wildcard (matches anything) so we never
 # block a match we're unsure about — we only block pairings we KNOW are
@@ -162,8 +256,8 @@ CATEGORY_COMPATIBILITY: dict[str, frozenset[str]] = {
     "Invoice": frozenset({"Invoice"}),
     "Debit Note": frozenset({"Debit Note", "Credit Note"}),
     "Credit Note": frozenset({"Credit Note", "Debit Note"}),
-    "Payment": frozenset({"Payment", "Receipt"}),
-    "Receipt": frozenset({"Receipt", "Payment"}),
+    "Payment": frozenset({"Payment"}),
+    "Receipt": frozenset({"Receipt"}),
     "TDS Adjusted": frozenset({"TDS Adjusted"}),
 }
 
@@ -503,6 +597,7 @@ class ReconciliationEngineService:
         date_tolerance_days: int = 3,
         tds_percentage: Decimal = Decimal("0"),
         gst_percentage: Decimal = Decimal("0"),
+        tds_percentage_min: Decimal = Decimal("0"),
     ) -> ReconciliationResult:
         """
         Execute the full 7-pass reconciliation engine for a case.
@@ -601,7 +696,7 @@ class ReconciliationEngineService:
         ]
         tolerance_pairs = self._tolerance_match(
             available_company, available_vendor, tolerance,
-            tds_percentage, gst_percentage,
+            tds_percentage, gst_percentage, tds_percentage_min,
         )
         for pair in tolerance_pairs:
             matched_company_ids.add(pair.company_entry_id)
@@ -643,6 +738,30 @@ class ReconciliationEngineService:
                 matched_company_ids.add(pair.company_entry_id)
                 matched_vendor_ids.add(pair.vendor_entry_id)
                 result.match_pairs.append(pair)
+
+        # ─── Pass 15: Amount Mismatch (same invoice number + same date,
+        # gap NOT explained by TDS/GST) ─────────────────────────────────
+        # Runs AFTER Tolerance (2) and TDS/GST (2.5) so a gap that DOES fit
+        # the configured tax rate is captured by those passes first as a
+        # "real" match; only a genuinely unexplained gap on an otherwise
+        # identical (invoice number + date) pair reaches this pass. Runs
+        # BEFORE the blind Amount+Date pass so a same-invoice-number pair
+        # is never mistaken for two unrelated entries that merely share an
+        # amount/date coincidence.
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        amount_mismatch_pairs = self._amount_mismatch_match(
+            available_company, available_vendor,
+            tds_percentage, gst_percentage, tds_percentage_min,
+        )
+        for pair in amount_mismatch_pairs:
+            matched_company_ids.add(pair.company_entry_id)
+            matched_vendor_ids.add(pair.vendor_entry_id)
+            result.match_pairs.append(pair)
 
         # ─── Pass 1.5: Amount + Date Match (ignoring doc number) ──────────
         # Most common scenario: company SAP doc numbers don't match vendor invoice numbers
@@ -783,6 +902,7 @@ class ReconciliationEngineService:
             tol_date_pairs = self._tolerance_date_match(
                 available_company, available_vendor,
                 tolerance, tds_percentage, gst_percentage, date_tolerance_days,
+                tds_percentage_min,
             )
             for pair in tol_date_pairs:
                 matched_company_ids.add(pair.company_entry_id)
@@ -803,6 +923,7 @@ class ReconciliationEngineService:
             len(utr_groups) > 0
             or len(one_to_many_groups) > 0 or len(many_to_one_groups) > 0
             or len(date_proximity_pairs) > 0 or len(tol_date_pairs) > 0
+            or len(amount_mismatch_pairs) > 0
         )
 
         # Calculate statistics (Requirement 5.12)
@@ -1217,6 +1338,121 @@ class ReconciliationEngineService:
         return pairs
 
     # ──────────────────────────────────────────────────────────────────────
+    # Pass 15: Amount Mismatch (same invoice number + same date, gap NOT
+    # explained by TDS/GST)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _amount_mismatch_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        tds_percentage: Decimal = Decimal("0"),
+        gst_percentage: Decimal = Decimal("0"),
+        tds_percentage_min: Decimal = Decimal("0"),
+    ) -> list[MatchPair]:
+        """
+        Pair entries that share the SAME invoice number AND the SAME
+        DOCUMENT DATE (Invoice Date) on both sides, when the amount gap is
+        real (not a rounding difference) and NOT explained by the
+        configured TDS/GST rate.
+
+        Uses `LedgerEntryData.posting_date`, which — despite the field's
+        legacy name — holds the DOCUMENT DATE (Invoice Date / SAP BLDAT),
+        not the SAP posting date (BUDAT), for any entry where the user has
+        mapped a Document/Invoice Date column on the Map Columns screen.
+        See column_mapping_controller.py's date-derivation logic: Invoice
+        Date is deliberately given priority over Posting Date there
+        specifically because SAP's posting date can lag the document date
+        by many days on real data (confirmed gap: 19-Apr document date vs
+        02-May posting date for the SAME invoice), which would otherwise
+        push a genuine same-invoice pair out of this pass entirely. This
+        field only falls back to the raw SAP posting date if no
+        Document/Invoice Date column was ever mapped for that case.
+
+        Per explicit correction: an identical invoice number and document
+        date is strong-enough identification that these two entries ARE the
+        same transaction — they must be matched and surfaced to the
+        reviewer as one linked pair with a genuine discrepancy, rather than
+        left as two separate "not booked by X" open items (which hides
+        that they're actually the same invoice with a real, reviewable
+        value mismatch). This is the one case where the engine itself
+        emits the "Amount Mismatch" classification/status (see
+        reconciliation_export_service.py) — every other pass either
+        explains the gap (TDS/GST/rounding) or leaves the entries
+        unmatched.
+
+        Runs AFTER _tolerance_match / _tds_gst_match in the pass order so a
+        gap that DOES fit the configured TDS/GST band is still captured by
+        those passes first (as "Invoice Number Matched" / "TDS Booked by
+        ..."), and only a genuinely unexplained gap on a same-invoice
+        same-document-date pair reaches this pass.
+        """
+        pairs: list[MatchPair] = []
+        used_vendor_ids: set[UUID] = set()
+
+        tds_min_frac = tds_percentage_min / Decimal("100") if tds_percentage_min > 0 else Decimal("0")
+        tds_max_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
+
+        # Build a lookup for vendor entries by (document date, invoice
+        # number) — NOT amount, since the whole point of this pass is that
+        # the amounts differ. `posting_date` here holds the DOCUMENT DATE
+        # (see docstring above), not the raw SAP posting date.
+        vendor_lookup: dict[tuple, list[LedgerEntryData]] = {}
+        for v_entry in vendor:
+            if not _is_matchable(v_entry):
+                continue
+            if not v_entry.invoice_number:
+                continue
+            key = (v_entry.posting_date, v_entry.invoice_number)
+            vendor_lookup.setdefault(key, []).append(v_entry)
+
+        for c_entry in company:
+            if not _is_matchable(c_entry):
+                continue
+            if not c_entry.invoice_number:
+                continue
+            key = (c_entry.posting_date, c_entry.invoice_number)
+            candidates = vendor_lookup.get(key, [])
+            for v_entry in candidates:
+                if v_entry.id in used_vendor_ids:
+                    continue
+                if not _categories_compatible(c_entry.category, v_entry.category):
+                    continue
+
+                diff = abs(abs(c_entry.amount) - abs(v_entry.amount))
+                if diff <= Decimal("0.005"):
+                    # No real gap at all — belongs to _exact_match, not here
+                    # (shouldn't normally reach this pass since exact_match
+                    # runs first and would have already claimed it).
+                    continue
+
+                is_tax_match = _is_tax_band_gap(
+                    diff, abs(c_entry.amount), abs(v_entry.amount),
+                    tds_min_frac, tds_max_frac, gst_frac,
+                )
+                if is_tax_match:
+                    # A real TDS/GST-driven gap — not an amount mismatch.
+                    # Should already have been claimed by an earlier pass,
+                    # but skip defensively rather than mislabel it here.
+                    continue
+
+                pairs.append(
+                    MatchPair(
+                        company_entry_id=c_entry.id,
+                        vendor_entry_id=v_entry.id,
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.AMOUNT_MISMATCH],
+                        pass_number=MatchPassType.AMOUNT_MISMATCH,
+                        matched_amount=c_entry.amount,
+                        difference_amount=c_entry.amount + v_entry.amount,
+                    )
+                )
+                used_vendor_ids.add(v_entry.id)
+                break
+
+        return pairs
+
+    # ──────────────────────────────────────────────────────────────────────
     # Pass 1.5: Amount + Date Match (cross-format doc numbers)
     # ──────────────────────────────────────────────────────────────────────
 
@@ -1303,11 +1539,12 @@ class ReconciliationEngineService:
         tds_percentage: Decimal,
         gst_percentage: Decimal,
         date_tolerance_days: int = 15,
+        tds_percentage_min: Decimal = Decimal("0"),
     ) -> list[MatchPair]:
         """
         Match entries whose ABSOLUTE amounts are within an allowed difference
-        (tolerance %, TDS %, or GST %) and whose dates are within tolerance days,
-        WITHOUT requiring reference numbers to match.
+        (tolerance %, TDS % range, or GST %) and whose dates are within
+        tolerance days, WITHOUT requiring reference numbers to match.
 
         Catches invoices that differ by GST rounding or small journal adjustments
         (e.g. company 208,683 vs vendor 208,860 → diff 177 within tolerance).
@@ -1318,7 +1555,8 @@ class ReconciliationEngineService:
 
         # Determine tolerance fraction (tolerance may be percentage < 1 or absolute)
         is_pct = tolerance < Decimal("1")
-        tds_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        tds_min_frac = tds_percentage_min / Decimal("100") if tds_percentage_min > 0 else Decimal("0")
+        tds_max_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
         gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
 
         for c_entry in company:
@@ -1328,14 +1566,14 @@ class ReconciliationEngineService:
             if abs_c == 0:
                 continue
 
-            # Compute the maximum allowed absolute difference for this entry
+            # Plain rounding tolerance ceiling, with a small ₹5 floor to
+            # absorb rounding. The TDS/GST-sized portion is checked
+            # separately via _is_tax_band_gap (range-aware band around the
+            # actual computed tax amount, not a blanket ceiling) — same
+            # false-match issue _tolerance_match had.
             allowed = Decimal("0")
             if tolerance > 0:
                 allowed = abs_c * tolerance if is_pct else tolerance
-            # Also allow up to the larger of TDS/GST portion (some diffs are tax-driven)
-            tax_allowed = abs_c * max(tds_frac, gst_frac)
-            allowed = max(allowed, tax_allowed)
-            # A small floor to absorb rounding (₹5)
             allowed = max(allowed, Decimal("5"))
 
             best_match: LedgerEntryData | None = None
@@ -1350,7 +1588,10 @@ class ReconciliationEngineService:
                     continue
 
                 diff = abs(abs_c - abs(v_entry.amount))
-                if diff > allowed:
+                is_tax_match = _is_tax_band_gap(
+                    diff, abs_c, abs(v_entry.amount), tds_min_frac, tds_max_frac, gst_frac,
+                )
+                if diff > allowed and not is_tax_match:
                     continue
 
                 # Date proximity check (directional forward-only window for
@@ -1392,6 +1633,7 @@ class ReconciliationEngineService:
         tolerance: Decimal,
         tds_percentage: Decimal = Decimal("0"),
         gst_percentage: Decimal = Decimal("0"),
+        tds_percentage_min: Decimal = Decimal("0"),
     ) -> list[MatchPair]:
         """
         Match entries where amount difference is within tolerance
@@ -1408,6 +1650,10 @@ class ReconciliationEngineService:
         "Date Range and Amount Matched" classification and losing the TDS
         signal on the difference entirely.
 
+        TDS is a RANGE [tds_percentage_min, tds_percentage] (the
+        Reconciliation Settings screen's Min/Max), not a single rate — the
+        mapping doc calls out multiple real tiers (0.1%/2%/10%).
+
         Requirement 5.3: Amount within configured Tolerance_Amount
         and invoice numbers match.
 
@@ -1421,7 +1667,8 @@ class ReconciliationEngineService:
 
         # Determine if tolerance is percentage-based (< 1) or absolute (>= 1)
         is_percentage = tolerance < Decimal("1")
-        tds_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
+        tds_min_frac = tds_percentage_min / Decimal("100") if tds_percentage_min > 0 else Decimal("0")
+        tds_max_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
         gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
 
         # Build invoice-number lookup for vendor entries (matchable only).
@@ -1453,17 +1700,24 @@ class ReconciliationEngineService:
                 # pass the tolerance check.
                 diff = abs(abs(c_entry.amount) - abs(v_entry.amount))
 
-                # Calculate allowed tolerance, widened to cover a TDS/GST-
-                # sized gap on top of the plain rounding tolerance.
+                # Plain rounding tolerance (small write-offs) — unrelated to
+                # tax, so this stays a simple ceiling check.
                 if is_percentage:
                     allowed = abs(c_entry.amount) * tolerance
                 else:
                     allowed = tolerance
-                base_amount = max(abs(c_entry.amount), abs(v_entry.amount))
-                tax_allowed = base_amount * max(tds_frac, gst_frac)
-                allowed = max(allowed, tax_allowed)
 
-                if diff <= allowed:
+                # TDS/GST-sized gap: only accepted if it actually resembles
+                # the configured rate applied to the base amount (within a
+                # tight band), not merely "smaller than the largest possible
+                # tax amount" — see _is_tax_band_gap for why the ceiling
+                # check let real amount mismatches through as false matches.
+                is_tax_match = _is_tax_band_gap(
+                    diff, abs(c_entry.amount), abs(v_entry.amount),
+                    tds_min_frac, tds_max_frac, gst_frac,
+                )
+
+                if diff <= allowed or is_tax_match:
                     pairs.append(
                         MatchPair(
                             company_entry_id=c_entry.id,
@@ -2057,6 +2311,7 @@ class ReconciliationEngineService:
                     MatchPassType.AMOUNT_DATE,
                     MatchPassType.TDS_GST,
                     MatchPassType.TOLERANCE_DATE,
+                    MatchPassType.AMOUNT_MISMATCH,
                 ):
                     entries_involved = ps.match_count * 2
                 elif ps.pass_number == 4:
