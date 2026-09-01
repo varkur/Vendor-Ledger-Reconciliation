@@ -548,17 +548,21 @@ class TestOneToManyMatch:
     def test_one_to_many_basic_match(
         self, service: ReconciliationEngineService
     ):
-        """Should match one company entry to multiple vendor entries summing to same amount."""
+        """Should match one company entry to multiple vendor entries summing
+        to same amount. Category must be a KNOWN one (e.g. "Invoice") — see
+        test_one_to_many_excludes_wildcard_category_entries for why a
+        wildcard/uncategorized entry must never participate in subset-sum
+        grouping."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"),
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"),
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         v2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"),
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
 
@@ -569,6 +573,57 @@ class TestOneToManyMatch:
         assert set(groups[0].vendor_entry_ids) == {v1.id, v2.id}
         assert groups[0].pass_number == MatchPassType.ONE_TO_MANY
         assert groups[0].matched_amount == Decimal("1000")
+
+    def test_one_to_many_excludes_wildcard_category_entries(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Client-confirmed bug: a Zuventus bulk request grouped one Emcure
+        invoice against multiple vendor entries via subset-sum, but ONE of
+        those vendor entries was an unrelated "Journal" (jnl) line that
+        merely happened to make the total add up — and the row was reported
+        "Reconciled" alongside the real invoices. Subset-sum grouping has no
+        invoice-number correlation (pure amount coincidence within a date
+        window), so a wildcard-category entry (Journal/Unknown/Other/blank)
+        must never be eligible for it, even if the arithmetic lines up.
+        """
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        v2_journal = LedgerEntryData(
+            id=uuid4(), amount=Decimal("400"), category="Journal",
+            posting_date=date(2024, 3, 15), reference_number="REF-B",
+        )
+
+        groups = service._one_to_many_match([c1], [v1, v2_journal])
+        assert len(groups) == 0
+
+    def test_one_to_many_anchor_entry_must_have_known_category(
+        self, service: ReconciliationEngineService
+    ):
+        """A wildcard-category company entry must not anchor a one-to-many
+        group either — it has no reliable economic identity to group
+        multiple vendor entries against."""
+        c1_journal = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"), category="Journal",
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        v2 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-B"
+        )
+
+        groups = service._one_to_many_match([c1_journal], [v1, v2])
+        assert len(groups) == 0
 
     def test_one_to_many_no_match_when_sums_differ(
         self, service: ReconciliationEngineService
@@ -616,17 +671,19 @@ class TestManyToOneMatch:
     def test_many_to_one_basic_match(
         self, service: ReconciliationEngineService
     ):
-        """Should match multiple company entries summing to one vendor entry."""
+        """Should match multiple company entries summing to one vendor entry.
+        Category must be a KNOWN one — see
+        test_many_to_one_excludes_wildcard_category_entries."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"),
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         c2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"),
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"),
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
 
@@ -637,6 +694,29 @@ class TestManyToOneMatch:
         assert groups[0].vendor_entry_ids == [v1.id]
         assert groups[0].pass_number == MatchPassType.MANY_TO_ONE
         assert groups[0].matched_amount == Decimal("1000")
+
+    def test_many_to_one_excludes_wildcard_category_entries(
+        self, service: ReconciliationEngineService
+    ):
+        """Mirrors test_one_to_many_excludes_wildcard_category_entries: a
+        Journal/Unknown/Other-category company entry that merely happens to
+        help the sum add up must never be silently pulled into a
+        many-to-one group."""
+        c1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-A"
+        )
+        c2_journal = LedgerEntryData(
+            id=uuid4(), amount=Decimal("600"), category="Journal",
+            posting_date=date(2024, 3, 15), reference_number="REF-B"
+        )
+        v1 = LedgerEntryData(
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            posting_date=date(2024, 3, 15), reference_number="REF-001"
+        )
+
+        groups = service._many_to_one_match([c1, c2_journal], [v1])
+        assert len(groups) == 0
 
     def test_many_to_one_no_match_when_sums_differ(
         self, service: ReconciliationEngineService
@@ -1394,15 +1474,15 @@ class TestConfidenceScoring:
     ):
         """Pass 4 (One-to-Many): BRD MatchScore = 80 → confidence = 0.80."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"),
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"),
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         v2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"),
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
 
@@ -1417,15 +1497,15 @@ class TestConfidenceScoring:
     ):
         """Pass 5 (Many-to-One): BRD MatchScore = 75 → confidence = 0.75."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"),
+            id=uuid4(), amount=Decimal("400"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         c2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"),
+            id=uuid4(), amount=Decimal("600"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"),
+            id=uuid4(), amount=Decimal("1000"), category="Invoice",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
 

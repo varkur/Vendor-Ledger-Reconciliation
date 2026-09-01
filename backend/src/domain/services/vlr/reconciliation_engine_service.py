@@ -1994,21 +1994,38 @@ class ReconciliationEngineService:
 
         # Sort company entries by absolute amount descending (larger amounts more
         # likely to be sums of multiple smaller vendor entries). Only matchable
-        # company entries drive one-to-many grouping.
+        # company entries with a KNOWN category drive one-to-many grouping —
+        # a wildcard-category (Journal/Unknown/Other) anchor entry has no
+        # reliable economic identity of its own to group multiple vendor
+        # entries against.
         sorted_company = sorted(
-            (e for e in company if _is_matchable(e)),
+            (e for e in company if _is_matchable(e) and e.category not in WILDCARD_CATEGORIES),
             key=lambda e: abs(e.amount),
             reverse=True,
         )
 
         for c_entry in sorted_company:
-            # Candidate vendor entries must be unused, matchable, and of a
+            # Candidate vendor entries must be unused, matchable, of a
             # category compatible with the company entry (no invoice<->receipt,
-            # no matching against knock-offs/SA entries).
+            # no matching against knock-offs/SA entries), AND have a KNOWN
+            # economic category (not Journal/Unknown/Other/blank).
+            #
+            # Client-confirmed bug: a subset-sum group pulled in an unrelated
+            # vendor "Journal" entry that merely happened to make the total
+            # add up, and the row was reported "Reconciled" alongside the
+            # real invoices in the group. Unlike Exact/Tolerance matching
+            # (which is keyed on invoice NUMBER identity — a strong signal
+            # that tolerates a wildcard category), subset-sum grouping has
+            # NO invoice-number correlation at all; it is pure amount
+            # coincidence within a date window. Wildcard categories must
+            # never participate in that weaker signal, or any journal/
+            # unclassified entry that happens to fit the sum gets silently
+            # absorbed into a real invoice group.
             available_vendor = [
                 v for v in vendor
                 if v.id not in used_vendor_ids
                 and _is_matchable(v)
+                and v.category not in WILDCARD_CATEGORIES
                 and _categories_compatible(c_entry.category, v.category)
             ]
             if len(available_vendor) < 2:
@@ -2055,18 +2072,27 @@ class ReconciliationEngineService:
         groups: list[MatchGroup] = []
         used_company_ids: set[UUID] = set()
 
-        # Sort vendor entries by absolute amount descending (matchable only).
+        # Sort vendor entries by absolute amount descending (matchable only,
+        # KNOWN category — see _one_to_many_match for why wildcard-category
+        # entries can't anchor a subset-sum group).
         sorted_vendor = sorted(
-            (e for e in vendor if _is_matchable(e)),
+            (e for e in vendor if _is_matchable(e) and e.category not in WILDCARD_CATEGORIES),
             key=lambda e: abs(e.amount),
             reverse=True,
         )
 
         for v_entry in sorted_vendor:
+            # Candidate company entries must ALSO have a known category —
+            # same rationale as _one_to_many_match: subset-sum grouping is
+            # pure amount coincidence with no invoice-number correlation, so
+            # a wildcard-category (e.g. Journal) entry that merely happens
+            # to fit the sum must never be silently absorbed into a real
+            # invoice/payment group.
             available_company = [
                 c for c in company
                 if c.id not in used_company_ids
                 and _is_matchable(c)
+                and c.category not in WILDCARD_CATEGORIES
                 and _categories_compatible(v_entry.category, c.category)
             ]
             if len(available_company) < 2:

@@ -157,6 +157,43 @@ class TestManualLinkStatusAndRemark:
         assert rows[0]["remark"] == "Invoice Booked And Adjusted"
         assert rows[0]["status"] == "Manually Mapped"
 
+    def test_classification_shows_reviewer_selected_reason_not_generic_label(self):
+        """
+        Client-confirmed bug: after manually linking two entries and
+        selecting a reason (e.g. "Opening Balance as per Company") in the
+        "Reason for Linking" dialog, the exported Classification column
+        always showed the generic "Manually Mapped" placeholder instead of
+        the actual reason the reviewer picked — losing that specific
+        selection entirely from the Classification column (it only ever
+        appeared in Remark).
+        """
+        c1 = FakeEntry(pass_number=8)
+        p1 = FakeEntry(pass_number=8)
+        match = FakeMatch(
+            company_entry_ids=[c1.id], vendor_entry_ids=[p1.id],
+            difference_amount=15110.0, status_reason="Opening Balance as per Company",
+        )
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
+
+        assert len(rows) == 1
+        assert rows[0]["status"] == "Manually Mapped"
+        assert rows[0]["classification"] == "Opening Balance as per Company"
+
+    def test_classification_falls_back_to_manually_mapped_when_no_reason_stored(self):
+        """A pass-8 match with no status_reason persisted (legacy data,
+        or a reason that failed to save) must still fall back to the
+        generic "Manually Mapped" label rather than showing blank."""
+        c1 = FakeEntry(pass_number=8)
+        p1 = FakeEntry(pass_number=8)
+        match = FakeMatch(company_entry_ids=[c1.id], vendor_entry_ids=[p1.id], status_reason=None)
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
+
+        assert rows[0]["classification"] == "Manually Mapped"
+
     def test_remark_blank_for_auto_matched_rows(self):
         """A plain exact invoice-number match (pass 1) carries no auto-remark
         — only rows falling back to weaker classifications or flagged by the
@@ -445,25 +482,121 @@ class TestMatchedResidualBucket:
         assert diff_row is not None
         assert abs(diff_row[2].value) < 0.01
 
+    def test_amount_mismatch_row_is_bucketed_by_classification_not_dropped(self):
+        """
+        Client-confirmed bug (Prince Graphics case): after the Amount
+        Mismatch pass (15) was added, its residual was never registered
+        for Summary-sheet bucketing, so every one of these matched-but-
+        discrepant pairs fell through to the unlinked "Amount Unsettled"
+        plug instead of getting its own itemised Summary line — inflating
+        "Amount Unsettled by Company" with money that actually belonged to
+        a real, already-matched category.
+
+        Status for this pass is "Reconciled" (the pair IS matched) per
+        explicit correction — the caveat lives in Classification =
+        "Amount Mismatch", so bucketing must key off Classification here,
+        not Status.
+        """
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "Reconciled", "classification": "Amount Mismatch", "difference": 5000.0},
+            {"status": "Reconciled", "classification": "Amount Mismatch", "difference": -1200.0},
+        ]
+        out = matched_residual_bucket(rows)
+        key = ("Amount Mismatch Difference", "Amount Mismatch",
+               "Finance to review - invoice number and date match but amount differs")
+        assert key in out
+        assert float(out[key][0]) == 3800.0
+        assert out[key][1] == 2
+
+    def test_summary_amount_mismatch_gets_own_linked_line_not_amount_unsettled(self):
+        """
+        End-to-end reproduction of the Prince Graphics bug: a same-invoice-
+        number, same-date pair with an unexplained gap (pass 15) must
+        appear as its own "Amount Mismatch Difference" Summary line with a
+        real annexure and entry count — not be absorbed into the unlinked
+        "Amount Unsettled" plug — and the final Difference row must still
+        net to zero.
+        """
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+
+        c1 = FakeEntry(
+            document_category="Invoice", amount=-90000.0,
+            pass_number=MatchPassType.AMOUNT_MISMATCH,
+        )
+        p1 = FakeEntry(
+            document_category="Invoice", amount=95000.0,
+            pass_number=MatchPassType.AMOUNT_MISMATCH,
+        )
+        match = FakeMatch(
+            company_entry_ids=[c1.id], vendor_entry_ids=[p1.id],
+            difference_amount=5000.0,
+        )
+        by_id = {str(c1.id): c1, str(p1.id): p1}
+
+        service = ReconciliationExportService()
+        service._tds_percentage_value = 0.0
+        service._gst_percentage_value = 0.0
+        service._reco_dt = "31-Aug-26 12:00 PM"
+        service._party_code = ""
+
+        rows = service._build_recon_rows([c1], [p1], [match], by_id)
+        assert rows[0]["status"] == "Reconciled"
+        assert rows[0]["classification"] == "Amount Mismatch"
+
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+
+        class FakeVendor:
+            name = "Prince Graphics Pvt Ltd"
+
+        annexure_map = service._compute_summary(
+            ws, FakeVendor(), [c1], [p1], [match],
+            None, None, "1.0 Rs", "0.0 - 10.0", "0 - 15",
+            rows,
+        )
+
+        labels = {v[0] for v in annexure_map.values()}
+        assert "Amount Mismatch" in labels
+
+        group_row = None
+        diff_row = None
+        for row in ws.iter_rows():
+            if row[0].value == "Amount Mismatch Difference":
+                group_row = row
+            if row[0].value == "Difference":
+                diff_row = row
+        assert group_row is not None, "Amount Mismatch Difference group must render on the Summary sheet"
+        assert diff_row is not None
+        assert abs(diff_row[2].value) < 0.01
+
 
 class TestAmountMismatchPassClassification:
     """
     Pass 15 (AMOUNT_MISMATCH) — same invoice number + same date, gap not
-    explained by TDS/GST — is the one case where the automated engine
-    itself emits "Amount Mismatch" as both Status and Classification.
+    explained by TDS/GST. Per explicit correction: Status = "Reconciled"
+    (the pair IS matched/settled, same as every other successful match);
+    Classification = "Amount Mismatch" (the caveat that the values don't
+    tie out and no tax rate explains it). This keeps Status/Classification
+    meaning consistent with every other pass: Status answers "is this
+    settled", Classification answers "how/why was it matched".
     """
 
-    def test_status_is_amount_mismatch(self):
+    def test_status_is_reconciled(self):
         from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
         c_entry = FakeEntry(amount=-100000.0)
         p_entry = FakeEntry(amount=95000.0)
         result = _status(MatchPassType.AMOUNT_MISMATCH, c_entry, p_entry, difference=-5000.0)
-        assert result == "Amount Mismatch"
+        assert result == "Reconciled"
 
-    def test_classification_is_invoice_number_matched(self):
+    def test_classification_is_amount_mismatch(self):
         from src.domain.services.vlr.reconciliation_export_service import _classification
         from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
-        assert _classification(MatchPassType.AMOUNT_MISMATCH) == "Invoice Number Matched"
+        assert _classification(MatchPassType.AMOUNT_MISMATCH) == "Amount Mismatch"
 
     def test_row_status_via_build_recon_rows(self):
         from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
@@ -484,5 +617,5 @@ class TestAmountMismatchPassClassification:
         rows = ReconciliationExportService()._build_recon_rows([c1], [p1], [match], by_id)
 
         assert len(rows) == 1
-        assert rows[0]["status"] == "Amount Mismatch"
-        assert rows[0]["classification"] == "Invoice Number Matched"
+        assert rows[0]["status"] == "Reconciled"
+        assert rows[0]["classification"] == "Amount Mismatch"

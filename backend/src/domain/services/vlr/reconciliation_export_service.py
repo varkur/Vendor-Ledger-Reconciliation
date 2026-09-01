@@ -64,7 +64,7 @@ PASS_CLASSIFICATION: dict[int, str] = {
     # doesn't match the configured TDS/GST rate — per explicit correction,
     # still matched (not left as two separate open items) and classified
     # as an invoice-number match with a genuine, reviewable discrepancy.
-    MatchPassType.AMOUNT_MISMATCH: "Invoice Number Matched",
+    MatchPassType.AMOUNT_MISMATCH: "Amount Mismatch",
 }
 
 # Match pass → derived rule code (our own taxonomy, prefixed VLR-)
@@ -175,13 +175,16 @@ def _status(
     if pn == MatchPassType.AMOUNT_MISMATCH:
         # Same invoice number AND same date on both sides (see
         # _amount_mismatch_match in reconciliation_engine_service.py) — the
-        # engine only reaches this pass when the gap did NOT match the
-        # configured TDS/GST rate, so it's always a genuine, unexplained
-        # discrepancy on what is otherwise clearly the same transaction.
-        # This is the ONE case where the automated engine itself emits
-        # "Amount Mismatch" (elsewhere that label is reserved for a
-        # reviewer's manually-selected link reason).
-        return "Amount Mismatch"
+        # pair IS matched/settled (Status = Reconciled, same as every
+        # other successfully-paired entry), but the CLASSIFICATION carries
+        # the caveat that the values don't tie out and no tax rate explains
+        # it — that's "Amount Mismatch" (see PASS_CLASSIFICATION above).
+        # Status answers "is this settled" (Reconciled/TDS Booked by.../
+        # Write off/Manually Mapped); Classification answers "how/why was
+        # it matched" (Invoice Number Matched/Date and Amount Matched/
+        # Amount Mismatch). Putting "Amount Mismatch" in Status broke that
+        # pattern for this one pass — corrected per explicit instruction.
+        return "Reconciled"
     if pn == 2 and abs(difference) > 0.005:
         # Pass 2 (_tolerance_match) now covers both small rounding
         # differences AND TDS/GST-sized gaps on an exact invoice-number
@@ -659,12 +662,22 @@ class ReconciliationExportService:
         # off the match, not off both sides being present, otherwise the extra
         # lines of a group show "Unmatched" while status says "Reconciled".
         is_matched = match is not None
+        manual_reason = (getattr(match, "status_reason", "") or "") if match else ""
         # Entry-intrinsic classification (Opening/Closing Balance, Reversal,
         # TDS) takes priority over the pass-based label, and applies whether or
         # not the row was matched. Check company side first, then party.
         special = _special_classification(c) or _special_classification(p)
         if special is not None:
             classification = special
+        elif is_matched and pass_number is not None and int(pass_number) == 8 and manual_reason:
+            # Manual link (pass 8): the reviewer picked a specific reason
+            # from the "Reason for Linking" dropdown (e.g. "Opening Balance
+            # as per Company") — that reason IS the classification for this
+            # row, not the generic "Manually Mapped" placeholder. Client-
+            # confirmed bug: the selected reason only ever showed up in the
+            # Remark column while Classification stayed hardcoded to
+            # "Manually Mapped" regardless of what was actually picked.
+            classification = manual_reason
         elif is_matched:
             classification = _classification(pass_number)
         else:
@@ -974,6 +987,7 @@ class ReconciliationExportService:
             "Payment / receipt Difference",
             "Other Differences",
             "TDS / TCS Difference",
+            "Amount Mismatch Difference",
             "Write Off / Rounding Off Difference",
             "Unexplained Amount Gap Difference",
         ]
@@ -1215,6 +1229,24 @@ _MATCHED_RESIDUAL_INFO: dict[str, tuple[str, str]] = {
     ),
 }
 
+# Classification -> (Summary group, Action Required text) for MATCHED pairs
+# whose Status is the plain "Reconciled" (the pair IS settled/matched) but
+# whose Classification carries a caveat worth surfacing on the Summary sheet.
+# Pass 15 (AMOUNT_MISMATCH): same invoice number + same document date on both
+# sides, gap not explained by TDS/GST (see _amount_mismatch_match in
+# reconciliation_engine_service.py) — Status = "Reconciled" (it IS matched),
+# Classification = "Amount Mismatch" (why it's worth a second look). Looked
+# up separately from _MATCHED_RESIDUAL_INFO above because this one keys off
+# Classification, not Status — every other entry in that dict has ITS OWN
+# distinct Status value, but Amount Mismatch deliberately shares "Reconciled"
+# with every clean match, so it can't be distinguished by Status alone.
+_MATCHED_RESIDUAL_INFO_BY_CLASSIFICATION: dict[str, tuple[str, str]] = {
+    "Amount Mismatch": (
+        "Amount Mismatch Difference",
+        "Finance to review - invoice number and date match but amount differs",
+    ),
+}
+
 
 def matched_residual_bucket(rows: list[dict] | None) -> dict:
     """
@@ -1237,14 +1269,19 @@ def matched_residual_bucket(rows: list[dict] | None) -> dict:
     if not rows:
         return out
     for r in rows:
-        info = _MATCHED_RESIDUAL_INFO.get(r.get("status"))
+        status = r.get("status")
+        info = _MATCHED_RESIDUAL_INFO.get(status)
+        label = status
+        if info is None:
+            info = _MATCHED_RESIDUAL_INFO_BY_CLASSIFICATION.get(r.get("classification"))
+            label = r.get("classification")
         if info is None:
             continue
         diff = Decimal(str(_num(r.get("difference", 0))))
         if abs(diff) < Decimal("0.005"):
             continue
         grp, action = info
-        key = (grp, r["status"], action)
+        key = (grp, label, action)
         agg = out.setdefault(key, [Decimal("0"), 0])
         agg[0] += diff
         agg[1] += 1
