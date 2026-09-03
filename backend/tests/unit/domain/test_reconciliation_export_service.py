@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from src.domain.services.vlr.reconciliation_export_service import (
     ReconciliationExportService,
+    _invoice_number,
     _status,
 )
 
@@ -121,6 +122,77 @@ class TestPassTwoStatusTdsVsWriteOff:
         p_entry = FakeEntry()
         p_entry.amount = 31524.0  # type: ignore[attr-defined]
         result = _status(2, c_entry, p_entry, difference=1794.78)
+        assert result == "Unexplained Amount Gap"
+
+    def test_low_rate_gap_within_configured_min_max_range_is_tds_booked(self):
+        """
+        Client-confirmed bug (round 2): TDS Percentage on the Reconciliation
+        Settings screen is a MIN-MAX range (e.g. 0%-10%), but the Status
+        check only ever compared the gap against a flat Max-rate amount —
+        so a genuine TDS deduction at any OTHER rate within that range
+        (here, ~0.085%, well inside 0%-10%) fell through to "Unexplained
+        Amount Gap" even though the matching engine's own range-aware
+        _is_tax_band_gap had already matched the pair correctly as TDS.
+        Real numbers from the client's export: company -238290.75,
+        party 238492.75, diff 202 (202/238492.75 ~= 0.0847%).
+        """
+        c_entry = FakeEntry()
+        c_entry.amount = -238290.75  # type: ignore[attr-defined]
+        p_entry = FakeEntry()
+        p_entry.amount = 238492.75  # type: ignore[attr-defined]
+        result = _status(
+            2, c_entry, p_entry, difference=202.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        # Company has the SMALLER absolute amount -> company booked the TDS.
+        assert result == "TDS Booked by Company"
+
+    def test_multiple_real_client_rows_within_tds_range_all_booked(self):
+        """A second and third row from the same client export, all with
+        implied rates in the ~0.08%-0.09% band, well within a configured
+        0%-10% TDS range."""
+        cases = [
+            (-346189.0, 346483.57, 294.57),
+            (-207695.46, 207871.46, 176.0),
+        ]
+        for c_amt, p_amt, diff in cases:
+            c_entry = FakeEntry()
+            c_entry.amount = c_amt  # type: ignore[attr-defined]
+            p_entry = FakeEntry()
+            p_entry.amount = p_amt  # type: ignore[attr-defined]
+            result = _status(
+                2, c_entry, p_entry, difference=diff,
+                tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+            )
+            assert result == "TDS Booked by Company", f"failed for c={c_amt}, p={p_amt}, diff={diff}"
+
+    def test_tds_gst_pass_also_respects_min_max_range(self):
+        """Pass TDS_GST (11) must use the same range-aware check as pass 2,
+        not the old flat-rate comparison."""
+        c_entry = FakeEntry()
+        c_entry.amount = -238290.75  # type: ignore[attr-defined]
+        p_entry = FakeEntry()
+        p_entry.amount = 238492.75  # type: ignore[attr-defined]
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        result = _status(
+            MatchPassType.TDS_GST, c_entry, p_entry, difference=202.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Company"
+
+    def test_gap_below_configured_min_is_still_unexplained(self):
+        """A gap whose implied rate is genuinely below the configured Min
+        (with margin) — not just any small gap — must still be
+        Unexplained, proving this isn't a blanket loosening."""
+        c_entry = FakeEntry()
+        c_entry.amount = -1000000.0  # type: ignore[attr-defined]
+        p_entry = FakeEntry()
+        p_entry.amount = 1000010.0  # type: ignore[attr-defined]
+        # implied rate ~= 0.001% -- below a configured Min of 2%
+        result = _status(
+            2, c_entry, p_entry, difference=10.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=2.0,
+        )
         assert result == "Unexplained Amount Gap"
 
 
@@ -358,6 +430,71 @@ class TestMultiEntryGroupDifference:
         assert rows[0]["difference"] == -5.0
 
 
+class TestInvoiceNumberNeverExportsPlaceholder:
+    """
+    Client-reported bug: the exported workbook's Invoice Number columns
+    (Party/Company Invoice Number, and the standalone "Party" sheet) were
+    getting filled with the internal synthetic placeholder "BAL_ROW_<n>"
+    (inserted by file_parser_service for rows with no recognizable invoice
+    column) instead of being left blank. "Don't need to fill the invoice
+    number column with this BAL_ROW."
+
+    _invoice_number()'s main lookup loop already skipped BAL_ROW_* values,
+    but its final fallback line returned `derived or doc` unconditionally —
+    exactly the values the loop had just rejected — so a genuinely
+    unidentifiable invoice number resurfaced as the raw placeholder anyway.
+    """
+
+    def test_bal_row_placeholder_in_document_number_is_left_blank(self):
+        entry = FakeEntry(document_number="BAL_ROW_82", derived_invoice_number=None)
+        assert _invoice_number(entry) == ""
+
+    def test_bal_row_placeholder_in_derived_invoice_number_is_left_blank(self):
+        entry = FakeEntry(document_number="", derived_invoice_number="BAL_ROW_15")
+        assert _invoice_number(entry) == ""
+
+    def test_bal_row_in_both_fields_is_left_blank(self):
+        entry = FakeEntry(document_number="BAL_ROW_9", derived_invoice_number="BAL_ROW_9")
+        assert _invoice_number(entry) == ""
+
+    def test_real_document_number_is_still_returned(self):
+        entry = FakeEntry(document_number="INV-1001", derived_invoice_number=None)
+        assert _invoice_number(entry) == "INV-1001"
+
+    def test_real_derived_invoice_number_takes_priority(self):
+        entry = FakeEntry(document_number="DOC-1", derived_invoice_number="XBLNR-500")
+        assert _invoice_number(entry) == "XBLNR-500"
+
+    def test_falls_back_to_raw_data_alias_when_placeholder(self):
+        entry = FakeEntry(
+            document_number="BAL_ROW_3",
+            derived_invoice_number=None,
+            raw_data={"Invoice No": "REAL-789"},
+        )
+        assert _invoice_number(entry) == "REAL-789"
+
+    def test_none_entry_returns_blank(self):
+        assert _invoice_number(None) == ""
+
+    def test_raw_data_containing_placeholder_itself_is_rejected(self):
+        """
+        Real-data bug: for balance rows (Opening/Closing Balance), raw_data's
+        own "document number"/"reference" aliases can already BE the
+        BAL_ROW_* placeholder (carried over from an earlier pipeline pass),
+        e.g. raw_data={"document number": "BAL_ROW_167"}. The raw_data
+        fallback must reject that too, not just the modelled
+        document_number/derived_invoice_number fields — otherwise the
+        placeholder round-trips straight back out through the "reference"
+        alias.
+        """
+        entry = FakeEntry(
+            document_number="BAL_ROW_167",
+            derived_invoice_number=None,
+            raw_data={"document number": "BAL_ROW_167", "reference": "BAL_ROW_167"},
+        )
+        assert _invoice_number(entry) == ""
+
+
 class TestMatchedResidualBucket:
     """
     Client-reported bug: the Summary sheet's "Amount Unsettled by
@@ -481,6 +618,54 @@ class TestMatchedResidualBucket:
                 break
         assert diff_row is not None
         assert abs(diff_row[2].value) < 0.01
+
+    def test_count_reflects_actual_ledger_entries_not_row_count(self):
+        """
+        Client-confirmed bug: "why is the count of no. of entries so less?"
+        A matched-pair row represents TWO actual ledger lines (one company,
+        one vendor) — the entry count must reflect that, matching every
+        other count on the same statement (unmatched entries, Reconciled
+        Entries), not just count "1 per row" the way this function
+        previously did. A real case with 16 TDS-matched PAIRS showed "16"
+        on the Particulars statement instead of the true 32 ledger entries.
+        """
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        # Realistic row dicts as produced by _build_recon_rows: both sides
+        # present (a real matched pair) -> counts as 2 entries.
+        rows = [
+            {"status": "TDS Booked by Company", "difference": 100.0,
+             "company_id": "c1", "party_id": "p1"},
+            {"status": "TDS Booked by Company", "difference": 200.0,
+             "company_id": "c2", "party_id": "p2"},
+        ]
+        out = matched_residual_bucket(rows)
+        key = ("TDS / TCS Difference", "TDS Booked by Company",
+               "Company to confirm TDS deducted and share the TDS certificate")
+        assert key in out
+        amt, cnt = out[key]
+        assert float(amt) == 300.0
+        assert cnt == 4, "2 matched pairs = 4 actual ledger entries, not 2 rows"
+
+    def test_count_for_one_sided_leg_of_group_is_one_entry(self):
+        """A one-to-many/many-to-one group's 'extra' leg row carries only
+        ONE side (see _build_recon_rows) — that's genuinely 1 ledger entry,
+        not 2."""
+        from src.domain.services.vlr.reconciliation_export_service import (
+            matched_residual_bucket,
+        )
+
+        rows = [
+            {"status": "TDS Booked by Company", "difference": 50.0,
+             "company_id": "", "party_id": "p1"},
+        ]
+        out = matched_residual_bucket(rows)
+        key = ("TDS / TCS Difference", "TDS Booked by Company",
+               "Company to confirm TDS deducted and share the TDS certificate")
+        amt, cnt = out[key]
+        assert cnt == 1
 
     def test_amount_mismatch_row_is_bucketed_by_classification_not_dropped(self):
         """

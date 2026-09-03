@@ -1048,11 +1048,26 @@ class ReconciliationEngineService:
                 vendor_entries_raw
             )
 
-        # Net difference = company closing - vendor closing. Computed whenever
-        # both sides have entries (using derived closings when needed).
+        # Net difference = company closing + vendor closing (NOT a subtraction).
+        # Bug fix: vendor-side amounts are stored with the OPPOSITE sign
+        # convention from the company side for the same underlying balance
+        # (confirmed by the Particulars statement / Excel export, which
+        # already computes this correctly as `company_closing + party_closing`
+        # with the comment "Party amounts are stored with the opposite sign,
+        # so the difference is the SUM of the two sides"). A genuinely
+        # reconciled pair of ledgers has company_closing ~= -vendor_closing,
+        # so ADDING them cancels out to the true residual gap. Subtracting
+        # them instead (the previous behaviour here) doubled the reported
+        # gap for any case where the two sides were actually close to
+        # agreeing — client-reported: "Difference Amount" showing almost
+        # exactly 2x the Company Amount on a case that otherwise looked
+        # correctly matched (confirmed: company_closing=3,156,328,
+        # vendor_closing=-3,160,129.12, so the true gap is ~3,801 but the
+        # old subtraction reported 6,316,457.12 — roughly double the
+        # company amount).
         net_difference = None
         if effective_company_closing is not None and effective_vendor_closing is not None:
-            net_difference = effective_company_closing - effective_vendor_closing
+            net_difference = effective_company_closing + effective_vendor_closing
 
         # Persist balance/category updates via the ledger repo's session
         await self._ledger_repo._session.flush()
@@ -2261,17 +2276,104 @@ class ReconciliationEngineService:
     # Reference Similarity
     # ──────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _reference_similarity(ref1: str, ref2: str) -> float:
+    # Matches a 2-digit year followed by an optional single separator
+    # (hyphen, slash, or space) followed by the next 2-digit year, e.g.
+    # "25-26", "25/26", "25 26", or the CLEAN-derived digit-only "2526".
+    # Built with a lookahead so overlapping candidate positions are all
+    # considered (finditer alone would skip past a match and miss a
+    # fiscal-year token that starts partway through another digit run,
+    # e.g. the "2526" inside "1142526").
+    _FISCAL_YEAR_PATTERN = re.compile(r"(?=(\d{2})([-/\s]?)(\d{2}))")
+
+    @classmethod
+    def _find_fiscal_year_spans(cls, value: str) -> list[tuple[str, int, int]]:
         """
-        Calculate string similarity between two reference numbers
-        using difflib.SequenceMatcher.
+        Find substrings that look like a fiscal-year token (two consecutive
+        2-digit years, the second being the first + 1, wrapping at year
+        100 — e.g. "25-26", "2526", "99-00"), across BOTH the raw
+        Assignment-style format ("114/25-26") and the CLEAN-derived
+        digit-only format ("1142526"). Returns (normalized_token, start,
+        end) tuples so the exact matched span (including any separator)
+        can be stripped from the original string.
+        """
+        spans: list[tuple[str, int, int]] = []
+        for m in cls._FISCAL_YEAR_PATTERN.finditer(value):
+            a, b = int(m.group(1)), int(m.group(3))
+            if b == (a + 1) % 100:
+                start = m.start()
+                end = start + 2 + len(m.group(2)) + 2
+                spans.append((m.group(1) + m.group(3), start, end))
+        return spans
+
+    @classmethod
+    def _strip_shared_fiscal_year(cls, ref1: str, ref2: str) -> tuple[str, str]:
+        """
+        Remove a fiscal-year token (e.g. "25-26" / "2526") from BOTH
+        references when the SAME year token appears in both — but only
+        then, so genuinely different fiscal years are never altered. This
+        isolates the actual distinguishing invoice digits before
+        similarity scoring.
+
+        Bug fix (client-reported, real data confirmed — vendor AUTOPACK
+        INDUSTRIES): invoice numbers routinely embed the fiscal year
+        alongside the real invoice digits, and NOT always in the fully
+        CLEAN-derived digit-only form — real data showed company
+        Assignment "114/25-26" (slash + hyphen still present) paired
+        against vendor Vch No. "25-26 447" (space-separated). Because the
+        shared "25-26"/"2526" token dominates difflib.SequenceMatcher's
+        ratio on these short strings, TWO COMPLETELY DIFFERENT invoices
+        (114 vs 447) scored ~0.56 — the SAME ballpark as the correct pair
+        (114 vs 114) — clearing the 0.5 threshold in `_tds_gst_match`
+        regardless of which invoice number was actually attached.
+        Stripping the shared token first (independent of which separator,
+        if any, surrounds it) makes the comparison key off the real
+        invoice digits instead of the noise.
+
+        An earlier version of this fix only matched the fully-cleaned
+        4-consecutive-digit form ("2526") and silently no-opped on the raw
+        separator-containing form ("25-26") actually present in production
+        data — this version matches both.
+        """
+        spans1 = cls._find_fiscal_year_spans(ref1)
+        spans2 = cls._find_fiscal_year_spans(ref2)
+        if not spans1 or not spans2:
+            return ref1, ref2
+        tokens1 = {t for t, _, _ in spans1}
+        tokens2 = {t for t, _, _ in spans2}
+        shared = tokens1 & tokens2
+        if not shared:
+            return ref1, ref2
+
+        def _remove_first_shared(value: str, spans: list[tuple[str, int, int]]) -> str:
+            for token, start, end in spans:
+                if token in shared:
+                    return value[:start] + value[end:]
+            return value
+
+        r1 = _remove_first_shared(ref1, spans1)
+        r2 = _remove_first_shared(ref2, spans2)
+        return r1.strip(), r2.strip()
+
+    @classmethod
+    def _reference_similarity(cls, ref1: str, ref2: str) -> float:
+        """
+        Calculate string similarity between two reference numbers using
+        difflib.SequenceMatcher, after stripping a shared fiscal-year token
+        (see _strip_shared_fiscal_year) so a common "25-26"-style suffix
+        can't inflate the score for two otherwise-unrelated invoice numbers.
 
         Returns a float between 0.0 and 1.0.
         """
         if not ref1 or not ref2:
             return 0.0
-        return difflib.SequenceMatcher(None, ref1, ref2).ratio()
+        r1, r2 = cls._strip_shared_fiscal_year(ref1, ref2)
+        if not r1 or not r2:
+            # Stripping the fiscal year left one side empty (it was PURELY
+            # the fiscal-year token, e.g. two "2526"-only references) —
+            # fall back to the un-stripped comparison rather than treating
+            # this as a hard 0.0.
+            return difflib.SequenceMatcher(None, ref1, ref2).ratio()
+        return difflib.SequenceMatcher(None, r1, r2).ratio()
 
     # ──────────────────────────────────────────────────────────────────────
     # Statistics Calculation

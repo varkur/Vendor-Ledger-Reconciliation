@@ -765,6 +765,92 @@ class TestReferenceSimilarity:
         score = service._reference_similarity("ABC", "XYZ")
         assert score < 0.5
 
+    def test_shared_fiscal_year_suffix_does_not_inflate_similarity(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Client-reported bug (real data, vendor AUTOPACK INDUSTRIES). The
+        engine's ACTUAL invoice_number for these entries keeps the raw
+        separators — company Assignment "114/25-26" and vendor Vch No.
+        "25-26 447" — NOT the fully CLEAN-derived digit-only form. Before
+        the fix, difflib scored this at ~0.56 — ABOVE the 0.5 threshold in
+        _tds_gst_match — purely because of the shared "25-26" fiscal-year
+        token, even though 114 and 447 are completely different invoices.
+        The CORRECT pair (114 <-> 114) scored in the same ballpark, so the
+        old threshold provided zero real discrimination for this data shape.
+
+        (A first attempt at this fix only matched the fully-cleaned
+        digit-only "2526" form and silently no-opped on this real
+        separator-containing data — this test uses the ACTUAL raw format
+        to guard against that regression.)
+        """
+        wrong_pair_score = service._reference_similarity("114/25-26", "25-26 447")
+        correct_pair_score = service._reference_similarity("114/25-26", "25-26 114")
+
+        assert wrong_pair_score < 0.5, (
+            f"Different invoices (114 vs 447) scored {wrong_pair_score}, "
+            "which would still falsely clear the 0.5 TDS/GST match threshold."
+        )
+        assert correct_pair_score > wrong_pair_score, (
+            "The correct pair (same invoice number) must score meaningfully "
+            "higher than the wrong pair — the fiscal-year token must not "
+            "make them indistinguishable."
+        )
+
+    def test_shared_fiscal_year_suffix_second_real_case(
+        self, service: ReconciliationEngineService
+    ):
+        """Second real cross-matched pair found in the same client data:
+        invoice 677 vs invoice 748, both carrying the "25-26" fiscal-year
+        token, in the real raw (separator-containing) format."""
+        wrong_pair_score = service._reference_similarity("677/25-26", "25-26 748")
+        correct_pair_score = service._reference_similarity("677/25-26", "25-26 677")
+
+        assert wrong_pair_score < 0.5
+        assert correct_pair_score > wrong_pair_score
+
+    def test_shared_fiscal_year_suffix_cleaned_digit_only_form(
+        self, service: ReconciliationEngineService
+    ):
+        """The fully CLEAN-derived digit-only form (no separators at all)
+        must also be handled — this is what a stricter upstream cleaning
+        pass could produce, even though real production data observed for
+        this bug retained the raw separators."""
+        wrong_pair_score = service._reference_similarity("1142526", "2526 447")
+        correct_pair_score = service._reference_similarity("1142526", "2526 114")
+
+        assert wrong_pair_score < 0.5
+        assert correct_pair_score > wrong_pair_score
+
+    def test_different_fiscal_years_are_not_stripped(
+        self, service: ReconciliationEngineService
+    ):
+        """A fiscal-year token must only be stripped when BOTH sides share
+        the exact same one — two different years are a genuine difference
+        and must still count toward (or against) the similarity score."""
+        # "24-25" vs "25-26" are different fiscal years — neither should be
+        # stripped, since they don't match each other.
+        score_same_invoice_diff_year = service._reference_similarity("114/24-25", "114/25-26")
+        score_diff_invoice_diff_year = service._reference_similarity("114/24-25", "447/25-26")
+        assert score_same_invoice_diff_year > score_diff_invoice_diff_year
+
+    def test_identical_references_still_score_1_after_fix(
+        self, service: ReconciliationEngineService
+    ):
+        """Sanity check: the fiscal-year stripping must not break the
+        simple identical-reference case."""
+        assert service._reference_similarity("REF-001", "REF-001") == 1.0
+
+    def test_reference_that_is_purely_a_fiscal_year_token_falls_back_safely(
+        self, service: ReconciliationEngineService
+    ):
+        """Edge case: if a reference is NOTHING but the shared fiscal-year
+        token, stripping it would leave an empty string — must fall back to
+        the un-stripped comparison instead of crashing or returning a
+        nonsensical score."""
+        score = service._reference_similarity("2526", "2526")
+        assert score == 1.0
+
 
 # ─── Full Execution Tests ─────────────────────────────────────────────────────
 
@@ -1950,6 +2036,70 @@ def _cat_entry(
     )
 
 
+class TestNetDifferenceSignConvention:
+    """
+    Client-reported bug: "Difference Amount" on the Track Reconciliation
+    summary showed almost exactly 2x the Company Amount for a case that
+    otherwise looked correctly matched. Root cause: `_compute_summary_fields`
+    computed net_difference as `company_closing - vendor_closing`, but
+    vendor-side closing balances are stored with the OPPOSITE sign
+    convention from the company side for the same underlying balance (the
+    Particulars statement / Excel export already computes this correctly
+    as `company_closing + party_closing`, with an explicit comment: "Party
+    amounts are stored with the opposite sign, so the difference is the
+    SUM of the two sides"). Subtracting instead of adding DOUBLED the
+    reported gap whenever the two ledgers actually agreed closely.
+
+    Real data confirmed: company_closing=3,156,328, vendor_closing=
+    -3,160,129.12 -> old (subtract) = 6,316,457.12 (~2x company amount,
+    reported bug); new (add) = -3,801.12 (the true, small residual gap).
+    """
+
+    async def test_net_difference_is_sum_not_subtraction(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+        mock_case_repo: AsyncMock,
+    ):
+        company_entries = [
+            _cat_entry("3156328", "Closing Balance", date(2026, 3, 31), document_type="CL"),
+        ]
+        vendor_entries = [
+            _cat_entry("-3160129.12", "Closing Balance", date(2026, 3, 31), document_type="Closing"),
+        ]
+        mock_ledger_repo._session = AsyncMock()
+
+        await service._compute_summary_fields(uuid4(), company_entries, vendor_entries)
+
+        assert mock_case_repo.update.await_count == 1
+        _, update_data = mock_case_repo.update.await_args.args
+        assert update_data["net_difference"] == Decimal("3156328") + Decimal("-3160129.12")
+        # Sanity: must NOT be the (much larger, wrong) subtraction result.
+        assert update_data["net_difference"] != Decimal("3156328") - Decimal("-3160129.12")
+
+    async def test_net_difference_matches_particulars_statement_convention(
+        self,
+        service: ReconciliationEngineService,
+        mock_ledger_repo: AsyncMock,
+        mock_case_repo: AsyncMock,
+    ):
+        """When both sides genuinely agree (opposite-signed, same
+        magnitude), the sum must net to ~zero — the whole point of the
+        sign convention."""
+        company_entries = [
+            _cat_entry("100000", "Closing Balance", date(2026, 3, 31), document_type="CL"),
+        ]
+        vendor_entries = [
+            _cat_entry("-100000", "Closing Balance", date(2026, 3, 31), document_type="Closing"),
+        ]
+        mock_ledger_repo._session = AsyncMock()
+
+        await service._compute_summary_fields(uuid4(), company_entries, vendor_entries)
+
+        _, update_data = mock_case_repo.update.await_args.args
+        assert update_data["net_difference"] == Decimal("0")
+
+
 class TestCategoryGating:
     """
     Cross-side matching must respect the Vendor Ledger Mapping Rules doc:
@@ -2042,6 +2192,47 @@ class TestCategoryGating:
         vendor = [_cat_entry("90000", "Knocking Off", date(2024, 3, 15), "INV-1")]
         pairs = service._tds_gst_match(company, vendor, Decimal("10"), Decimal("0"))
         assert len(pairs) == 0
+
+    def test_tds_gst_match_does_not_cross_match_different_invoices_sharing_fiscal_year(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        End-to-end reproduction of the client-reported bug (real data,
+        vendor AUTOPACK INDUSTRIES): two DIFFERENT invoices (114 and 447),
+        both from FY 25-26, with a TDS-sized amount gap between company
+        invoice 114 and vendor invoice 447. Invoice numbers use the REAL
+        raw format actually produced by the engine (separators retained:
+        "114/25-26" / "25-26 447"), not a fully-cleaned digit-only form —
+        an earlier fix attempt only handled the cleaned form and this
+        exact scenario still cross-matched with real data. Before the
+        fix, the shared "25-26" fiscal-year token alone pushed similarity
+        to ~0.56 (above the 0.5 threshold), so _tds_gst_match wrongly
+        paired them.
+
+        Amounts mirror the real case: company -616226 (invoice 114),
+        vendor 685185 (invoice 447) — gap 68959 = ~10.06% of 685185, inside
+        a 10% TDS band with 1% tolerance.
+        """
+        company = [_cat_entry("-616226", "Invoice", date(2025, 5, 31), "114/25-26")]
+        vendor = [_cat_entry("685185", "Invoice", date(2025, 5, 31), "25-26 447")]
+        pairs = service._tds_gst_match(company, vendor, Decimal("10"), Decimal("0"))
+        assert len(pairs) == 0, (
+            "Company invoice 114 must NOT match vendor invoice 447 just "
+            "because they share the FY 25-26 token."
+        )
+
+    def test_tds_gst_match_still_fires_for_the_correct_invoice_pair(
+        self, service: ReconciliationEngineService
+    ):
+        """Same real-data scenario, but the ACTUAL matching pair (both
+        invoice 114, with a genuine ~10% TDS gap between them) — must
+        still match after the fiscal-year-stripping fix."""
+        company = [_cat_entry("-100000", "Invoice", date(2025, 5, 31), "114/25-26")]
+        vendor = [_cat_entry("90000", "Invoice", date(2025, 5, 31), "25-26 114")]
+        pairs = service._tds_gst_match(company, vendor, Decimal("10"), Decimal("0"))
+        assert len(pairs) == 1
+        assert pairs[0].company_entry_id == company[0].id
+        assert pairs[0].vendor_entry_id == vendor[0].id
 
     def test_exact_match_gates_on_category(
         self, service: ReconciliationEngineService

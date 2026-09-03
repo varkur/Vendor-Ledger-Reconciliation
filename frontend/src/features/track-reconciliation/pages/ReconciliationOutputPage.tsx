@@ -48,6 +48,8 @@ interface ParticularsChild {
   side: string;
   document_category: string;
   view_key: string;
+  is_matched_residual?: boolean;
+  matched_status?: string;
 }
 interface ParticularsGroup {
   label: string;
@@ -55,6 +57,7 @@ interface ParticularsGroup {
   no_of_entries: number;
   children: ParticularsChild[];
   view_key: string;
+  is_matched_residual?: boolean;
 }
 interface ParticularsResponse {
   closing_balance_company: number | null;
@@ -77,6 +80,35 @@ interface ParticularsFlatRow {
   isKnocking: boolean;
   isManuallyMapped: boolean;
   statusReason?: string;
+  /**
+   * Particulars-statement difference group label (e.g. "Invoice
+   * Difference", "Other Differences") carried on both group and child
+   * rows via the backend's view_key. Passed through as the `group` query
+   * param so each group/child's "View" drill-in shows only its own
+   * entries instead of the full unmatched list.
+   */
+  groupFilter?: string;
+  /**
+   * True when this row aggregates MATCHED (not unmatched) residual entries
+   * — TDS deducted, rounding write-off, unexplained gap, amount mismatch.
+   * Routes "View" to the Matched/Recommended tab instead of unmatched.
+   */
+  isMatchedResidual: boolean;
+  /** Computed Status/Classification value to filter the Matched/Recommended drill-in by. */
+  matchedStatus?: string;
+  /**
+   * True ONLY on a group-header row whose children are a MIX of matched
+   * residuals and genuinely unmatched entries (e.g. "TDS / TCS Difference"
+   * = some TDS entries were matched with a residual, others are still
+   * unmatched on one side). Bug fix: there is no single destination page
+   * that shows both matched and unmatched entries together, so a mixed
+   * group's "View" previously routed to the unmatched-only view and
+   * silently dropped every matched entry from the drill-in (count showed
+   * 34, but "View" only ever showed the 2 unmatched ones). For a mixed
+   * group, clicking "View" now expands the row instead of navigating,
+   * since each CHILD row underneath already routes correctly on its own.
+   */
+  isMixedGroup?: boolean;
 }
 
 /** Map an analytics row to its dedicated view slug. */
@@ -93,10 +125,21 @@ function particularsViewSlug(r: ParticularsFlatRow): string {
   if (r.isManuallyMapped) return 'manually-mapped';
   if (r.isKnocking) return 'knocking';
   if (r.isClosingBalance) return 'differences';
-  // Company-side lines live in the Unmatched-Company view; party lines in Vendor.
+  // Matched-pair residuals (TDS deducted, rounding write-off, unexplained
+  // gap, amount mismatch) live on the Matched/Recommended tabs, not the
+  // unmatched views — "Amount Mismatch" rows are still pending Finance
+  // confirmation (Recommended); everything else is an auto-accepted match
+  // with a residual note (Matched).
+  if (r.isMatchedResidual) {
+    return r.matchedStatus === 'Amount Mismatch' ? 'recommended' : 'matched';
+  }
+  // Company-side lines live in the Unmatched-Company view; party lines in
+  // Vendor. Group-header rows (no single side — they roll up BOTH sides,
+  // e.g. "Invoice Difference" = invoices missing from either ledger) go to
+  // the combined Unmatched-All view instead, filtered by group.
   if (r.side === 'company') return 'unmatched-company';
   if (r.side === 'vendor') return 'unmatched-vendor';
-  return 'unmatched-company';
+  return 'unmatched';
 }
 
 function fmtAmount(n: number | null | undefined): string {
@@ -156,6 +199,24 @@ export const ReconciliationOutputPage = () => {
     const groupIsClosing = g.view_key === 'closing_balance' || /closing balance/i.test(g.label);
     const groupIsKnocking = g.view_key === 'knocking' || /knocking/i.test(g.label);
     const groupIsManuallyMapped = g.view_key === 'manually_mapped' || /manually mapped/i.test(g.label);
+    // Group-level view_key now carries the actual Particulars group label
+    // (e.g. "Invoice Difference") rather than a generic "unmatched"
+    // placeholder — passed through so this group's View only shows its own
+    // entries. Closing-balance/knocking/manually-mapped groups keep their
+    // dedicated views and don't need this filter.
+    const groupFilter = !groupIsClosing && !groupIsKnocking && !groupIsManuallyMapped && !g.is_matched_residual
+      ? g.view_key || undefined
+      : undefined;
+    // A group is "mixed" when it has BOTH matched-residual children and
+    // genuinely unmatched children (e.g. TDS / TCS Difference: some TDS
+    // entries matched with a residual, others still sit unmatched). Only
+    // meaningful for the generic difference groups — closing
+    // balance/knocking/manually-mapped groups always have a single
+    // consistent destination already.
+    const hasMatchedChild = (g.children ?? []).some((c) => c.is_matched_residual);
+    const hasUnmatchedChild = (g.children ?? []).some((c) => !c.is_matched_residual);
+    const isMixedGroup = !groupIsClosing && !groupIsKnocking && !groupIsManuallyMapped
+      && hasMatchedChild && hasUnmatchedChild;
     particularsRows.push({
       key: `g-${gi}`,
       label: g.label,
@@ -168,6 +229,9 @@ export const ReconciliationOutputPage = () => {
       isClosingBalance: groupIsClosing,
       isKnocking: groupIsKnocking,
       isManuallyMapped: groupIsManuallyMapped,
+      groupFilter,
+      isMatchedResidual: !!g.is_matched_residual,
+      isMixedGroup,
     });
     if (expandedGroups.has(gi)) {
       g.children.forEach((c, ci) => {
@@ -184,6 +248,12 @@ export const ReconciliationOutputPage = () => {
           isKnocking: groupIsKnocking,
           isManuallyMapped: groupIsManuallyMapped,
           statusReason: groupIsManuallyMapped ? c.label : undefined,
+          isMatchedResidual: !!c.is_matched_residual,
+          matchedStatus: c.matched_status || undefined,
+          // Only relevant for unmatched children — a matched-residual
+          // child routes via matchedStatus/computed_status instead, so
+          // don't carry an unused `group` param into that URL.
+          groupFilter: c.is_matched_residual ? undefined : groupFilter,
         });
       });
     }
@@ -201,6 +271,7 @@ export const ReconciliationOutputPage = () => {
       isManuallyMapped: false,
       groupIndex: null,
       hasChildren: false,
+      isMatchedResidual: false,
     });
   }
 
@@ -478,13 +549,28 @@ export const ReconciliationOutputPage = () => {
                       <span
                         className="link-view"
                         style={{ color: 'var(--color-primary)', cursor: 'pointer', fontWeight: 600 }}
+                        title={r.isMixedGroup ? 'This group has both matched and unmatched entries — expand to view each separately' : undefined}
                         onClick={() => {
+                          // A mixed group (part matched-residual, part
+                          // genuinely unmatched) has no single destination
+                          // page that shows both — expand it instead so the
+                          // user can View each child row separately, rather
+                          // than silently landing on the unmatched-only view
+                          // and losing every matched entry from the count.
+                          if (r.isMixedGroup && r.groupIndex !== null) {
+                            toggleGroup(r.groupIndex);
+                            return;
+                          }
                           const slug = particularsViewSlug(r);
-                          const qs = r.statusReason ? `?status_reason=${encodeURIComponent(r.statusReason)}` : '';
+                          const qp = new URLSearchParams();
+                          if (r.statusReason) qp.set('status_reason', r.statusReason);
+                          if (r.groupFilter) qp.set('group', r.groupFilter);
+                          if (r.isMatchedResidual && r.matchedStatus) qp.set('computed_status', r.matchedStatus);
+                          const qs = qp.toString() ? `?${qp.toString()}` : '';
                           navigate(`/track-reconciliation/${requestId}/case/${caseId}/view/${slug}${qs}`);
                         }}
                       >
-                        View
+                        {r.isMixedGroup ? 'View breakdown' : 'View'}
                       </span>
                     )
                   }

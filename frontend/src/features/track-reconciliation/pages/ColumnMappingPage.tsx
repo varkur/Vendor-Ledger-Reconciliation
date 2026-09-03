@@ -262,6 +262,14 @@ export const ColumnMappingPage = () => {
       queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
       queryClient.invalidateQueries({ queryKey: ['ledger-entries', caseId, side] });
       queryClient.invalidateQueries({ queryKey: ['ledger-present', caseId, side] });
+      // Bug fix: deleting a ledger clears its saved column mapping
+      // server-side (see delete_ledger in column_mapping_controller.py),
+      // but the ['column-mapping', ...] query was never invalidated here —
+      // reopening Map Columns afterward could replay a stale cached
+      // mapping from before the delete instead of the fresh (now-empty)
+      // state.
+      queryClient.invalidateQueries({ queryKey: ['column-mapping', caseId, side] });
+      queryClient.invalidateQueries({ queryKey: ['column-mapping-headers', caseId, side] });
     } catch (error: any) {
       const detail = error.response?.data?.detail || 'Delete failed.';
       toast.current?.show({ severity: 'error', summary: 'Delete Failed', detail, life: 6000 });
@@ -288,6 +296,13 @@ export const ColumnMappingPage = () => {
       queryClient.invalidateQueries({ queryKey: ['case-detail', caseId] });
       queryClient.invalidateQueries({ queryKey: ['ledger-entries', caseId, side] });
       queryClient.invalidateQueries({ queryKey: ['ledger-present', caseId, side] });
+      // Bug fix: a reupload clears the PREVIOUS mapping server-side (see
+      // reupload_ledger), so the cached ['column-mapping', ...] query must
+      // be invalidated too — otherwise the Map Columns popup opened right
+      // below can show the old file's stale cached mapping/headers instead
+      // of fresh auto-detection against the new file.
+      queryClient.invalidateQueries({ queryKey: ['column-mapping', caseId, side] });
+      queryClient.invalidateQueries({ queryKey: ['column-mapping-headers', caseId, side] });
       // Open the column-mapping form in a popup for the side just uploaded,
       // so the user maps + saves columns immediately without leaving this page.
       setMappingSide(side);

@@ -42,6 +42,14 @@ interface MatchedItemsTabProps {
    * group-level "View" on the "Manually Mapped" Particulars row.
    */
   manualOnly?: boolean;
+  /**
+   * Pre-applied, non-editable filter to a single computed Status/
+   * Classification value (e.g. "TDS Booked by Company", "Write off /
+   * Rounding off") — from the Particulars statement's matched-residual
+   * drill-in. When set, the search bar and match-type dropdown are hidden
+   * since the view is already scoped to one residual reason.
+   */
+  computedStatusFilter?: string;
 }
 
 const MATCH_TYPE_OPTIONS = [
@@ -87,7 +95,7 @@ function getConfidenceSeverity(score: number): 'success' | 'warning' | 'danger' 
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, manualOnly = false }: MatchedItemsTabProps) => {
+export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, manualOnly = false, computedStatusFilter }: MatchedItemsTabProps) => {
   const [params, setParams] = useState<ListParams>({
     page: 1,
     page_size: 10,
@@ -118,13 +126,14 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
     setParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
   }, [debouncedSearch]);
 
-  const isReasonScoped = !!statusReasonFilter || manualOnly;
+  const isReasonScoped = !!statusReasonFilter || manualOnly || !!computedStatusFilter;
   const { data, isLoading, isFetching, error, refetch } = useMatchedItems(caseId, {
     ...params,
     search: isReasonScoped ? undefined : (debouncedSearch || undefined),
     match_type: isReasonScoped ? undefined : ((matchTypeFilter as MatchType) || undefined),
     status_reason: statusReasonFilter || undefined,
     manual_only: manualOnly || undefined,
+    computed_status_filter: computedStatusFilter || undefined,
   });
 
   // ─── Event Handlers ──────────────────────────────────────────────────────────
@@ -203,7 +212,16 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
       {/* Filter Bar */}
       {isReasonScoped ? (
         <div className="mb-3">
-          <Tag value={statusReasonFilter ? `Reason: ${statusReasonFilter}` : 'All Manually Mapped Entries'} severity="info" />
+          <Tag
+            value={
+              computedStatusFilter
+                ? `Status: ${computedStatusFilter}`
+                : statusReasonFilter
+                ? `Reason: ${statusReasonFilter}`
+                : 'All Manually Mapped Entries'
+            }
+            severity="info"
+          />
         </div>
       ) : (
         <div className="flex align-items-center gap-3 mb-3">

@@ -18,7 +18,7 @@ import { InputText } from 'primereact/inputtext';
 import { RadioButton } from 'primereact/radiobutton';
 import { Toast } from 'primereact/toast';
 import { ProgressSpinner } from 'primereact/progressspinner';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
 import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 
@@ -51,6 +51,7 @@ export interface MappingFormContentProps {
 export const MappingFormContent = ({ caseId, side, onSubmitted, submitLabel, onCancel }: MappingFormContentProps) => {
   const toast = useRef<Toast>(null);
   const { companyCode } = useSelectedEntity();
+  const queryClient = useQueryClient();
   const [isSaving, setIsSaving] = useState(false);
 
   // Column mapping state
@@ -250,6 +251,20 @@ export const MappingFormContent = ({ caseId, side, onSubmitted, submitLabel, onC
       await apiClient.post(`/vlr/column-mapping/${caseId}/apply`, {
         side,
       }, { params: { company_code: companyCode } });
+
+      // Bug fix: this save/apply flow uses raw axios calls, not a React
+      // Query mutation, so the ['column-mapping', caseId, side] query
+      // (fetched above via useQuery, e.g. on first open when no mapping
+      // existed yet and the response was `mappings: null`) never learns
+      // the data changed. With the app-wide 5-minute staleTime, reopening
+      // the Map Columns dialog afterward silently replayed that stale
+      // (often empty) cached response instead of hitting the network —
+      // "recheck mapping looks empty" even though the save succeeded and
+      // the backend has the correct data. Invalidate both this query and
+      // the headers query (doc-type summary can shift after a reupload)
+      // so reopening always refetches the just-saved mapping.
+      queryClient.invalidateQueries({ queryKey: ['column-mapping', caseId, side] });
+      queryClient.invalidateQueries({ queryKey: ['column-mapping-headers', caseId, side] });
 
       toast.current?.show({
         severity: 'success',

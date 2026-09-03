@@ -367,6 +367,21 @@ class ParticularsChild(BaseModel):
     side: str = Field("", description="Which side the entries belong to (company/vendor)")
     document_category: str = Field("", description="Document category filter for drill-in")
     view_key: str = Field("", description="Drill-in identifier for the 'View' action")
+    # A matched PAIR can still carry a genuine residual (TDS deducted, a
+    # rounding write-off, an unexplained gap, or a same-invoice amount
+    # mismatch) — these rows come from _build_recon_rows/
+    # matched_residual_bucket rather than the plain unmatched bucket, and
+    # their entries live in the Matched/Recommended tabs, not the
+    # unmatched-company/unmatched-vendor tabs. is_matched_residual tells the
+    # frontend to route the "View" action there instead, using
+    # matched_status (the row's computed Status, e.g. "TDS Booked by
+    # Company") or, for Amount Mismatch, the row's Classification.
+    is_matched_residual: bool = Field(
+        False, description="True when this line aggregates matched (not unmatched) residual entries"
+    )
+    matched_status: str = Field(
+        "", description="Computed Status/Classification value to filter the Matched/Recommended drill-in by"
+    )
 
 
 class ParticularsGroup(BaseModel):
@@ -377,6 +392,12 @@ class ParticularsGroup(BaseModel):
     no_of_entries: int = Field(0, description="Total entries across all children")
     children: list[ParticularsChild] = Field(default_factory=list)
     view_key: str = Field("", description="Drill-in identifier for the 'View' action")
+    # True when EVERY child in this group is a matched-pair residual (no
+    # unmatched component at all) — lets the frontend route the group-level
+    # "View" to the Matched tab (unfiltered) instead of the unmatched view.
+    is_matched_residual: bool = Field(
+        False, description="True when this entire group is composed of matched residual entries"
+    )
 
 
 class ParticularsSummaryResponse(BaseModel):

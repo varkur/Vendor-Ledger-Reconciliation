@@ -43,6 +43,7 @@ htmlcov/
 .pytest_cache/
 deploy/
 enterprise-architecture/
+docs/
 # Build
 *.egg
 *.whl

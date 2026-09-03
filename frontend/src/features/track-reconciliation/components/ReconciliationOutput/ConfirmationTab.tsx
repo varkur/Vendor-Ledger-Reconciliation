@@ -24,13 +24,20 @@ import type { ConfirmAction, ConfirmationItem, ListParams } from './reconciliati
 
 interface ConfirmationTabProps {
   caseId: string;
+  /**
+   * Pre-applied, non-editable filter to a single computed Status/
+   * Classification value (currently only "Amount Mismatch" lands here) —
+   * from the Particulars statement's matched-residual drill-in. When set,
+   * the search bar is hidden since the view is already scoped.
+   */
+  computedStatusFilter?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
+export const ConfirmationTab = ({ caseId, computedStatusFilter }: ConfirmationTabProps) => {
   const [params, setParams] = useState<ListParams>({
     page: 1,
     page_size: 10,
@@ -48,7 +55,8 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
 
   const { data, isLoading, isFetching, error, refetch } = useConfirmationItems(caseId, {
     ...params,
-    search: debouncedSearch || undefined,
+    search: computedStatusFilter ? undefined : (debouncedSearch || undefined),
+    computed_status_filter: computedStatusFilter || undefined,
   });
 
   const confirmMutation = useConfirmMatch(caseId);
@@ -179,19 +187,25 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
         />
       )}
 
-      {/* Search Bar */}
-      <div className="flex align-items-center gap-3 mb-3">
-        <div className="em-search-bar">
-          <InputText
-            placeholder="Search by reference..."
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            style={{ border: 'none', boxShadow: 'none', width: 200 }}
-            aria-label="Search confirmation items"
-          />
-          <i className={isFetching ? 'pi pi-spin pi-spinner' : 'pi pi-search'} />
+      {/* Search Bar / Computed Status Filter Indicator */}
+      {computedStatusFilter ? (
+        <div className="mb-3">
+          <Tag value={`Status: ${computedStatusFilter}`} severity="info" />
         </div>
-      </div>
+      ) : (
+        <div className="flex align-items-center gap-3 mb-3">
+          <div className="em-search-bar">
+            <InputText
+              placeholder="Search by reference..."
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ border: 'none', boxShadow: 'none', width: 200 }}
+              aria-label="Search confirmation items"
+            />
+            <i className={isFetching ? 'pi pi-spin pi-spinner' : 'pi pi-search'} />
+          </div>
+        </div>
+      )}
 
       {!data || data.items.length === 0 ? (
         <div className="p-4 text-center">
@@ -214,6 +228,16 @@ export const ConfirmationTab = ({ caseId }: ConfirmationTabProps) => {
           emptyMessage="No confirmation items found."
           aria-label="Finance confirmation items table"
         >
+          {/* Bug fix: this column (and the buttons behind it) already
+              existed in `actionsTemplate` but was never added to the
+              table, so recommended matches had no way to be de-linked
+              before sending the reconciliation to the vendor. */}
+          <Column
+            header="Action"
+            frozen
+            style={{ width: '11rem', minWidth: '11rem', textAlign: 'center' }}
+            body={actionsTemplate}
+          />
           <Column field="company_reference" header="Company Ref" sortable style={{ width: '12%' }} />
           <Column field="vendor_reference" header="Vendor Ref" sortable style={{ width: '12%' }} />
           <Column field="company_amount" header="Company Amt" sortable style={{ width: '11%', textAlign: 'right' }} />

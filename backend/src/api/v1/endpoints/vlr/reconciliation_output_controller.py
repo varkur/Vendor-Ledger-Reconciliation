@@ -163,6 +163,123 @@ def _genuine_unmatched_conditions(case_id: UUID, side: str) -> list:
     return conds
 
 
+def _particulars_group_for_entry(entry) -> str | None:
+    """
+    Classify one unmatched ledger entry into its Particulars-statement
+    difference group label (e.g. "Invoice Difference", "Other Differences"),
+    mirroring the exact bucketing logic used by
+    get_reconciliation_particulars's local `_bucket()` closure. Returns None
+    for entries that endpoint excludes entirely (balance rows, reversals).
+
+    Used to filter the unmatched-company/unmatched-vendor "View" drill-in so
+    each Particulars group's View link shows only ITS OWN entries instead of
+    the full unmatched list — bug fix: previously every group's View button
+    routed to the same unfiltered unmatched-company view, so every group
+    "tab" displayed identical invoices.
+    """
+    from src.domain.services.vlr.reconciliation_export_service import (
+        CATEGORY_TO_SUMMARY,
+        DEFAULT_SUMMARY,
+        _special_classification,
+    )
+
+    cat = (getattr(entry, "document_category", "") or "").strip()
+    if cat in ("Opening Balance", "Closing Balance"):
+        return None
+    special = _special_classification(entry)
+    if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
+        return None
+    # Bug fix: this was missing the same TDS special-case override that
+    # get_reconciliation_particulars's own _bucket() closure applies — an
+    # unmatched TDS entry (detected via _special_classification, NOT its raw
+    # document_category) rolls up under the dedicated "TDS / TCS Difference"
+    # group there. Without this override here, the SAME entry computed a
+    # DIFFERENT group (whatever its raw document_category maps to via
+    # CATEGORY_TO_SUMMARY/DEFAULT_SUMMARY), so it silently failed the
+    # group_filter match and never showed up when a user clicked "View" on
+    # TDS / TCS Difference — the statement's count included it, but the
+    # drill-in returned zero results for that entry.
+    if special == "TDS Booked by Party":
+        info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
+    else:
+        info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
+    return info["group"]
+
+
+async def _load_tax_config(case, session: AsyncSession) -> tuple[float, float, float]:
+    """
+    Load (tds_percentage_max, tds_percentage_min, gst_percentage) from the
+    case's parent request. Needed to compute the same Status/Classification
+    labels ("TDS Booked by Company", "Write off / Rounding off",
+    "Unexplained Amount Gap") that the Excel export and the Particulars
+    statement use, so drill-in filters agree with what's shown.
+    """
+    if not getattr(case, "request_id", None):
+        return 0.0, 0.0, 0.0
+    from src.infrastructure.database.models.vlr.reconciliation_request_model import (
+        ReconciliationRequestModel,
+    )
+    pres = await session.execute(
+        select(ReconciliationRequestModel).where(
+            ReconciliationRequestModel.id == str(case.request_id)
+        )
+    )
+    parent = pres.scalar_one_or_none()
+    if parent is None:
+        return 0.0, 0.0, 0.0
+    return (
+        float(getattr(parent, "tds_percentage", 0) or 0),
+        float(getattr(parent, "tds_percentage_min", 0) or 0),
+        float(getattr(parent, "gst_percentage", 0) or 0),
+    )
+
+
+async def _filter_matches_by_computed_status(
+    matches: list["MatchResultModel"],
+    computed_status_filter: str,
+    tds_max: float,
+    tds_min: float,
+    gst_pct: float,
+    session: AsyncSession,
+) -> list["MatchResultModel"]:
+    """
+    Filter matches to those whose computed row-level Status OR Classification
+    equals `computed_status_filter` (e.g. "TDS Booked by Company", "Write
+    off / Rounding off", "Unexplained Amount Gap", "Amount Mismatch").
+
+    Bug fix: the Particulars/Differences statement only ever itemised
+    UNMATCHED entries — a matched PAIR that still carries a genuine residual
+    (TDS deducted, a rounding write-off, an unexplained gap, or a same-
+    invoice amount mismatch) never appeared in the statement at all, even
+    though the Excel export already surfaces these via
+    matched_residual_bucket. Client: "are the matched columns not a part of
+    these particulars and differences? we also need those". This helper
+    powers the "View" drill-in for those newly-surfaced matched-residual
+    rows, reusing the SAME _status()/_classification() functions the export
+    service and the statement's own totals are built from, so the drill-in
+    list always agrees with what the statement shows.
+    """
+    from src.domain.services.vlr.reconciliation_export_service import (
+        _classification,
+        _status,
+    )
+
+    filtered: list[MatchResultModel] = []
+    for m in matches:
+        ce = await _get_first_entry(m.company_entry_ids, session)
+        ve = await _get_first_entry(m.vendor_entry_ids, session)
+        diff = m.difference_amount
+        if diff is None:
+            c_amt = float(ce.amount) if ce and ce.amount is not None else 0.0
+            v_amt = float(ve.amount) if ve and ve.amount is not None else 0.0
+            diff = (c_amt + v_amt) if (ce and ve) else 0.0
+        computed_status = _status(m.pass_number, ce, ve, float(diff), tds_max, gst_pct, tds_min)
+        computed_classification = _classification(m.pass_number)
+        if computed_status == computed_status_filter or computed_classification == computed_status_filter:
+            filtered.append(m)
+    return filtered
+
+
 def _build_pagination(page: int, page_size: int, total: int) -> PaginationMeta:
     """Build pagination metadata."""
     return PaginationMeta(
@@ -201,6 +318,46 @@ async def _get_entry_reference(
     return ref, amount
 
 
+async def _filter_matches_by_search(
+    matches: list["MatchResultModel"],
+    search: str,
+    session: AsyncSession,
+) -> list["MatchResultModel"]:
+    """
+    Filter a list of MatchResultModel rows to only those whose linked
+    company or vendor ledger entry has a reference/invoice/document number
+    containing `search` (case-insensitive).
+
+    Bug fix: the "Search by reference..." box on the Matched Items and
+    Confirmation tabs sent a `search` query param that the backend never
+    declared or read at all — every keystroke round-tripped to the server
+    and came back completely unfiltered. The reference/invoice number for
+    a match lives on the LINKED LedgerEntryModel row(s) (via
+    company_entry_ids/vendor_entry_ids, a JSON array of entry IDs), not on
+    MatchResultModel itself, so this can't be a simple SQL WHERE on the
+    match table — each match's linked entries have to be loaded and
+    compared. Pagination/counting for a search request therefore filters
+    over the full (unpaginated) result set rather than a single SQL page.
+    """
+    term = search.strip().lower()
+    if not term:
+        return matches
+    filtered: list[MatchResultModel] = []
+    for m in matches:
+        ce = await _get_first_entry(m.company_entry_ids, session)
+        ve = await _get_first_entry(m.vendor_entry_ids, session)
+        haystacks = []
+        for e in (ce, ve):
+            if e is None:
+                continue
+            haystacks.append(invoice_number(e) or "")
+            haystacks.append(e.reference_number or "")
+            haystacks.append(e.document_number or "")
+        if any(term in h.lower() for h in haystacks if h):
+            filtered.append(m)
+    return filtered
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Tab 1: Matched Items
 # ──────────────────────────────────────────────────────────────────────
@@ -226,6 +383,18 @@ async def get_matched_items(
     manual_only: bool = Query(
         False, description="Filter to all manual links (pass 8), regardless of status_reason"
     ),
+    search: str | None = Query(
+        None, description="Search by company/vendor invoice or reference number"
+    ),
+    computed_status_filter: str | None = Query(
+        None,
+        description=(
+            "Filter to matches whose computed Status/Classification equals "
+            "this value, e.g. 'TDS Booked by Company', 'Write off / "
+            "Rounding off', 'Unexplained Amount Gap', 'Amount Mismatch' — "
+            "used by the Particulars statement's matched-residual drill-in"
+        ),
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> MatchedItemsResponse:
@@ -237,7 +406,7 @@ async def get_matched_items(
 
     Requirement 18.1: Display matched items with match type and confidence.
     """
-    await _verify_case_exists(case_id, session)
+    case = await _verify_case_exists(case_id, session)
 
     # Build base query: confirmed / auto-accepted matches. A status_reason
     # filter (or manual_only) is only meaningful for manual links (pass 8,
@@ -273,24 +442,46 @@ async def get_matched_items(
             MatchResultModel.match_type == match_type_filter
         )
 
-    # Count total
-    count_stmt = select(func.count()).select_from(base_query.subquery())
-    total_result = await session.execute(count_stmt)
-    total = total_result.scalar() or 0
-
-    # Apply sorting
+    # Apply sorting (applied before the search filter so a searched result
+    # set still comes back in the requested order).
     sort_column = getattr(MatchResultModel, sort_by, MatchResultModel.pass_number)
     if sort_order == SortOrder.DESC:
         base_query = base_query.order_by(sort_column.desc())
     else:
         base_query = base_query.order_by(sort_column.asc())
 
-    # Apply pagination
-    offset = (page - 1) * page_size
-    base_query = base_query.offset(offset).limit(page_size)
+    if (search and search.strip()) or computed_status_filter:
+        # Reference/invoice number lives on the LINKED ledger entries, not
+        # on MatchResultModel itself — load every candidate match (no SQL
+        # LIMIT yet), filter in Python, then paginate the filtered list.
+        # Same approach for computed_status_filter: Status/Classification
+        # ("TDS Booked by Company", "Write off / Rounding off", ...) is
+        # computed on the fly by _status()/_classification(), not a stored
+        # column, so it can't be a SQL WHERE either.
+        all_result = await session.execute(base_query)
+        all_matches = list(all_result.scalars().all())
+        if search and search.strip():
+            all_matches = await _filter_matches_by_search(all_matches, search, session)
+        if computed_status_filter:
+            tds_max, tds_min, gst_pct = await _load_tax_config(case, session)
+            all_matches = await _filter_matches_by_computed_status(
+                all_matches, computed_status_filter, tds_max, tds_min, gst_pct, session
+            )
+        total = len(all_matches)
+        offset = (page - 1) * page_size
+        matches = all_matches[offset:offset + page_size]
+    else:
+        # Count total
+        count_stmt = select(func.count()).select_from(base_query.subquery())
+        total_result = await session.execute(count_stmt)
+        total = total_result.scalar() or 0
 
-    result = await session.execute(base_query)
-    matches = list(result.scalars().all())
+        # Apply pagination
+        offset = (page - 1) * page_size
+        base_query = base_query.offset(offset).limit(page_size)
+
+        result = await session.execute(base_query)
+        matches = list(result.scalars().all())
 
     # Build response items
     from src.domain.services.vlr.reconciliation_export_service import _rule_code
@@ -361,6 +552,17 @@ async def get_confirmation_items(
     sort_by: str = Query("pass_number", description="Sort field"),
     sort_order: SortOrder = Query(SortOrder.ASC, description="Sort direction"),
     match_type_filter: str | None = Query(None, description="Filter by match type"),
+    search: str | None = Query(
+        None, description="Search by company/vendor invoice or reference number"
+    ),
+    computed_status_filter: str | None = Query(
+        None,
+        description=(
+            "Filter to matches whose computed Status/Classification equals "
+            "this value, e.g. 'Amount Mismatch' — used by the Particulars "
+            "statement's matched-residual drill-in"
+        ),
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> ConfirmationItemsResponse:
@@ -372,7 +574,7 @@ async def get_confirmation_items(
 
     Requirement 19.1: Display matches needing manual review.
     """
-    await _verify_case_exists(case_id, session)
+    case = await _verify_case_exists(case_id, session)
 
     base_query = select(MatchResultModel).where(
         and_(
@@ -387,24 +589,42 @@ async def get_confirmation_items(
             MatchResultModel.match_type == match_type_filter
         )
 
-    # Count total
-    count_stmt = select(func.count()).select_from(base_query.subquery())
-    total_result = await session.execute(count_stmt)
-    total = total_result.scalar() or 0
-
-    # Apply sorting
+    # Apply sorting (before the search filter, so a searched result set
+    # still comes back in the requested order).
     sort_column = getattr(MatchResultModel, sort_by, MatchResultModel.pass_number)
     if sort_order == SortOrder.DESC:
         base_query = base_query.order_by(sort_column.desc())
     else:
         base_query = base_query.order_by(sort_column.asc())
 
-    # Apply pagination
-    offset = (page - 1) * page_size
-    base_query = base_query.offset(offset).limit(page_size)
+    if (search and search.strip()) or computed_status_filter:
+        # Reference/invoice number lives on the LINKED ledger entries — see
+        # _filter_matches_by_search for why this can't be a plain SQL WHERE.
+        # Same for computed_status_filter — see _filter_matches_by_computed_status.
+        all_result = await session.execute(base_query)
+        all_matches = list(all_result.scalars().all())
+        if search and search.strip():
+            all_matches = await _filter_matches_by_search(all_matches, search, session)
+        if computed_status_filter:
+            tds_max, tds_min, gst_pct = await _load_tax_config(case, session)
+            all_matches = await _filter_matches_by_computed_status(
+                all_matches, computed_status_filter, tds_max, tds_min, gst_pct, session
+            )
+        total = len(all_matches)
+        offset = (page - 1) * page_size
+        matches = all_matches[offset:offset + page_size]
+    else:
+        # Count total
+        count_stmt = select(func.count()).select_from(base_query.subquery())
+        total_result = await session.execute(count_stmt)
+        total = total_result.scalar() or 0
 
-    result = await session.execute(base_query)
-    matches = list(result.scalars().all())
+        # Apply pagination
+        offset = (page - 1) * page_size
+        base_query = base_query.offset(offset).limit(page_size)
+
+        result = await session.execute(base_query)
+        matches = list(result.scalars().all())
 
     items: list[ConfirmationEntryResponse] = []
     for match in matches:
@@ -459,6 +679,16 @@ async def get_unmatched_company(
     document_type_filter: str | None = Query(
         None, description="Filter by document type"
     ),
+    search: str | None = Query(
+        None, description="Search by reference/invoice/document number"
+    ),
+    group_filter: str | None = Query(
+        None,
+        description=(
+            "Filter to entries belonging to this Particulars-statement "
+            "difference group (e.g. 'Invoice Difference', 'Other Differences')"
+        ),
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> UnmatchedCompanyResponse:
@@ -481,24 +711,58 @@ async def get_unmatched_company(
             LedgerEntryModel.document_type == document_type_filter
         )
 
-    # Count total
-    count_stmt = select(func.count()).select_from(base_query.subquery())
-    total_result = await session.execute(count_stmt)
-    total = total_result.scalar() or 0
+    # Bug fix: the "Search by reference..." box sent a `search` query param
+    # that this endpoint never declared, so it round-tripped unfiltered on
+    # every keystroke. Matches against any of the reference/invoice/document
+    # number columns (case-insensitive substring).
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        base_query = base_query.where(
+            or_(
+                LedgerEntryModel.reference_number.ilike(term),
+                LedgerEntryModel.document_number.ilike(term),
+                LedgerEntryModel.derived_invoice_number.ilike(term),
+            )
+        )
 
-    # Apply sorting
+    # Apply sorting (before the group filter, so a group-filtered result set
+    # still comes back in the requested order).
     sort_column = getattr(LedgerEntryModel, sort_by, LedgerEntryModel.posting_date)
     if sort_order == SortOrder.DESC:
         base_query = base_query.order_by(sort_column.desc())
     else:
         base_query = base_query.order_by(sort_column.asc())
 
-    # Apply pagination
-    offset = (page - 1) * page_size
-    base_query = base_query.offset(offset).limit(page_size)
+    if group_filter and group_filter.strip():
+        # Bug fix: every difference group's "View" link on the Particulars
+        # statement routed here with NO group filter at all, so every group
+        # ("Invoice Difference", "Other Differences", "TDS / TCS
+        # Difference", ...) showed the exact same full unmatched-company
+        # list. The group label depends on document_category classification
+        # logic (_particulars_group_for_entry, mirroring the Particulars
+        # endpoint's own bucketing) — not a plain SQL column — so filter in
+        # Python: load all candidates, classify each, then paginate.
+        all_result = await session.execute(base_query)
+        all_entries = list(all_result.scalars().all())
+        entries_filtered = [
+            e for e in all_entries
+            if _particulars_group_for_entry(e) == group_filter.strip()
+        ]
+        total = len(entries_filtered)
+        offset = (page - 1) * page_size
+        entries = entries_filtered[offset:offset + page_size]
+    else:
+        # Count total
+        count_stmt = select(func.count()).select_from(base_query.subquery())
+        total_result = await session.execute(count_stmt)
+        total = total_result.scalar() or 0
 
-    result = await session.execute(base_query)
-    entries = list(result.scalars().all())
+        # Apply pagination
+        offset = (page - 1) * page_size
+        base_query = base_query.offset(offset).limit(page_size)
+
+        result = await session.execute(base_query)
+        entries = list(result.scalars().all())
 
     items = [
         UnmatchedCompanyEntryResponse(
@@ -543,6 +807,16 @@ async def get_unmatched_vendor(
     document_type_filter: str | None = Query(
         None, description="Filter by document type"
     ),
+    search: str | None = Query(
+        None, description="Search by reference/invoice/document number"
+    ),
+    group_filter: str | None = Query(
+        None,
+        description=(
+            "Filter to entries belonging to this Particulars-statement "
+            "difference group (e.g. 'Invoice Difference', 'Other Differences')"
+        ),
+    ),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> UnmatchedVendorResponse:
@@ -565,24 +839,49 @@ async def get_unmatched_vendor(
             LedgerEntryModel.document_type == document_type_filter
         )
 
-    # Count total
-    count_stmt = select(func.count()).select_from(base_query.subquery())
-    total_result = await session.execute(count_stmt)
-    total = total_result.scalar() or 0
+    # Bug fix: same as unmatched-company — the `search` param was never
+    # declared/read here, so it round-tripped unfiltered on every keystroke.
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        base_query = base_query.where(
+            or_(
+                LedgerEntryModel.reference_number.ilike(term),
+                LedgerEntryModel.document_number.ilike(term),
+                LedgerEntryModel.derived_invoice_number.ilike(term),
+            )
+        )
 
-    # Apply sorting
+    # Apply sorting (before the group filter, so a group-filtered result set
+    # still comes back in the requested order).
     sort_column = getattr(LedgerEntryModel, sort_by, LedgerEntryModel.posting_date)
     if sort_order == SortOrder.DESC:
         base_query = base_query.order_by(sort_column.desc())
     else:
         base_query = base_query.order_by(sort_column.asc())
 
-    # Apply pagination
-    offset = (page - 1) * page_size
-    base_query = base_query.offset(offset).limit(page_size)
+    if group_filter and group_filter.strip():
+        # Bug fix: same as unmatched-company — see _particulars_group_for_entry.
+        all_result = await session.execute(base_query)
+        all_entries = list(all_result.scalars().all())
+        entries_filtered = [
+            e for e in all_entries
+            if _particulars_group_for_entry(e) == group_filter.strip()
+        ]
+        total = len(entries_filtered)
+        offset = (page - 1) * page_size
+        entries = entries_filtered[offset:offset + page_size]
+    else:
+        # Count total
+        count_stmt = select(func.count()).select_from(base_query.subquery())
+        total_result = await session.execute(count_stmt)
+        total = total_result.scalar() or 0
 
-    result = await session.execute(base_query)
-    entries = list(result.scalars().all())
+        # Apply pagination
+        offset = (page - 1) * page_size
+        base_query = base_query.offset(offset).limit(page_size)
+
+        result = await session.execute(base_query)
+        entries = list(result.scalars().all())
 
     items = [
         UnmatchedVendorEntryResponse(
@@ -1033,7 +1332,7 @@ async def get_reconciliation_particulars(
       • Calculated Balance = sum of all transaction-difference groups, which
         reconciles the closing-balance gap.
     """
-    await _verify_case_exists(case_id, session)
+    case = await _verify_case_exists(case_id, session)
     cid = str(case_id)
 
     # Reuse the SAME classification logic as the Excel export so the on-screen
@@ -1041,11 +1340,13 @@ async def get_reconciliation_particulars(
     from src.domain.services.vlr.reconciliation_export_service import (
         CATEGORY_TO_SUMMARY,
         DEFAULT_SUMMARY,
+        ReconciliationExportService,
         _closing,
         _closing_count,
         _company_closing,
         _num,
         _special_classification,
+        matched_residual_bucket,
     )
 
     # Load full ledgers (ORM entries) for both sides.
@@ -1116,7 +1417,17 @@ async def get_reconciliation_particulars(
             special = _special_classification(e)
             if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                 continue
-            info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
+            # Bug fix: an unmatched TDS entry must roll up under "TDS / TCS
+            # Difference" regardless of its raw document_category (the
+            # export service's own bucket() closure already does this via
+            # CATEGORY_TO_SUMMARY["TDS Adjusted"] — this endpoint was
+            # missing the same special-case, so unmatched TDS entries fell
+            # through to "Other Differences" on-screen while the exported
+            # workbook correctly grouped them under TDS / TCS Difference).
+            if special == "TDS Booked by Party":
+                info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
+            else:
+                info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
             # An entry open on the company side is missing on the party side,
             # and vice versa (see Emcure mapping rules doc + export service).
             label = info["party_missing"] if side == "company" else info["company_missing"]
@@ -1135,18 +1446,78 @@ async def get_reconciliation_particulars(
         "Debit Note / Credit Note Difference",
         "Payment / receipt Difference",
         "Other Differences",
+        "TDS / TCS Difference",
+        "Amount Mismatch Difference",
+        "Write Off / Rounding Off Difference",
+        "Unexplained Amount Gap Difference",
     ]
     lines_by_group: dict[str, list[ParticularsChild]] = {}
     for (grp, label), (amt, cnt) in {**comp_buckets, **party_buckets}.items():
-        side = "company" if "by Company" in label else "vendor"
+        # Bug fix: a line labeled "... not booked by Party" comes from
+        # _bucket(company_entries, ...) — the underlying rows physically
+        # live in the COMPANY ledger (company booked it, party hasn't), so
+        # its drill-in view is unmatched-company. Conversely "... not
+        # booked by Company" rows live in the VENDOR ledger. This was
+        # inverted (checked "by Company" -> side="company"), which silently
+        # pointed the child-row "View" action at the wrong ledger side.
+        side = "company" if "by Party" in label else "vendor"
         lines_by_group.setdefault(grp, []).append(
             ParticularsChild(
                 label=label,
                 amount=amt,
                 no_of_entries=cnt,
                 side=side,
-                document_category="",
-                view_key="unmatched",
+                document_category=grp,
+                # Bug fix: this was hardcoded to the generic "unmatched"
+                # placeholder for every group, so the frontend's "View" slug
+                # resolver had no way to tell "Invoice Difference" apart
+                # from "Other Differences" or any other group — every group's
+                # View link ended up pointing at the exact same full
+                # unmatched-company list. view_key now carries the actual
+                # Particulars group label, which the frontend passes through
+                # as the `group_filter` query param on unmatched-company/
+                # unmatched-vendor so each group's View only shows its own
+                # entries.
+                view_key=grp,
+            )
+        )
+
+    # ── Matched-pair residuals (TDS deducted, rounding write-off, unexplained
+    # gap, amount mismatch) ──
+    # Bug fix: the statement above only ever itemised UNMATCHED (one-sided)
+    # entries — a matched PAIR that still carries a genuine residual gap
+    # never appeared here at all, even though the Excel export already
+    # surfaces these via matched_residual_bucket. Client: "are the matched
+    # columns not a part of these particulars and differences? we also need
+    # those". Build the same row dicts the export service computes Status/
+    # Classification from, then fold matched_residual_bucket's output into
+    # the same groups so "TDS / TCS Difference", "Write Off / Rounding Off
+    # Difference", "Unexplained Amount Gap Difference", and "Amount Mismatch
+    # Difference" now include BOTH the unmatched entries above AND matched
+    # pairs with a residual, exactly like the downloaded workbook.
+    mr_res = await session.execute(
+        select(MatchResultModel).where(MatchResultModel.case_id == cid)
+    )
+    match_results = list(mr_res.scalars().all())
+    tds_max, tds_min, gst_pct = await _load_tax_config(case, session)
+    export_svc = ReconciliationExportService()
+    export_svc._tds_percentage_value = tds_max
+    export_svc._tds_percentage_min_value = tds_min
+    export_svc._gst_percentage_value = gst_pct
+    by_id = {str(e.id): e for e in company_entries + vendor_entries}
+    recon_rows = export_svc._build_recon_rows(company_entries, vendor_entries, match_results, by_id)
+    matched_residuals = matched_residual_bucket(recon_rows)
+    for (grp, label, _action), (amt, cnt) in matched_residuals.items():
+        lines_by_group.setdefault(grp, []).append(
+            ParticularsChild(
+                label=label,
+                amount=amt,
+                no_of_entries=cnt,
+                side="",
+                document_category=grp,
+                view_key=grp,
+                is_matched_residual=True,
+                matched_status=label,
             )
         )
 
@@ -1163,7 +1534,15 @@ async def get_reconciliation_particulars(
                 label=grp,
                 amount=grp_amount,
                 no_of_entries=grp_count,
-                view_key="unmatched",
+                # See comment above on the child view_key — same fix at the
+                # group level, so the group-row "View" (the one shown in the
+                # collapsed table before expanding) also gets its own
+                # dedicated drill-in instead of the shared "unmatched" slug.
+                view_key=grp,
+                # True only when every child is a matched residual (no
+                # unmatched component) — lets the frontend route the
+                # group-level View straight to the Matched/Recommended tab.
+                is_matched_residual=all(c.is_matched_residual for c in children),
                 children=children,
             )
         )
@@ -1367,7 +1746,9 @@ async def export_reconciliation(
 
     # Tolerances (as display strings)
     tol_amt = f"{float(parent.tolerance_amount or 0)} Rs" if parent else "0 Rs"
-    tds_pct = f"0.0 - {float(parent.tds_percentage or 0)}" if parent else "0.0"
+    tds_min_display = float(getattr(parent, "tds_percentage_min", 0) or 0) if parent else 0.0
+    tds_max_display = float(getattr(parent, "tds_percentage", 0) or 0) if parent else 0.0
+    tds_pct = f"{tds_min_display} - {tds_max_display}"
     party_code = getattr(vendor, "vendor_code", "") or ""
     party_name = getattr(vendor, "name", "reconciliation") or "reconciliation"
 
@@ -1384,7 +1765,8 @@ async def export_reconciliation(
         party_code=party_code,
         tolerance_amount=tol_amt,
         tds_percentage=tds_pct,
-        tds_percentage_value=float(getattr(parent, "tds_percentage", 0) or 0) if parent else 0.0,
+        tds_percentage_value=tds_max_display,
+        tds_percentage_min_value=tds_min_display,
         gst_percentage_value=float(getattr(parent, "gst_percentage", 0) or 0) if parent else 0.0,
     )
 

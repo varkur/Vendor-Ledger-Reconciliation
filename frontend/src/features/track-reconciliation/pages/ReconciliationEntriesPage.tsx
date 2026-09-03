@@ -51,6 +51,15 @@ export const ReconciliationEntriesPage = () => {
   const { companyCode } = useSelectedEntity();
   const [searchParams] = useSearchParams();
   const statusReason = searchParams.get('status_reason') || undefined;
+  // Particulars-statement difference group (e.g. "Invoice Difference") —
+  // bug fix: every group's "View" used to route here with no filter at all,
+  // so every group showed the exact same full unmatched list.
+  const groupFilter = searchParams.get('group') || undefined;
+  // Matched-pair residual filter (e.g. "TDS Booked by Company", "Amount
+  // Mismatch") — from the Particulars statement's matched-residual
+  // drill-in, which previously didn't exist at all: matched entries with a
+  // genuine residual gap were invisible on the statement.
+  const computedStatusFilter = searchParams.get('computed_status') || undefined;
 
   const config = (view && VIEW_CONFIG[view]) || VIEW_CONFIG.matched;
 
@@ -82,15 +91,15 @@ export const ReconciliationEntriesPage = () => {
     if (!caseId) return null;
     switch (view) {
       case 'recommended':
-        return <ConfirmationTab caseId={caseId} />;
+        return <ConfirmationTab caseId={caseId} computedStatusFilter={computedStatusFilter} />;
       case 'unmatched':
-        return <UnmatchedAllTab caseId={caseId} editable={canEditLinks} />;
+        return <UnmatchedAllTab caseId={caseId} editable={canEditLinks} groupFilter={groupFilter} />;
       case 'knocking':
         return <KnockingTab caseId={caseId} />;
       case 'unmatched-company':
-        return <UnmatchedCompanyTab caseId={caseId} />;
+        return <UnmatchedCompanyTab caseId={caseId} groupFilter={groupFilter} />;
       case 'unmatched-vendor':
-        return <UnmatchedVendorTab caseId={caseId} />;
+        return <UnmatchedVendorTab caseId={caseId} groupFilter={groupFilter} />;
       case 'differences':
         return <DifferencesSummaryTab caseId={caseId} />;
       case 'manually-mapped':
@@ -104,7 +113,13 @@ export const ReconciliationEntriesPage = () => {
         );
       case 'matched':
       default:
-        return <MatchedItemsTab caseId={caseId} editable={canEditLinks} />;
+        return (
+          <MatchedItemsTab
+            caseId={caseId}
+            editable={canEditLinks}
+            computedStatusFilter={computedStatusFilter}
+          />
+        );
     }
   };
 

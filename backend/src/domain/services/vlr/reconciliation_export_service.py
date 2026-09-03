@@ -24,7 +24,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+from src.domain.services.vlr.reconciliation_engine_service import (
+    MatchPassType,
+    _is_tax_band_gap,
+)
 
 
 # ── Colour palette (matches the reference export) ──
@@ -108,6 +111,7 @@ def _status(
     difference: float,
     tds_percentage: float = 0.0,
     gst_percentage: float = 0.0,
+    tds_percentage_min: float = 0.0,
 ) -> str:
     """
     Row-level Status (distinct from Classification). Reconciled unless the
@@ -123,19 +127,29 @@ def _status(
         selected reason is shown separately in the Remark column)
       - Everything else that matched -> "Reconciled"
 
-    A gap is only ever labelled "TDS Booked by ..." if it matches the
-    case's configured TDS% or GST% of the base amount almost EXACTLY
-    (within +/-1%, just enough to absorb paise-level rounding — same
-    precision as the matching engine's _is_tax_band_gap / pass 11's
-    _tds_gst_match). Client-confirmed bug: a flat "difference > Rs 5"
-    check with no upper bound mislabelled gaps of tens/hundreds of
-    thousands of rupees as "TDS Booked by Company" — those are a genuine
-    amount mismatch, not a tax adjustment, and must not be silently
-    absorbed into the TDS bucket. The root cause has since been fixed in
-    the matching engine itself (passes 2/TOLERANCE and TOLERANCE_DATE no
-    longer match on an unexplained gap at all), so this bound is now
-    mostly a defensive fallback for any pair that still reaches this
-    function unexplained.
+    A gap is only ever labelled "TDS Booked by ..." if it falls within the
+    case's configured TDS% RANGE [tds_percentage_min, tds_percentage] or
+    matches the configured GST% almost exactly — using the exact same
+    _is_tax_band_gap range check the matching engine itself used to decide
+    this pair was TDS-explained in the first place (see
+    reconciliation_engine_service.py).
+
+    Client-confirmed bug (round 1): a flat "difference > Rs 5" check with
+    no upper bound mislabelled gaps of tens/hundreds of thousands of
+    rupees as "TDS Booked by Company" — those are a genuine amount
+    mismatch, not a tax adjustment. Fixed by bounding the check to the
+    configured rate.
+
+    Client-confirmed bug (round 2): the bound-to-configured-rate fix above
+    checked only the flat Max rate as a single number, e.g. a configured
+    "TDS 0%-10%" range collapsed to "must be within 1% of a 10% gap" —
+    so a REAL TDS deduction at any other rate within that range (a
+    genuine ~0.08% deduction, well inside 0%-10%) still fell through to
+    "Unexplained Amount Gap" even though the matching engine's own
+    _is_tax_band_gap (a proper Min-Max range check) had already matched
+    the pair correctly as TDS-explained. This function must agree with
+    that same range check, not re-derive tax-matching from a different,
+    narrower formula.
     """
     if pass_number is None:
         return ""
@@ -156,21 +170,21 @@ def _status(
 
     c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
     p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
-    base_amount = max(c_amt, p_amt)
 
     def _matches_tax_amount(gap: float) -> bool:
-        """+/-1% band around EACH configured rate's computed amount —
-        checked independently so a real TDS-sized gap isn't missed just
-        because GST% happens to be configured larger, or vice versa."""
-        for pct in (tds_percentage, gst_percentage):
-            if not pct or pct <= 0:
-                continue
-            expected = base_amount * (pct / 100.0)
-            if expected <= 0:
-                continue
-            if abs(gap - expected) <= expected * 0.01:
-                return True
-        return False
+        """Range-aware TDS/GST check — same logic (and same base-amount
+        conventions: TDS off the larger amount, GST off the smaller) as
+        the matching engine's own _is_tax_band_gap, so the Status label
+        never disagrees with why the engine actually matched this pair."""
+        if c_amt <= 0 or p_amt <= 0:
+            return False
+        tds_min_frac = Decimal(str(tds_percentage_min / 100.0)) if tds_percentage_min > 0 else Decimal("0")
+        tds_max_frac = Decimal(str(tds_percentage / 100.0)) if tds_percentage > 0 else Decimal("0")
+        gst_frac = Decimal(str(gst_percentage / 100.0)) if gst_percentage > 0 else Decimal("0")
+        return _is_tax_band_gap(
+            Decimal(str(gap)), Decimal(str(c_amt)), Decimal(str(p_amt)),
+            tds_min_frac, tds_max_frac, gst_frac,
+        )
 
     if pn == MatchPassType.AMOUNT_MISMATCH:
         # Same invoice number AND same date on both sides (see
@@ -236,10 +250,24 @@ def _invoice_number(entry) -> str:
         "inv number", "trx number", "transaction number", "bill no",
         "document number", "doc no", "voucher no", "vch no.", "reference",
     ], "")
-    if val:
+    # Bug fix: for balance rows (Opening/Closing Balance) — and potentially
+    # any row re-processed from a previous export/pipeline run — raw_data's
+    # own "document number"/"reference" aliases can themselves already BE
+    # the placeholder (e.g. raw_data={"document number": "BAL_ROW_167", ...}),
+    # so this fallback needs the same BAL_ROW_* rejection as every other
+    # lookup here, otherwise the placeholder round-trips right back out.
+    if val and not str(val).startswith("BAL_ROW_"):
         return str(val)
-    # Last resort: whatever we had (may be the placeholder).
-    return str(derived or doc or "")
+    # Bug fix: this used to fall back to `derived or doc`, which returns the
+    # raw synthetic BAL_ROW_* placeholder itself (e.g. "BAL_ROW_82") when no
+    # real invoice number could be recovered from raw_data — client: "don't
+    # need to fill the invoice number column with this BAL_ROW". Both
+    # `derived` and `doc` were already excluded by the loop above whenever
+    # they started with "BAL_ROW_", so if we reach here neither is usable —
+    # leave the invoice number genuinely blank in the export, matching the
+    # API-side equivalent (entry_columns.invoice_number) used by the
+    # matched/unmatched drill-in screens.
+    return ""
 
 
 def _entry_signals(entry) -> str:
@@ -470,6 +498,7 @@ class ReconciliationExportService:
     # caller) without first going through `build()`, which is the only place
     # that normally sets these to the request's actual configured values.
     _tds_percentage_value: float = 0.0
+    _tds_percentage_min_value: float = 0.0
     _gst_percentage_value: float = 0.0
 
     # Full 46-column header for the Reconciliation sheet (matches reference).
@@ -518,6 +547,7 @@ class ReconciliationExportService:
         tds_percentage: str = "0.0 - 10.0",
         date_tolerance: str = "0 - 15",
         tds_percentage_value: float = 0.0,
+        tds_percentage_min_value: float = 0.0,
         gst_percentage_value: float = 0.0,
     ) -> bytes:
         wb = Workbook()
@@ -530,7 +560,21 @@ class ReconciliationExportService:
         # bound the "TDS Booked by ..." status so it's never applied to a
         # gap larger than what the actual configured rate could explain.
         # `tds_percentage`/`tolerance_amount` above are display-only strings.
+        #
+        # tds_percentage_min_value: bug fix — the TDS Percentage setting is
+        # a MIN/MAX range (e.g. 0%–10%), not a single rate, but this
+        # Min value was never threaded through to the Status calculation
+        # at all. _matches_tax_amount (below, via _status) only ever
+        # checked the gap against a flat Max-rate amount, so a real
+        # TDS-driven gap at any rate OTHER than exactly the configured Max
+        # (e.g. a genuine ~0.08% deduction, with Max=10%) always failed
+        # that check and was mislabeled "Unexplained Amount Gap" — even
+        # though the matching engine's own _is_tax_band_gap (a proper
+        # Min–Max range check) had already matched the pair correctly as
+        # TDS-explained. The Status label must agree with the same range
+        # check the engine used to create the match in the first place.
         self._tds_percentage_value = float(tds_percentage_value or 0)
+        self._tds_percentage_min_value = float(tds_percentage_min_value or 0)
         self._gst_percentage_value = float(gst_percentage_value or 0)
 
         # Build match linkage: entry_id -> match record
@@ -611,6 +655,7 @@ class ReconciliationExportService:
                 status = _status(
                     pn, c, p, row_diff,
                     self._tds_percentage_value, self._gst_percentage_value,
+                    self._tds_percentage_min_value,
                 )
                 rows.append(self._row(c, p, m, status=status, row_difference=group_diff))
 
@@ -852,11 +897,17 @@ class ReconciliationExportService:
                 _status(
                     pass_number, None, e, row_diff,
                     self._tds_percentage_value, self._gst_percentage_value,
+                    self._tds_percentage_min_value,
                 ) if m else self._unmatched_status(e, "party"),
                 _classification(pass_number) if m else "Unmatched",
                 "ledger",
                 _fmt_date(getattr(e, "posting_date", None)),
-                getattr(e, "derived_invoice_number", None) or getattr(e, "document_number", ""),
+                # Bug fix: this read derived_invoice_number/document_number
+                # directly with no BAL_ROW_* placeholder filtering at all —
+                # use the shared _invoice_number() helper so the "Party"
+                # sheet's invoice number column matches the same
+                # blank-when-unidentifiable behavior as every other sheet.
+                _invoice_number(e),
                 (getattr(e, "document_category", "") or "").lower(),
                 getattr(e, "document_type", ""),
                 getattr(e, "description", ""),
@@ -1264,6 +1315,17 @@ def matched_residual_bucket(rows: list[dict] | None) -> dict:
     Summary sheet at all — only one-sided (unmatched) entries were. The
     gap between the itemised total and the closing-balance difference was
     dumped wholesale into the unlinked "Amount Unsettled" line.
+
+    Count bug fix: the entry count was incremented by 1 PER ROW, but each
+    row here is a matched PAIR — it carries a company-side ledger entry AND
+    a vendor-side ledger entry (2 actual ledger lines), or just one side for
+    an unpaired leg of a one-to-many/many-to-one group. Every OTHER count in
+    this module (`bucket()` for unmatched entries, `matched_bucket()` for
+    "Reconciled Entries") counts actual ledger entries, not rows/pairs — so
+    this one silently under-counted by roughly half versus every other
+    figure on the same statement (client: "why is the count of no. of
+    entries so less?"). Now counts len(entries actually present on the row)
+    instead of a flat +1.
     """
     out: dict = {}
     if not rows:
@@ -1284,5 +1346,8 @@ def matched_residual_bucket(rows: list[dict] | None) -> dict:
         key = (grp, label, action)
         agg = out.setdefault(key, [Decimal("0"), 0])
         agg[0] += diff
-        agg[1] += 1
+        # Count the actual ledger entries this row represents (1 or 2), not
+        # the row itself.
+        entry_count = sum(1 for side_id in (r.get("company_id"), r.get("party_id")) if side_id)
+        agg[1] += entry_count or 1
     return out

@@ -120,6 +120,20 @@ export interface ListParams {
   status_reason?: string;
   /** Filter to all manual links (pass 8), regardless of status_reason. */
   manual_only?: boolean;
+  /**
+   * Filter to entries belonging to this Particulars-statement difference
+   * group (e.g. "Invoice Difference", "Other Differences"). Used by the
+   * unmatched-company/unmatched-vendor "View" drill-in from the
+   * reconciliation statement so each group only shows its own entries.
+   */
+  group_filter?: string;
+  /**
+   * Filter to matches whose computed Status/Classification equals this
+   * value (e.g. "TDS Booked by Company", "Write off / Rounding off",
+   * "Unexplained Amount Gap", "Amount Mismatch"). Used by the Particulars
+   * statement's matched-residual drill-in on the Matched/Recommended tabs.
+   */
+  computed_status_filter?: string;
 }
 
 /** A single matched item entry (Tab 1). */

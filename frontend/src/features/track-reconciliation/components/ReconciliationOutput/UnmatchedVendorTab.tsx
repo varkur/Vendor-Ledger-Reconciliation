@@ -5,14 +5,16 @@
  * Requirements: 21.1, 21.2, 21.3
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from 'primereact/button';
 import { Column } from 'primereact/column';
 import { DataTable, type DataTablePageEvent, type DataTableSortEvent } from 'primereact/datatable';
 import { InputText } from 'primereact/inputtext';
 import { Message } from 'primereact/message';
 import { ProgressSpinner } from 'primereact/progressspinner';
+import { Tag } from 'primereact/tag';
 
+import { useDebouncedValue } from '@shared/hooks/useDebouncedValue';
 import { useUnmatchedVendor, useConfirmMatch } from './useReconciliationOutput';
 import { LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
 import type { ListParams, UnmatchedVendorAction, UnmatchedVendorItem } from './reconciliationOutputApi';
@@ -23,13 +25,20 @@ import type { ListParams, UnmatchedVendorAction, UnmatchedVendorItem } from './r
 
 interface UnmatchedVendorTabProps {
   caseId: string;
+  /**
+   * Pre-applied, non-editable filter to a single Particulars-statement
+   * difference group (from the reconciliation statement's "View" drill-in).
+   * When set, the search bar is hidden since the view is already scoped to
+   * one group.
+   */
+  groupFilter?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
+export const UnmatchedVendorTab = ({ caseId, groupFilter }: UnmatchedVendorTabProps) => {
   const [params, setParams] = useState<ListParams>({
     page: 1,
     page_size: 10,
@@ -38,9 +47,18 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
   });
   const [searchInput, setSearchInput] = useState('');
 
+  // Debounce the search box so it only queries the server after the user
+  // pauses typing, not on every keystroke — matches the pattern used by
+  // MatchedItemsTab/ConfirmationTab/UnmatchedCompanyTab.
+  const debouncedSearch = useDebouncedValue(searchInput, 400);
+  useEffect(() => {
+    setParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+  }, [debouncedSearch]);
+
   const { data, isLoading, error, refetch } = useUnmatchedVendor(caseId, {
     ...params,
-    search: searchInput || undefined,
+    search: groupFilter ? undefined : (debouncedSearch || undefined),
+    group_filter: groupFilter || undefined,
   });
 
   const confirmMutation = useConfirmMatch(caseId);
@@ -61,12 +79,6 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
       sort_by: event.sortField as string,
       sort_order: event.sortOrder === 1 ? 'asc' : 'desc',
     }));
-  };
-
-  const onSearchKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter') {
-      setParams((prev) => ({ ...prev, page: 1 }));
-    }
   };
 
   const handleAction = (itemId: string, action: UnmatchedVendorAction) => {
@@ -179,20 +191,25 @@ export const UnmatchedVendorTab = ({ caseId }: UnmatchedVendorTabProps) => {
         />
       )}
 
-      {/* Search Bar */}
-      <div className="flex align-items-center gap-3 mb-3">
-        <div className="em-search-bar">
-          <InputText
-            placeholder="Search by reference..."
-            value={searchInput}
-            onChange={(e) => setSearchInput(e.target.value)}
-            onKeyDown={onSearchKeyDown}
-            style={{ border: 'none', boxShadow: 'none', width: 200 }}
-            aria-label="Search unmatched vendor entries"
-          />
-          <i className="pi pi-search" />
+      {/* Search Bar / Group Filter Indicator */}
+      {groupFilter ? (
+        <div className="mb-3">
+          <Tag value={`Group: ${groupFilter}`} severity="info" />
         </div>
-      </div>
+      ) : (
+        <div className="flex align-items-center gap-3 mb-3">
+          <div className="em-search-bar">
+            <InputText
+              placeholder="Search by reference..."
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ border: 'none', boxShadow: 'none', width: 200 }}
+              aria-label="Search unmatched vendor entries"
+            />
+            <i className="pi pi-search" />
+          </div>
+        </div>
+      )}
 
       {/* DataTable */}
       <div className="em-card" style={{ padding: 0 }}>

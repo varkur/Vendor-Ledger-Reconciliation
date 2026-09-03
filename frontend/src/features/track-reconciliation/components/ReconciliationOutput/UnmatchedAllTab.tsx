@@ -48,17 +48,27 @@ interface UnmatchedAllTabProps {
   caseId: string;
   /** Enables selection + "Link Selected" — off by default (read-only). */
   editable?: boolean;
+  /**
+   * Pre-applied, non-editable filter to a single Particulars-statement
+   * difference group (e.g. "Invoice Difference", "Other Differences") —
+   * from the reconciliation statement's group-header "View" drill-in. Bug
+   * fix: previously every difference group's View button routed here with
+   * NO filter at all, so every group showed the same full unmatched list.
+   * When set, the free-text search box is hidden since the view is already
+   * scoped to one group.
+   */
+  groupFilter?: string;
 }
 
-export const UnmatchedAllTab = ({ caseId, editable = false }: UnmatchedAllTabProps) => {
+export const UnmatchedAllTab = ({ caseId, editable = false, groupFilter }: UnmatchedAllTabProps) => {
   const toast = useRef<Toast>(null);
   const queryClient = useQueryClient();
 
   const { data: companyData, isLoading: companyLoading, error: companyError, refetch: refetchCompany } = useQuery({
-    queryKey: ['unmatched-company-all', caseId],
+    queryKey: ['unmatched-company-all', caseId, groupFilter],
     queryFn: async () => {
       const { data } = await apiClient.get(`/vlr/reconciliation/${caseId}/unmatched-company`, {
-        params: { page: 1, page_size: 1000 },
+        params: { page: 1, page_size: 1000, group_filter: groupFilter || undefined },
       });
       return normalizeRows(data, 'Company');
     },
@@ -66,10 +76,10 @@ export const UnmatchedAllTab = ({ caseId, editable = false }: UnmatchedAllTabPro
   });
 
   const { data: vendorData, isLoading: vendorLoading, error: vendorError, refetch: refetchVendor } = useQuery({
-    queryKey: ['unmatched-vendor-all', caseId],
+    queryKey: ['unmatched-vendor-all', caseId, groupFilter],
     queryFn: async () => {
       const { data } = await apiClient.get(`/vlr/reconciliation/${caseId}/unmatched-vendor`, {
-        params: { page: 1, page_size: 1000 },
+        params: { page: 1, page_size: 1000, group_filter: groupFilter || undefined },
       });
       return normalizeRows(data, 'Party');
     },
@@ -211,16 +221,20 @@ export const UnmatchedAllTab = ({ caseId, editable = false }: UnmatchedAllTabPro
         <div className="p-3 flex align-items-center justify-content-between">
           <h4 className="m-0">Unmatched Data</h4>
           <div className="flex align-items-center gap-3">
-            <div className="em-search-bar">
-              <InputText
-                placeholder="Search unmatched entries..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                style={{ border: 'none', boxShadow: 'none', width: 220 }}
-                aria-label="Search unmatched entries"
-              />
-              <i className="pi pi-search" />
-            </div>
+            {groupFilter ? (
+              <Tag value={`Group: ${groupFilter}`} severity="info" />
+            ) : (
+              <div className="em-search-bar">
+                <InputText
+                  placeholder="Search unmatched entries..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  style={{ border: 'none', boxShadow: 'none', width: 220 }}
+                  aria-label="Search unmatched entries"
+                />
+                <i className="pi pi-search" />
+              </div>
+            )}
             {editable && <Tag value={`${companySelection.length} company`} />}
             {editable && <Tag value={`${vendorSelection.length} party`} severity="warning" />}
             {!editable && <Tag value={`${companyCount} company`} />}
