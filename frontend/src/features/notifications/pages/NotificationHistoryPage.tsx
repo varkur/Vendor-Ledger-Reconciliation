@@ -7,7 +7,7 @@
  */
 
 import { useState, useRef, useCallback } from 'react';
-import { DataTable } from 'primereact/datatable';
+import { DataTable, type DataTablePageEvent } from 'primereact/datatable';
 import { Column } from 'primereact/column';
 import { Button } from 'primereact/button';
 import { InputText } from 'primereact/inputtext';
@@ -115,8 +115,8 @@ export const NotificationHistoryPage = () => {
     });
   }, [selectedNotifications, markAsReadMutation]);
 
-  const handlePageChange = useCallback((event: { page: number; rows: number }) => {
-    setPage(event.page + 1);
+  const handlePageChange = useCallback((event: DataTablePageEvent) => {
+    setPage((event.page ?? 0) + 1);
     setPageSize(event.rows);
   }, []);
 

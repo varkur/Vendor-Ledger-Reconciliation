@@ -32,7 +32,7 @@ function generateCorrelationId(): string {
     if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
       const arr = new Uint8Array(1);
       crypto.getRandomValues(arr);
-      return arr[0] / 256;
+      return (arr[0] ?? 0) / 256;
     }
     return Math.random();
   };

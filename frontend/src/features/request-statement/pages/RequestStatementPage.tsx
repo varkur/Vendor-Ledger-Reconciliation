@@ -125,9 +125,6 @@ export const RequestStatementPage = () => {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
 
-  // Success state
-  const [showSuccess, setShowSuccess] = useState(false);
-
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
@@ -378,14 +375,6 @@ export const RequestStatementPage = () => {
     setVendorSearch(e.filter);
   }, []);
 
-  const handleSelectAllVendors = useCallback(() => {
-    if (selectedVendorIds.length > 0) {
-      setSelectedVendorIds([]);
-    } else {
-      setSelectedVendorIds(vendorOptions.map((v) => v.value));
-    }
-  }, [vendorOptions, selectedVendorIds]);
-
   // Preview email template handler
   const handlePreview = useCallback(async () => {
     if (!emailTemplate) {
@@ -416,17 +405,6 @@ export const RequestStatementPage = () => {
       setPreviewLoading(false);
     }
   }, [emailTemplate, companyCode]);
-
-  const handleResetSuccess = useCallback(() => {
-    setShowSuccess(false);
-    setTitle('');
-    setSelectedVendorIds([]);
-    setStartDate(null);
-    setEndDate(null);
-    setRemarks('');
-    setCurrentStep('configure');
-    createMutation.reset();
-  }, [createMutation]);
 
   // ─── Auto-detect (consolidated ledger) upload handlers ──────────────────
   const handleAutoDetectFileUpload = useCallback(async (file: File) => {

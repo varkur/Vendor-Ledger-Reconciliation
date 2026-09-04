@@ -227,10 +227,10 @@ export const ApprovalMatrixPage = () => {
             </div>
             {rules.map((rule, idx) => (
               <div key={idx} className="flex gap-2 mb-2 align-items-center">
-                <InputText value={rule.field} onChange={(e) => { const r = [...rules]; r[idx].field = e.target.value; setRules(r); }} placeholder="Field (e.g. amount)" className="flex-1" />
-                <Dropdown value={rule.operator} options={OPERATORS} onChange={(e) => { const r = [...rules]; r[idx].operator = e.value; setRules(r); }} className="w-8rem" />
-                <InputText value={rule.value} onChange={(e) => { const r = [...rules]; r[idx].value = e.target.value; setRules(r); }} placeholder="Value" className="flex-1" />
-                <Dropdown value={rule.data_type} options={DATA_TYPES} onChange={(e) => { const r = [...rules]; r[idx].data_type = e.value; setRules(r); }} className="w-7rem" />
+                <InputText value={rule.field} onChange={(e) => { const r = [...rules]; r[idx]!.field = e.target.value; setRules(r); }} placeholder="Field (e.g. amount)" className="flex-1" />
+                <Dropdown value={rule.operator} options={OPERATORS} onChange={(e) => { const r = [...rules]; r[idx]!.operator = e.value; setRules(r); }} className="w-8rem" />
+                <InputText value={rule.value} onChange={(e) => { const r = [...rules]; r[idx]!.value = e.target.value; setRules(r); }} placeholder="Value" className="flex-1" />
+                <Dropdown value={rule.data_type} options={DATA_TYPES} onChange={(e) => { const r = [...rules]; r[idx]!.data_type = e.value; setRules(r); }} className="w-7rem" />
                 <Button icon="pi pi-trash" rounded outlined severity="danger" size="small" onClick={() => removeRule(idx)} />
               </div>
             ))}
@@ -246,12 +246,12 @@ export const ApprovalMatrixPage = () => {
             {assignments.map((assign, idx) => (
               <div key={idx} className="flex gap-2 mb-2 align-items-center">
                 <Tag value={`L${assign.level}`} severity="info" />
-                <Dropdown value={assign.assignment_type} options={[{ label: 'Role', value: 'ROLE' }, { label: 'User', value: 'USER' }]} onChange={(e) => { const a = [...assignments]; a[idx].assignment_type = e.value; a[idx].user_ids = []; a[idx].role_ids = []; setAssignments(a); }} className="w-7rem" />
+                <Dropdown value={assign.assignment_type} options={[{ label: 'Role', value: 'ROLE' }, { label: 'User', value: 'USER' }]} onChange={(e) => { const a = [...assignments]; a[idx]!.assignment_type = e.value; a[idx]!.user_ids = []; a[idx]!.role_ids = []; setAssignments(a); }} className="w-7rem" />
                 {assign.assignment_type === 'ROLE' ? (
                   <MultiSelect
                     value={assign.role_ids}
                     options={roleOptions}
-                    onChange={(e) => { const a = [...assignments]; a[idx].role_ids = e.value; setAssignments(a); }}
+                    onChange={(e) => { const a = [...assignments]; a[idx]!.role_ids = e.value; setAssignments(a); }}
                     placeholder="Select roles"
                     display="chip"
                     filter
@@ -261,7 +261,7 @@ export const ApprovalMatrixPage = () => {
                   <MultiSelect
                     value={assign.user_ids}
                     options={userOptions}
-                    onChange={(e) => { const a = [...assignments]; a[idx].user_ids = e.value; setAssignments(a); }}
+                    onChange={(e) => { const a = [...assignments]; a[idx]!.user_ids = e.value; setAssignments(a); }}
                     placeholder="Select users"
                     display="chip"
                     filter

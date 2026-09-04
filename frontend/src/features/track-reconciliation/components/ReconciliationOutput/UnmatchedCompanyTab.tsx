@@ -6,7 +6,6 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Button } from 'primereact/button';
 import { Column } from 'primereact/column';
 import { DataTable, type DataTablePageEvent, type DataTableSortEvent } from 'primereact/datatable';
 import { InputText } from 'primereact/inputtext';
@@ -17,7 +16,7 @@ import { Tag } from 'primereact/tag';
 import { useDebouncedValue } from '@shared/hooks/useDebouncedValue';
 import { useUnmatchedCompany, useConfirmMatch } from './useReconciliationOutput';
 import { LEDGER_COLUMN_DEFS } from './reconciliationOutputApi';
-import type { ListParams, UnmatchedCompanyAction, UnmatchedCompanyItem } from './reconciliationOutputApi';
+import type { ListParams, UnmatchedCompanyItem } from './reconciliationOutputApi';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -80,63 +79,6 @@ export const UnmatchedCompanyTab = ({ caseId, groupFilter }: UnmatchedCompanyTab
       sort_order: event.sortOrder === 1 ? 'asc' : 'desc',
     }));
   };
-
-  const handleAction = (itemId: string, action: UnmatchedCompanyAction) => {
-    confirmMutation.mutate({
-      item_id: itemId,
-      action,
-      tab: 'unmatched_company',
-    });
-  };
-
-  // ─── Column Templates ────────────────────────────────────────────────────────
-
-  const amountTemplate = (rowData: UnmatchedCompanyItem) => {
-    const value = Number(rowData.amount ?? 0);
-    return (
-      <span className={value < 0 ? 'text-red-500' : ''}>
-        {rowData.currency ?? 'INR'} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-      </span>
-    );
-  };
-
-  const actionsTemplate = (rowData: UnmatchedCompanyItem) => (
-    <div className="flex align-items-center gap-2">
-      <Button
-        icon="pi pi-check"
-        severity="success"
-        size="small"
-        tooltip="Accept"
-        tooltipOptions={{ position: 'top' }}
-        onClick={() => handleAction(rowData.id, 'accept')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'accept'}
-        disabled={confirmMutation.isPending}
-        aria-label={`Accept entry ${rowData.reference}`}
-      />
-      <Button
-        icon="pi pi-exclamation-triangle"
-        severity="warning"
-        size="small"
-        tooltip="Dispute"
-        tooltipOptions={{ position: 'top' }}
-        onClick={() => handleAction(rowData.id, 'dispute')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'dispute'}
-        disabled={confirmMutation.isPending}
-        aria-label={`Dispute entry ${rowData.reference}`}
-      />
-      <Button
-        icon="pi pi-envelope"
-        severity="info"
-        size="small"
-        tooltip="Request info"
-        tooltipOptions={{ position: 'top' }}
-        onClick={() => handleAction(rowData.id, 'request')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'request'}
-        disabled={confirmMutation.isPending}
-        aria-label={`Request info for entry ${rowData.reference}`}
-      />
-    </div>
-  );
 
   // ─── Render ──────────────────────────────────────────────────────────────────
 

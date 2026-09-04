@@ -86,6 +86,7 @@ export const ReportsPage = () => {
   // Export handler
   const handleExport = useCallback(() => {
     const reportType = TAB_TO_REPORT_TYPE[activeTab];
+    if (!reportType) return;
     generateMutation.mutate(
       { reportType, format: exportFormat },
       {

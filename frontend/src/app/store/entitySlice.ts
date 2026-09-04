@@ -92,9 +92,12 @@ const entitySlice = createSlice({
 
         if (savedEntity) {
           state.selectedEntity = savedEntity;
-        } else if (action.payload.length > 0) {
-          state.selectedEntity = action.payload[0];
-          sessionStorage.setItem('selectedEntityId', action.payload[0].id);
+        } else {
+          const firstEntity = action.payload[0];
+          if (firstEntity) {
+            state.selectedEntity = firstEntity;
+            sessionStorage.setItem('selectedEntityId', firstEntity.id);
+          }
         }
       })
       .addCase(fetchEntities.rejected, (state, action) => {

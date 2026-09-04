@@ -26,7 +26,15 @@ import {
   type ReconciliationRequestResponse,
 } from './directReconciliationApi';
 
-const mockedApiClient = vi.mocked(apiClient);
+// `apiClient` (an AxiosInstance) types `get`/`post` as overloaded generic
+// functions, which `vi.mocked()` cannot map onto a `Mock` with
+// `.mockResolvedValue(...)`. The mock module above only ever defines `get`
+// and `post` as plain `vi.fn()`, so cast to that narrower, accurate shape
+// instead of trying to force the real AxiosInstance type through vi.mocked.
+const mockedApiClient = apiClient as unknown as {
+  get: ReturnType<typeof vi.fn>;
+  post: ReturnType<typeof vi.fn>;
+};
 
 describe('directReconciliationApi', () => {
   beforeEach(() => {

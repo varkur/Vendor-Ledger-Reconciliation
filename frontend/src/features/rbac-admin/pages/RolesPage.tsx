@@ -31,11 +31,12 @@ function buildPermissionTree(permissions: Permission[]): TreeNode[] {
   for (const perm of permissions) {
     const scope = perm.scope;
     // Use first part of resource as feature group
-    const resource = perm.resource.split('.')[0];
+    const resource = perm.resource.split('.')[0] ?? perm.resource;
 
     if (!scopeMap[scope]) scopeMap[scope] = {};
-    if (!scopeMap[scope][resource]) scopeMap[scope][resource] = [];
-    scopeMap[scope][resource].push(perm);
+    const resourceMap = scopeMap[scope];
+    if (!resourceMap[resource]) resourceMap[resource] = [];
+    resourceMap[resource].push(perm);
   }
 
   const scopeLabels: Record<string, string> = {
@@ -65,7 +66,7 @@ function buildPermissionTree(permissions: Permission[]): TreeNode[] {
     };
 
     for (const [resource, perms] of Object.entries(resources).sort()) {
-      if (perms.length === 1) {
+      if (perms.length === 1 && perms[0]) {
         // Single permission under resource — add directly to scope
         const perm = perms[0];
         scopeNode.children!.push({

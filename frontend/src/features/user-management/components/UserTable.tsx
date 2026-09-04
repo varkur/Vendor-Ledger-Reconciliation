@@ -10,7 +10,6 @@ import { Tag } from 'primereact/tag';
 import { Button } from 'primereact/button';
 import { Dialog } from 'primereact/dialog';
 import { FilterMatchMode } from 'primereact/api';
-import { InputText } from 'primereact/inputtext';
 import { apiClient } from '@shared/services/apiClient';
 import { userApi } from '../api/userApi';
 import type { User, UserRole } from '../models/User';

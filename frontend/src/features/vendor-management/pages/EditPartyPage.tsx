@@ -395,7 +395,9 @@ export const EditPartyPage = () => {
                       value={rowData.name}
                       onChange={(e) => {
                         const updated = [...contacts];
-                        updated[rowIndex] = { ...updated[rowIndex], name: e.target.value };
+                        const current = updated[rowIndex];
+                        if (!current) return;
+                        updated[rowIndex] = { ...current, name: e.target.value };
                         setContacts(updated);
                       }}
                       style={{ width: '100%', border: 'none', background: 'transparent' }}
@@ -411,7 +413,9 @@ export const EditPartyPage = () => {
                       value={rowData.email}
                       onChange={(e) => {
                         const updated = [...contacts];
-                        updated[rowIndex] = { ...updated[rowIndex], email: e.target.value };
+                        const current = updated[rowIndex];
+                        if (!current) return;
+                        updated[rowIndex] = { ...current, email: e.target.value };
                         setContacts(updated);
                       }}
                       style={{ width: '100%', border: 'none', background: 'transparent' }}
@@ -427,7 +431,9 @@ export const EditPartyPage = () => {
                       value={rowData.phone}
                       onChange={(e) => {
                         const updated = [...contacts];
-                        updated[rowIndex] = { ...updated[rowIndex], phone: e.target.value };
+                        const current = updated[rowIndex];
+                        if (!current) return;
+                        updated[rowIndex] = { ...current, phone: e.target.value };
                         setContacts(updated);
                       }}
                       style={{ width: '100%', border: 'none', background: 'transparent' }}
@@ -443,7 +449,9 @@ export const EditPartyPage = () => {
                       value={rowData.workPhone}
                       onChange={(e) => {
                         const updated = [...contacts];
-                        updated[rowIndex] = { ...updated[rowIndex], workPhone: e.target.value };
+                        const current = updated[rowIndex];
+                        if (!current) return;
+                        updated[rowIndex] = { ...current, workPhone: e.target.value };
                         setContacts(updated);
                       }}
                       style={{ width: '100%', border: 'none', background: 'transparent' }}

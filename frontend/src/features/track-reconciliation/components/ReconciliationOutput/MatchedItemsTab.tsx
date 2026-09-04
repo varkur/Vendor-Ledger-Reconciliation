@@ -15,7 +15,6 @@ import { ProgressSpinner } from 'primereact/progressspinner';
 import { Tag } from 'primereact/tag';
 
 import { useRef } from 'react';
-import { Button } from 'primereact/button';
 import { Toast } from 'primereact/toast';
 import { useQueryClient } from '@tanstack/react-query';
 import { useDebouncedValue } from '@shared/hooks/useDebouncedValue';
@@ -167,15 +166,6 @@ export const MatchedItemsTab = ({ caseId, editable = false, statusReasonFilter, 
         value={`${percentage}%`}
         severity={getConfidenceSeverity(rowData.confidence_score)}
       />
-    );
-  };
-
-  const amountTemplate = (field: 'company_amount' | 'vendor_amount') => (rowData: MatchedItem) => {
-    const value = Number(rowData[field] ?? 0);
-    return (
-      <span className={value < 0 ? 'text-red-500' : ''}>
-        {rowData.currency ?? 'INR'} {value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-      </span>
     );
   };
 

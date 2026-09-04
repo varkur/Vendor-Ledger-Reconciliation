@@ -22,7 +22,6 @@ import { InputText } from 'primereact/inputtext';
 import { InputTextarea } from 'primereact/inputtextarea';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '@shared/services/apiClient';
-import { useSelectedEntity } from '@shared/hooks/useSelectedEntity';
 import { manualLink, getStatusReasons, LEDGER_COLUMN_DEFS } from '../components/ReconciliationOutput/reconciliationOutputApi';
 import type { EntryColumns } from '../components/ReconciliationOutput/reconciliationOutputApi';
 
@@ -59,7 +58,6 @@ export const LinkUnmatchedPage = () => {
   const navigate = useNavigate();
   const toast = useRef<Toast>(null);
   const queryClient = useQueryClient();
-  const { companyCode } = useSelectedEntity();
 
   const [selection, setSelection] = useState<UnmatchedRow[]>([]);
   const [isLinking, setIsLinking] = useState(false);
@@ -113,10 +111,10 @@ export const LinkUnmatchedPage = () => {
     if (!term) return allRows;
     return allRows.filter((row) => {
       const haystack: string[] = [
-        row.document_number, row.reference, row.description, row.document_type,
+        row.document_number, row.reference, row.description ?? '', row.document_type,
       ];
       if (row.columns) {
-        for (const v of Object.values(row.columns as Record<string, unknown>)) {
+        for (const v of Object.values(row.columns as unknown as Record<string, unknown>)) {
           if (v !== null && v !== undefined) haystack.push(String(v));
         }
       }
@@ -259,6 +257,7 @@ export const LinkUnmatchedPage = () => {
           value={filteredRows}
           selection={selection}
           onSelectionChange={(e) => setSelection(e.value as UnmatchedRow[])}
+          selectionMode="checkbox"
           dataKey="id"
           size="small"
           scrollable

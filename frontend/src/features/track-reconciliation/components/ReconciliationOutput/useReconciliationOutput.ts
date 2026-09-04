@@ -21,7 +21,6 @@ import {
   type ListParams,
   type MatchedItem,
   type PaginatedResponse,
-  type SubmitForApprovalRequest,
   type SubmitForApprovalResponse,
   type UnmatchedCompanyItem,
   type UnmatchedVendorItem,

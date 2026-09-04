@@ -123,7 +123,7 @@ export const ColumnMappingPage = () => {
       const { data } = await apiClient.get(`/vlr/column-mapping/${caseId}/headers`, {
         params: { side: 'company', company_code: companyCode },
       });
-      return data.sample_values ? Object.keys(data.sample_values).map((h, i) => ({
+      return data.sample_values ? Object.keys(data.sample_values).map((_h, i) => ({
         document_number: data.sample_values['Document Number']?.[i] || '',
         document_type: data.sample_values['Document Type']?.[i] || '',
         posting_date: data.sample_values['Posting Date']?.[i] || '',
@@ -142,7 +142,7 @@ export const ColumnMappingPage = () => {
       const { data } = await apiClient.get(`/vlr/column-mapping/${caseId}/headers`, {
         params: { side: 'vendor', company_code: companyCode },
       });
-      return data.sample_values ? Object.keys(data.sample_values).map((h, i) => ({
+      return data.sample_values ? Object.keys(data.sample_values).map((_h, i) => ({
         document_number: data.sample_values['Document Number']?.[i] || '',
         document_type: data.sample_values['Document Type']?.[i] || '',
         posting_date: data.sample_values['Posting Date']?.[i] || '',
@@ -233,7 +233,7 @@ export const ColumnMappingPage = () => {
       const ext = originalFilename.includes('.')
         ? originalFilename.slice(originalFilename.lastIndexOf('.'))
         : '.csv';
-      const contentType = response.headers['content-type'] || 'application/octet-stream';
+      const contentType = String(response.headers['content-type'] || 'application/octet-stream');
       downloadBlob(
         response.data,
         `${sanitize(partyCode)}_${sanitize(partyName)}_ledger${ext}`,

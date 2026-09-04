@@ -98,7 +98,7 @@ export const UnmatchedAllTab = ({ caseId, editable = false, groupFilter }: Unmat
     if (!term) return allRows;
     return allRows.filter((row) => {
       if (!row.columns) return false;
-      return Object.values(row.columns as Record<string, unknown>).some(
+      return Object.values(row.columns as unknown as Record<string, unknown>).some(
         (v) => v !== null && v !== undefined && String(v).toLowerCase().includes(term)
       );
     });

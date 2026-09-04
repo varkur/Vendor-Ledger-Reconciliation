@@ -65,8 +65,9 @@ export const EditUserDialog = ({ visible, user, onHide, onSubmit, loading }: Edi
       setLoadingUserRole(true);
       userApi.getUserRoles(user.id)
         .then((data) => {
-          if (data.roles.length > 0) {
-            setValue('role_id', data.roles[0].id);
+          const firstRole = data.roles[0];
+          if (firstRole) {
+            setValue('role_id', firstRole.id);
           }
         })
         .catch(() => {})

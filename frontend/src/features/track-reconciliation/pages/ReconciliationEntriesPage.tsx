@@ -61,7 +61,8 @@ export const ReconciliationEntriesPage = () => {
   // genuine residual gap were invisible on the statement.
   const computedStatusFilter = searchParams.get('computed_status') || undefined;
 
-  const config = (view && VIEW_CONFIG[view]) || VIEW_CONFIG.matched;
+  const config: { title: string; icon: string } =
+    (view && VIEW_CONFIG[view]) || VIEW_CONFIG.matched!;
 
   // Case status gates reviewer edit actions (unlink) on the matched view.
   const { data: caseData } = useQuery({
