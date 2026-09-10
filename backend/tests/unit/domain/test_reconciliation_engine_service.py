@@ -851,6 +851,88 @@ class TestReferenceSimilarity:
         score = service._reference_similarity("2526", "2526")
         assert score == 1.0
 
+    def test_four_digit_year_fiscal_token_fully_stripped_not_just_trailing_digits(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Client-confirmed bug (real data): the fiscal-year detector only
+        ever captured the TRAILING 2 digits of each year, so a 4-digit-
+        year value like "2025-26" (vs the 2-digit "25-26" it was designed
+        for) only had "25-26" stripped, leaving the leading century digits
+        "20" behind un-stripped on BOTH sides. Two genuinely DIFFERENT
+        invoices (47 vs 36) that both happened to use this 4-digit-year
+        format then kept an identical leftover "20" fragment, inflating
+        similarity to ~0.78 — above the fuzzy-match (0.8 is close) and
+        well above the tds_gst (0.5) thresholds. Real numbers from the
+        client export: "47/HOC/2025-26" vs "36/HOC/2025/26".
+        """
+        wrong_pair_score = service._reference_similarity(
+            "47/HOC/2025-26", "36/HOC/2025/26"
+        )
+        correct_pair_score = service._reference_similarity(
+            "47/HOC/2025-26", "47/HOC/2025/26"
+        )
+        assert wrong_pair_score < 0.8, (
+            f"Different invoices (47 vs 36) sharing a 4-digit-year fiscal "
+            f"token scored {wrong_pair_score}, which must not be close "
+            "enough to plausibly clear a fuzzy-match threshold purely from "
+            "an incompletely-stripped leftover century fragment."
+        )
+        assert correct_pair_score > wrong_pair_score
+
+    def test_four_digit_year_span_strips_the_full_token_including_century(
+        self, service: ReconciliationEngineService
+    ):
+        """Direct check on the span detector: "2025-26" must be recognized
+        and stripped as ONE complete token (century + both 2-digit years),
+        not just the trailing "25-26" portion."""
+        spans = service._find_fiscal_year_spans("2025-26")
+        assert spans == [("202526", 0, 7)]
+
+    def test_four_digit_year_both_sides_strips_correctly(
+        self, service: ReconciliationEngineService
+    ):
+        """"2025-26" vs "2025/26" (same 4-digit fiscal year, different
+        separator) must strip to the SAME token on both sides."""
+        r1, r2 = service._strip_shared_fiscal_year(
+            "47/HOC/2025-26", "36/HOC/2025/26"
+        )
+        assert r1 == "47/HOC/"
+        assert r2 == "36/HOC/"
+
+    def test_digit_only_form_unaffected_by_century_prefix_support(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Safety regression: adding century-prefix support to the fiscal-
+        year pattern must NOT cause unrelated invoice digits immediately
+        preceding a valid 2-digit-year pair to be misread as a century —
+        e.g. in "1142526" (invoice "114" + fiscal year "2526"), the "14"
+        must never be swallowed as a fake century of the "25" that
+        follows it. Century prefix is restricted to the literal "19"/"20"
+        precisely to prevent this.
+        """
+        spans = service._find_fiscal_year_spans("1142526")
+        assert spans == [("2526", 3, 7)]
+
+        wrong_pair_score = service._reference_similarity("1142526", "2526 447")
+        correct_pair_score = service._reference_similarity("1142526", "2526 114")
+        assert wrong_pair_score < 0.5
+        assert correct_pair_score == 1.0
+
+    def test_mixed_2digit_and_4digit_year_not_falsely_equated(
+        self, service: ReconciliationEngineService
+    ):
+        """A 2-digit-year token ("25-26") and an unrelated 4-digit-year
+        token from a genuinely different fiscal year ("2026-27") must not
+        be treated as shared just because both are recognized as valid
+        fiscal-year tokens — _strip_shared_fiscal_year only strips when
+        the SAME token appears on both sides."""
+        r1, r2 = service._strip_shared_fiscal_year("114/25-26", "114/2026-27")
+        # Different tokens ("2526" vs "202627") -> nothing shared -> nothing stripped.
+        assert r1 == "114/25-26"
+        assert r2 == "114/2026-27"
+
 
 # ─── Full Execution Tests ─────────────────────────────────────────────────────
 
@@ -2242,6 +2324,37 @@ class TestCategoryGating:
         pairs = service._exact_match(company, vendor)
         assert len(pairs) == 0
 
+    def test_journal_category_does_not_cross_match_payment(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Client-confirmed bug: a company Payment (KZ) entry was cross-matched
+        against a vendor Journal (JE) entry purely on date+amount, reported
+        as "Date and Amount Matched" / "Reconciled". The mapping rules doc
+        never describes any cross-doctype matching except the one explicit
+        Debit Note <-> Credit Note exception — "Journal" must self-match
+        only, exactly like Payment/Receipt/TDS Adjusted, and must NOT be
+        treated as a wildcard category (unlike Unknown/Other/blank, which
+        exist only as placeholders for un-mapped data).
+        """
+        company = [_cat_entry("100000", "Payment", date(2025, 4, 23))]
+        vendor = [_cat_entry("-100000", "Journal", date(2025, 4, 24))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 0, (
+            "A Payment entry must not cross-match a Journal entry on "
+            "date+amount alone — different document types must not match."
+        )
+
+    def test_journal_category_still_matches_journal(
+        self, service: ReconciliationEngineService
+    ):
+        """Journal <-> Journal (same category, both sides) must still be
+        eligible for matching — only cross-doctype pairing is blocked."""
+        company = [_cat_entry("100000", "Journal", date(2025, 4, 23))]
+        vendor = [_cat_entry("-100000", "Journal", date(2025, 4, 24))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 1
+
     def test_wildcard_category_still_matches(
         self, service: ReconciliationEngineService
     ):
@@ -2251,6 +2364,122 @@ class TestCategoryGating:
         vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 15))]
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 1
+
+
+class TestInvoiceNumberNormalizedExactMatch:
+    """
+    Client-confirmed bug: company Assignment "114/25-26" and vendor Vch No.
+    "25-26 114" are the SAME invoice (114, fiscal year 25-26) written with
+    the components in a different order and a different separator. The
+    exact-match (Pass 1) and tolerance (Pass 2) passes keyed on the raw
+    string, so this pair could never clear either pass — it was demoted
+    all the way to the weaker Fuzzy Reference pass (Pass 3, confidence
+    capped at 70%, always needs manual confirmation) despite being an
+    unambiguous, zero-difference match. Fixed via a normalized invoice-
+    number key (fiscal-year token + separators stripped, case-folded) used
+    as a fallback ONLY when the raw string doesn't already match.
+    """
+
+    def test_exact_match_catches_reordered_invoice_number(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("-616226", "Invoice", date(2025, 4, 23), "114/25-26")]
+        vendor = [_cat_entry("616226", "Invoice", date(2025, 4, 23), "25-26 114")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 1.0
+        assert pairs[0].pass_number == MatchPassType.EXACT
+
+    def test_exact_match_still_requires_raw_match_when_no_fiscal_year_present(
+        self, service: ReconciliationEngineService
+    ):
+        """Two invoice numbers that merely differ in separator style but
+        carry NO fiscal-year token still must not silently collapse into
+        each other unless they normalize to the identical string — this
+        confirms normalization isn't a blanket fuzzy match."""
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "INV-100")]
+        vendor = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "INV-200")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_exact_match_normalized_key_is_purely_additive_fallback(
+        self, service: ReconciliationEngineService
+    ):
+        """When the raw string ALREADY matches, the normalized fallback
+        must not change or duplicate the result — still exactly one pair."""
+        company = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "INV-100")]
+        vendor = [_cat_entry("1000", "Invoice", date(2024, 3, 15), "INV-100")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 1
+
+    def test_exact_match_normalization_does_not_reintroduce_the_fixed_false_positive(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Safety regression: the normalized key must NEVER cause the exact
+        false-positive scenario the fiscal-year-stripping fix in
+        _tds_gst_match already resolved — two genuinely DIFFERENT invoices
+        (114 vs 447) that merely share a fiscal-year token must stay
+        unmatched here too.
+        """
+        company = [_cat_entry("-616226", "Invoice", date(2025, 5, 31), "114/25-26")]
+        vendor = [_cat_entry("685185", "Invoice", date(2025, 5, 31), "25-26 447")]
+        pairs = service._exact_match(company, vendor)
+        assert len(pairs) == 0
+
+    def test_tolerance_match_catches_reordered_invoice_number(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 2 (_tolerance_match) must recognize the same reordered
+        invoice number, including when there's a small tolerance-sized
+        gap (not just a zero-difference pair)."""
+        company = [_cat_entry("-616226", "Invoice", date(2025, 4, 23), "114/25-26")]
+        vendor = [_cat_entry("616230", "Invoice", date(2025, 4, 23), "25-26 114")]
+        pairs = service._tolerance_match(
+            company, vendor, tolerance=Decimal("10"),
+        )
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.TOLERANCE
+
+    def test_tolerance_match_normalization_does_not_reintroduce_the_fixed_false_positive(
+        self, service: ReconciliationEngineService
+    ):
+        company = [_cat_entry("-616226", "Invoice", date(2025, 5, 31), "114/25-26")]
+        vendor = [_cat_entry("616230", "Invoice", date(2025, 5, 31), "25-26 447")]
+        pairs = service._tolerance_match(
+            company, vendor, tolerance=Decimal("10"),
+        )
+        assert len(pairs) == 0
+
+    def test_amount_mismatch_match_catches_reordered_invoice_number(
+        self, service: ReconciliationEngineService
+    ):
+        """Pass 15 (_amount_mismatch_match) must recognize the same
+        reordered invoice number when the amount gap is real and
+        unexplained by TDS/GST."""
+        company = [_cat_entry("-100000", "Invoice", date(2024, 3, 15), "114/25-26")]
+        vendor = [_cat_entry("95000", "Invoice", date(2024, 3, 15), "25-26 114")]
+        pairs = service._amount_mismatch_match(company, vendor)
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.AMOUNT_MISMATCH
+
+    def test_normalized_key_helper_purely_fiscal_year_value_is_empty(
+        self, service: ReconciliationEngineService
+    ):
+        """A value that IS entirely the fiscal-year token normalizes to an
+        empty string, and must never be used as a match key (mirrors the
+        existing `if not invoice_number: continue` guards elsewhere) —
+        otherwise two genuinely different blank/placeholder invoice
+        numbers could collide on an empty normalized key."""
+        assert service._normalized_invoice_key("25-26") == ""
+        assert service._normalized_invoice_key("") == ""
+        assert service._normalized_invoice_key(None) == ""
+
+    def test_normalized_key_helper_case_and_separator_insensitive(
+        self, service: ReconciliationEngineService
+    ):
+        assert service._normalized_invoice_key("inv-100") == service._normalized_invoice_key("INV 100")
+        assert service._normalized_invoice_key("inv/100") == service._normalized_invoice_key("inv_100")
 
 
 class TestReversalBothSides:

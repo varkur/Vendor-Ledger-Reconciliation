@@ -38,13 +38,14 @@ from src.api.v1.endpoints.vlr.reconciliation_output_controller import (
 )
 
 
-def _mock_entry(document_category="", document_type="", is_tds=False):
+def _mock_entry(document_category="", document_type="", is_tds=False, pass_number=None):
     entry = MagicMock()
     entry.document_category = document_category
     entry.document_type = document_type
     entry.is_tds = is_tds
     entry.raw_data = None
     entry.description = ""
+    entry.pass_number = pass_number
     return entry
 
 
@@ -84,6 +85,30 @@ class TestParticularsGroupForEntry:
     def test_reversal_knockoff_excluded(self):
         e = _mock_entry(document_category="Knocking Off", document_type="AB")
         assert _particulars_group_for_entry(e) is None
+
+    def test_paired_sa_entry_excluded_as_reversal(self):
+        """An SA entry that actually netted via same-side pass 13
+        (_other_entry_match) is a genuine internal reversal and must stay
+        excluded from the difference groups, same as a knock-off."""
+        from src.domain.services.vlr.reconciliation_engine_service import (
+            OTHER_ENTRY_PASS,
+        )
+        e = _mock_entry(document_category="Adjusted", document_type="SA", pass_number=OTHER_ENTRY_PASS)
+        assert _particulars_group_for_entry(e) is None
+
+    def test_unpaired_sa_entry_is_a_genuine_difference_not_excluded(self):
+        """
+        Client-confirmed bug (screenshot): an UNPAIRED SA entry ("MSME
+        Interest", no same-side netting counterpart, pass_number None)
+        was being excluded from the difference groups purely because of
+        its raw doc type/category, exactly like a genuine same-side-netted
+        reversal — hiding a real open item. Per the mapping doc's Open Item
+        Status section, an unpaired SA entry is a genuine difference and
+        must fall through to normal classification (Other Differences),
+        not be silently dropped.
+        """
+        e = _mock_entry(document_category="Adjusted", document_type="SA", pass_number=None)
+        assert _particulars_group_for_entry(e) == "Other Differences"
 
     def test_different_groups_are_actually_distinguishable(self):
         # This is the crux of the original bug: every group used to
@@ -128,3 +153,39 @@ class TestGroupFilterParamDeclaredOnUnmatchedEndpoints:
             "param — the Particulars statement's per-group View links would "
             "have no way to scope results to a single group."
         )
+
+
+class TestGenuineUnmatchedConditionsExcludeOnlyKnockoffNotSA:
+    """
+    Client-confirmed bug (screenshot): _NON_DIFFERENCE_CATEGORIES /
+    _NON_DIFFERENCE_DOC_TYPES used to blanket-exclude ANY entry with
+    category "Adjusted" / doc type "SA" from the unmatched list, regardless
+    of match_id — so an unpaired SA entry ("MSME Interest", genuinely
+    match_id IS NULL) never showed up as unmatched anywhere, on top of being
+    mislabeled "Reversal Entries" in the export. Knock-off (category
+    "Knocking Off" / doc type "AB") IS correctly excluded by category/type
+    here as defense-in-depth (paired knock-offs get a match_id anyway), but
+    "Adjusted"/"SA" must NOT be — an unpaired SA entry only gets excluded by
+    match_id IS NOT NULL (i.e. it actually netted via pass 13).
+    """
+
+    def test_adjusted_category_not_in_non_difference_categories(self):
+        from src.api.v1.endpoints.vlr.reconciliation_output_controller import (
+            _NON_DIFFERENCE_CATEGORIES,
+        )
+        assert "Adjusted" not in _NON_DIFFERENCE_CATEGORIES
+
+    def test_sa_doc_type_not_in_non_difference_doc_types(self):
+        from src.api.v1.endpoints.vlr.reconciliation_output_controller import (
+            _NON_DIFFERENCE_DOC_TYPES,
+        )
+        assert "SA" not in _NON_DIFFERENCE_DOC_TYPES
+
+    def test_knocking_off_and_ab_still_excluded(self):
+        """Knock-off exclusion by category/doc-type must be unaffected."""
+        from src.api.v1.endpoints.vlr.reconciliation_output_controller import (
+            _NON_DIFFERENCE_CATEGORIES,
+            _NON_DIFFERENCE_DOC_TYPES,
+        )
+        assert "Knocking Off" in _NON_DIFFERENCE_CATEGORIES
+        assert "AB" in _NON_DIFFERENCE_DOC_TYPES

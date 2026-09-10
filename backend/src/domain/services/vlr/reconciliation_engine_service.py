@@ -249,6 +249,14 @@ NON_MATCHABLE_CATEGORIES: frozenset[str] = frozenset(
 #     correction: cross-category matching should not occur except where
 #     the doc explicitly requires it (Debit Note/Credit Note above).
 #   TDS Adjusted -> TDS Adjusted only
+#   Journal -> Journal only — "Journal" is a real, user-selected category
+#     (assigned via the Map Document Type / Document Types admin screen),
+#     NOT a placeholder for un-mapped data. It has no documented
+#     cross-category behavior in the mapping doc at all, so treating it as
+#     a wildcard let a company Payment (KZ) entry match a vendor Journal
+#     (JE) entry purely on date+amount — a real cross-doctype match the
+#     business explicitly said should never happen. Confirmed same-side
+#     self-only per the "no cross-doctype matching" rule.
 # A category not listed here is a wildcard (matches anything) so we never
 # block a match we're unsure about — we only block pairings we KNOW are
 # economically incompatible.
@@ -259,6 +267,7 @@ CATEGORY_COMPATIBILITY: dict[str, frozenset[str]] = {
     "Payment": frozenset({"Payment"}),
     "Receipt": frozenset({"Receipt"}),
     "TDS Adjusted": frozenset({"TDS Adjusted"}),
+    "Journal": frozenset({"Journal"}),
 }
 
 # "Adjusted" (SA / Other entry) is explicitly excluded from the wildcard set:
@@ -280,7 +289,14 @@ CATEGORY_COMPATIBILITY: dict[str, frozenset[str]] = {
 # collapsing match counts from ~340 to ~18 on a real case. "Other" must be
 # wildcard, not a known category, until the user explicitly maps it via the
 # Map Document Type screen.
-WILDCARD_CATEGORIES: frozenset[str] = frozenset({"Journal", "Unknown", "Other", ""})
+#
+# "Journal" is deliberately NOT in this wildcard set (see
+# CATEGORY_COMPATIBILITY above) — unlike "Other", it is never auto-assigned
+# as a fallback bucket; it only appears when a user explicitly maps a doc
+# type to "Journal" via the Document Types screen, or when the raw doc-type
+# text itself contains the word "journal" (_derive_category heuristic).
+# Either way it is a real, known category and must self-match only.
+WILDCARD_CATEGORIES: frozenset[str] = frozenset({"Unknown", "Other", ""})
 
 
 def _derive_category(document_type: str) -> str:
@@ -360,7 +376,9 @@ def _categories_compatible(cat_a: str, cat_b: str) -> bool:
 
     - Non-matchable / self-only categories (balances, knock-offs, "Adjusted"
       other-entries) never cross-match.
-    - Wildcard categories (journal/unknown) match anything else.
+    - Wildcard categories (unknown/other/blank — un-mapped data only) match
+      anything else. "Journal" is a known category, not a wildcard, and
+      self-matches only.
     - Otherwise both sides must appear in each other's compatibility set.
     """
     if cat_a in NON_MATCHABLE_CATEGORIES or cat_b in NON_MATCHABLE_CATEGORIES:
@@ -1309,9 +1327,17 @@ class ReconciliationEngineService:
         pairs: list[MatchPair] = []
         used_vendor_ids: set[UUID] = set()
 
-        # Build a lookup for vendor entries by (amount, date, invoice number).
+        # Build a lookup for vendor entries by (amount, date, invoice number)
+        # — the raw string, for a true byte-for-byte exact match — AND a
+        # second lookup keyed on the NORMALIZED invoice number (fiscal-year
+        # token + separators stripped, case-folded), so two invoice numbers
+        # that are the same invoice written in a different component order
+        # or separator style ("114/25-26" vs "25-26 114") still clear this
+        # pass instead of being demoted to the weaker Fuzzy Reference pass
+        # (confidence capped at 70%, always needs manual confirmation).
         # Only matchable entries participate (excludes balances/knock-offs/SA).
         vendor_lookup: dict[tuple, list[LedgerEntryData]] = {}
+        vendor_lookup_normalized: dict[tuple, list[LedgerEntryData]] = {}
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
@@ -1324,6 +1350,10 @@ class ReconciliationEngineService:
             # fall through to the weaker _amount_date_match pass instead.
             key = (abs(v_entry.amount), v_entry.posting_date, v_entry.invoice_number)
             vendor_lookup.setdefault(key, []).append(v_entry)
+            norm = self._normalized_invoice_key(v_entry.invoice_number)
+            if norm:
+                norm_key = (abs(v_entry.amount), v_entry.posting_date, norm)
+                vendor_lookup_normalized.setdefault(norm_key, []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
@@ -1332,6 +1362,14 @@ class ReconciliationEngineService:
                 continue
             key = (abs(c_entry.amount), c_entry.posting_date, c_entry.invoice_number)
             candidates = vendor_lookup.get(key, [])
+            if not candidates:
+                # Fall back to the normalized key only when the raw string
+                # didn't already match — the raw exact-string check always
+                # takes priority so this normalization is purely additive.
+                norm = self._normalized_invoice_key(c_entry.invoice_number)
+                if norm:
+                    norm_key = (abs(c_entry.amount), c_entry.posting_date, norm)
+                    candidates = vendor_lookup_normalized.get(norm_key, [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
                     continue
@@ -1412,8 +1450,13 @@ class ReconciliationEngineService:
         # Build a lookup for vendor entries by (document date, invoice
         # number) — NOT amount, since the whole point of this pass is that
         # the amounts differ. `posting_date` here holds the DOCUMENT DATE
-        # (see docstring above), not the raw SAP posting date.
+        # (see docstring above), not the raw SAP posting date. Also builds
+        # a normalized-key lookup (see _normalized_invoice_key) so a same
+        # invoice number written in a different component order/separator
+        # is still recognized as the same invoice for this pass, same
+        # rationale as _exact_match/_tolerance_match.
         vendor_lookup: dict[tuple, list[LedgerEntryData]] = {}
+        vendor_lookup_normalized: dict[tuple, list[LedgerEntryData]] = {}
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
@@ -1421,6 +1464,9 @@ class ReconciliationEngineService:
                 continue
             key = (v_entry.posting_date, v_entry.invoice_number)
             vendor_lookup.setdefault(key, []).append(v_entry)
+            norm = self._normalized_invoice_key(v_entry.invoice_number)
+            if norm:
+                vendor_lookup_normalized.setdefault((v_entry.posting_date, norm), []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
@@ -1429,6 +1475,10 @@ class ReconciliationEngineService:
                 continue
             key = (c_entry.posting_date, c_entry.invoice_number)
             candidates = vendor_lookup.get(key, [])
+            if not candidates:
+                norm = self._normalized_invoice_key(c_entry.invoice_number)
+                if norm:
+                    candidates = vendor_lookup_normalized.get((c_entry.posting_date, norm), [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
                     continue
@@ -1686,14 +1736,23 @@ class ReconciliationEngineService:
         tds_max_frac = tds_percentage / Decimal("100") if tds_percentage > 0 else Decimal("0")
         gst_frac = gst_percentage / Decimal("100") if gst_percentage > 0 else Decimal("0")
 
-        # Build invoice-number lookup for vendor entries (matchable only).
+        # Build invoice-number lookup for vendor entries (matchable only) —
+        # by raw string AND by normalized key (see _normalized_invoice_key),
+        # same rationale as _exact_match: a same invoice number written in
+        # a different component order/separator ("114/25-26" vs "25-26
+        # 114") must still clear this pass rather than being demoted to
+        # the weaker Fuzzy Reference pass.
         vendor_by_ref: dict[str, list[LedgerEntryData]] = {}
+        vendor_by_ref_normalized: dict[str, list[LedgerEntryData]] = {}
         for v_entry in vendor:
             if not _is_matchable(v_entry):
                 continue
             if not v_entry.invoice_number:
                 continue
             vendor_by_ref.setdefault(v_entry.invoice_number, []).append(v_entry)
+            norm = self._normalized_invoice_key(v_entry.invoice_number)
+            if norm:
+                vendor_by_ref_normalized.setdefault(norm, []).append(v_entry)
 
         for c_entry in company:
             if not _is_matchable(c_entry):
@@ -1701,6 +1760,13 @@ class ReconciliationEngineService:
             if not c_entry.invoice_number:
                 continue
             candidates = vendor_by_ref.get(c_entry.invoice_number, [])
+            if not candidates:
+                # Raw string didn't match — fall back to the normalized
+                # key. The raw exact-string check always takes priority so
+                # this normalization is purely additive.
+                norm = self._normalized_invoice_key(c_entry.invoice_number)
+                if norm:
+                    candidates = vendor_by_ref_normalized.get(norm, [])
             for v_entry in candidates:
                 if v_entry.id in used_vendor_ids:
                     continue
@@ -2276,34 +2342,168 @@ class ReconciliationEngineService:
     # Reference Similarity
     # ──────────────────────────────────────────────────────────────────────
 
-    # Matches a 2-digit year followed by an optional single separator
-    # (hyphen, slash, or space) followed by the next 2-digit year, e.g.
-    # "25-26", "25/26", "25 26", or the CLEAN-derived digit-only "2526".
-    # Built with a lookahead so overlapping candidate positions are all
-    # considered (finditer alone would skip past a match and miss a
-    # fiscal-year token that starts partway through another digit run,
-    # e.g. the "2526" inside "1142526").
-    _FISCAL_YEAR_PATTERN = re.compile(r"(?=(\d{2})([-/\s]?)(\d{2}))")
+    # Matches a 2-digit year, with an OPTIONAL 2-digit century prefix,
+    # followed by an optional single separator (hyphen, slash, or space),
+    # followed by the next 2-digit year (also with an optional century
+    # prefix), e.g. "25-26", "25/26", "25 26", "2025-26", "2025/26",
+    # "2025-2026", or the CLEAN-derived digit-only "2526". Built with a
+    # lookahead so overlapping candidate positions are all considered
+    # (finditer alone would skip past a match and miss a fiscal-year token
+    # that starts partway through another digit run, e.g. the "2526"
+    # inside "1142526").
+    #
+    # Bug fix: the previous pattern only ever captured the TRAILING 2
+    # digits of each year, so a 4-digit-year value like "2025-26" matched
+    # via the overlapping-lookahead scan starting at the "25" (not the
+    # "20"), stripping only "25-26" and leaving the leading "20" behind.
+    # Two DIFFERENT invoice numbers that both happen to use this 4-digit-
+    # year format then kept an identical leftover "20" fragment after
+    # stripping, artificially inflating their SequenceMatcher similarity
+    # (client-confirmed real case: "47/HOC/2025-26" vs "36/HOC/2025/26"
+    # scored 0.78 similarity — above several matching thresholds — purely
+    # from the shared, incompletely-stripped "20" prefix, not genuine
+    # invoice similarity). The optional century-prefix groups now let the
+    # WHOLE 4-digit year get captured and stripped, not just its tail.
+    # The optional century prefix is restricted to the LITERAL "19" or
+    # "20" (not an arbitrary \d{2}) — real invoice dates in this business
+    # domain are all 1900s/2000s, and restricting to a literal century
+    # value (rather than "any 2 digits") prevents unrelated invoice digits
+    # that merely happen to precede a valid 2-digit year pair from being
+    # misread as a century prefix (e.g. invoice "114" followed by year
+    # "25" must NOT have its "14" swallowed as a fake century of "25").
+    _FISCAL_YEAR_PATTERN = re.compile(
+        r"(?=(19|20)?(\d{2})([-/\s]?)(19|20)?(\d{2}))"
+    )
+
+    # Separators commonly used to punctuate an invoice number (hyphen,
+    # slash, underscore, dot, whitespace) — stripped during normalization
+    # so purely-cosmetic formatting differences (e.g. component order,
+    # separator choice) don't block an exact-match lookup. Deliberately
+    # does NOT strip alphanumeric characters — only separator punctuation.
+    _INVOICE_SEPARATOR_PATTERN = re.compile(r"[\s\-/_.]+")
+
+    @classmethod
+    def _normalized_invoice_key(cls, value: str) -> str:
+        """
+        Canonical invoice-number key for EXACT-equality lookups (Pass 1
+        _exact_match, Pass 2 _tolerance_match), tolerant of purely cosmetic
+        formatting differences between company and vendor systems.
+
+        Client-confirmed bug: company Assignment "114/25-26" and vendor Vch
+        No. "25-26 114" are the SAME invoice (114, fiscal year 25-26) with
+        the components in a different order and a different separator —
+        but the exact-match/tolerance passes key on the raw string, so this
+        pair could never clear those passes and was demoted all the way to
+        the weaker Fuzzy Reference pass (confidence capped at 70%, always
+        needs manual confirmation) despite being an unambiguous, zero-
+        difference match.
+
+        Normalization applied, in order:
+          1. Strip the fiscal-year token (e.g. "25-26"/"2526") using the
+             SAME `_find_fiscal_year_spans` detector _strip_shared_fiscal_year
+             uses — a real fiscal-year token is recognized structurally
+             (two consecutive 2-digit years, second = first+1), not by
+             guessing at position, so this doesn't accidentally eat real
+             invoice digits that happen to look year-like only when they
+             ALSO appear elsewhere in the string coincidentally more than
+             once (see safety note below).
+          2. Strip separator punctuation (space, hyphen, slash, underscore,
+             dot) so "-", "/", " " differences collapse.
+          3. Uppercase, so case differences ("inv" vs "INV") don't matter.
+
+        SAFETY — why this does not increase false-positive risk:
+          - This is intentionally NARROWER than the fuzzy-similarity check
+            used by Pass 3 (which accepts a >0.8 SequenceMatcher ratio —
+            an approximate, position-independent score). This function
+            instead produces a single canonical string; two invoice
+            numbers must become EXACTLY equal after normalization to be
+            treated as the same invoice by Pass 1/2 — no partial-credit
+            fuzziness is introduced into the exact-match tier.
+          - The fiscal-year stripping only removes a token that
+            STRUCTURALLY looks like a fiscal year (consecutive N, N+1 two-
+            digit years) — it does not remove arbitrary digit runs, so two
+            DIFFERENT invoice numbers that don't share that exact
+            structural pattern are never coincidentally collapsed together
+            (e.g. "114" vs "447" stay "114" vs "447" — confirmed via the
+            existing regression test that these must NOT fuzzy-match; this
+            normalization doesn't touch that outcome since neither string
+            contains a fiscal-year token to strip once isolated from a
+            shared prefix — see _strip_shared_fiscal_year's own "only when
+            BOTH sides share the token" gate, mirrored here since this
+            function only strips a token that independently matches the
+            fiscal-year structural pattern on its OWN string, never one
+            borrowed from the other side).
+          - A value that normalizes to an EMPTY string (e.g. the raw value
+            was purely a fiscal-year token like "25-26" with nothing else)
+            is never used as a match key — callers must still gate on the
+            normalized key being non-empty, exactly like the existing
+            `if not entry.invoice_number: continue` guards, so two
+            genuinely different blank/placeholder invoice numbers can never
+            collide on an empty string.
+        """
+        if not value:
+            return ""
+        spans = cls._find_fiscal_year_spans(value)
+        s = value
+        for token, start, end in sorted(spans, key=lambda sp: sp[1], reverse=True):
+            s = s[:start] + s[end:]
+        s = cls._INVOICE_SEPARATOR_PATTERN.sub("", s)
+        return s.strip().upper()
 
     @classmethod
     def _find_fiscal_year_spans(cls, value: str) -> list[tuple[str, int, int]]:
         """
         Find substrings that look like a fiscal-year token (two consecutive
         2-digit years, the second being the first + 1, wrapping at year
-        100 — e.g. "25-26", "2526", "99-00"), across BOTH the raw
-        Assignment-style format ("114/25-26") and the CLEAN-derived
+        100 — e.g. "25-26", "2526", "99-00"), across the raw
+        Assignment-style 2-digit-year format ("114/25-26"), a 4-digit-year
+        variant ("114/2025-26", "114/2025/2026"), and the CLEAN-derived
         digit-only format ("1142526"). Returns (normalized_token, start,
-        end) tuples so the exact matched span (including any separator)
-        can be stripped from the original string.
+        end) tuples so the exact matched span — including any separator
+        AND any century-prefix digits actually present — can be fully
+        stripped from the original string.
+
+        The lookahead pattern generates an overlapping candidate at EVERY
+        position a valid token could start, so a 4-digit-year value like
+        "2025-26" produces TWO valid candidates: the full "2025-26" (start
+        0) and the nested "25-26" (start 2, both years read as their
+        trailing 2 digits). Only the LONGER (century-inclusive) span is
+        kept when candidates overlap — this is what fixed the real bug:
+        previously (before century-prefix support existed) only the
+        shorter nested match was found at all, so a leading century
+        fragment ("20") was left un-stripped, artificially inflating
+        SequenceMatcher similarity between two otherwise-different invoice
+        numbers that happened to share that leftover fragment.
         """
-        spans: list[tuple[str, int, int]] = []
+        candidates: list[tuple[str, int, int, int]] = []
         for m in cls._FISCAL_YEAR_PATTERN.finditer(value):
-            a, b = int(m.group(1)), int(m.group(3))
-            if b == (a + 1) % 100:
-                start = m.start()
-                end = start + 2 + len(m.group(2)) + 2
-                spans.append((m.group(1) + m.group(3), start, end))
-        return spans
+            century1, y1, sep, century2, y2 = m.groups()
+            a, b = int(y1), int(y2)
+            if b != (a + 1) % 100:
+                continue
+            start = m.start()
+            length = (
+                (len(century1) if century1 else 0)
+                + 2
+                + len(sep)
+                + (len(century2) if century2 else 0)
+                + 2
+            )
+            end = start + length
+            token = (century1 or "") + y1 + (century2 or "") + y2
+            candidates.append((token, start, end, length))
+
+        # Prefer longer (more specific, century-inclusive) spans; discard
+        # any candidate that overlaps an already-selected longer span.
+        candidates.sort(key=lambda c: (-c[3], c[1]))
+        selected: list[tuple[str, int, int]] = []
+        for token, start, end, _length in candidates:
+            if any(start < s_end and s_start < end for (_t, s_start, s_end) in selected):
+                continue
+            selected.append((token, start, end))
+
+        selected.sort(key=lambda sp: sp[1])
+        return selected
 
     @classmethod
     def _strip_shared_fiscal_year(cls, ref1: str, ref2: str) -> tuple[str, str]:

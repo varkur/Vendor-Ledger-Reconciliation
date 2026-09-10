@@ -25,6 +25,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from src.domain.services.vlr.reconciliation_engine_service import (
+    OTHER_ENTRY_PASS,
     MatchPassType,
     _is_tax_band_gap,
 )
@@ -188,17 +189,23 @@ def _status(
 
     if pn == MatchPassType.AMOUNT_MISMATCH:
         # Same invoice number AND same date on both sides (see
-        # _amount_mismatch_match in reconciliation_engine_service.py) — the
-        # pair IS matched/settled (Status = Reconciled, same as every
-        # other successfully-paired entry), but the CLASSIFICATION carries
-        # the caveat that the values don't tie out and no tax rate explains
-        # it — that's "Amount Mismatch" (see PASS_CLASSIFICATION above).
-        # Status answers "is this settled" (Reconciled/TDS Booked by.../
-        # Write off/Manually Mapped); Classification answers "how/why was
-        # it matched" (Invoice Number Matched/Date and Amount Matched/
-        # Amount Mismatch). Putting "Amount Mismatch" in Status broke that
-        # pattern for this one pass — corrected per explicit instruction.
-        return "Reconciled"
+        # _amount_mismatch_match in reconciliation_engine_service.py), but
+        # the amount gap is NOT explained by the configured TDS/GST rate.
+        #
+        # Per explicit correction: do NOT report this as "Reconciled" —
+        # the pair is linked/identified as the same invoice for review
+        # purposes, but the money does not actually tie out, so Status
+        # must say so. Status is now "Amount Mismatch" whenever the gap
+        # exceeds the configured TDS tolerance band; the defensive
+        # tax-band check below only fires if a gap somehow reaches this
+        # pass despite genuinely matching a configured rate (shouldn't
+        # normally happen — _amount_mismatch_match itself already skips
+        # tax-explained gaps before creating this pass's pairs — but kept
+        # here so Status/Classification never disagree if that ever
+        # changes).
+        if c_amt > 0 and p_amt > 0 and _matches_tax_amount(abs(difference)):
+            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+        return "Amount Mismatch"
     if pn == 2 and abs(difference) > 0.005:
         # Pass 2 (_tolerance_match) now covers both small rounding
         # differences AND TDS/GST-sized gaps on an exact invoice-number
@@ -226,6 +233,28 @@ def _status(
             if _matches_tax_amount(abs(difference)):
                 return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
             return "Unexplained Amount Gap"
+        return "Reconciled"
+    if pn == MatchPassType.TOLERANCE_DATE:
+        # Client-confirmed bug (screenshot): "Date Range and Amount Matched"
+        # rows with a genuine TDS-range gap (e.g. company 50780 vs vendor
+        # 51656, diff 876) showed Status "Reconciled" — this pass had NO
+        # tax-band check at all, unlike pass 2/TDS_GST above, so a real TDS
+        # deduction went unreported. Same side-attribution rule: the side
+        # with the SMALLER absolute amount had tax withheld/deducted from
+        # it, so that side "booked" the TDS.
+        if c_amt > 0 and p_amt > 0 and _matches_tax_amount(abs(difference)):
+            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+        # Per explicit correction (same treatment as pass 15/AMOUNT_MISMATCH
+        # above): this pass is the weakest matching tier — no exact amount,
+        # no invoice-number correlation at all, matched purely on amount-
+        # within-tolerance + date proximity. A genuine, non-negligible gap
+        # that isn't explained by the configured TDS/GST rate must NOT be
+        # reported as "Reconciled" — that overstates how settled the pair
+        # actually is. A truly negligible/rounding-level gap (<= a paisa,
+        # same 0.005 threshold used elsewhere in this module) still counts
+        # as settled.
+        if abs(difference) > 0.005:
+            return "Amount Mismatch"
         return "Reconciled"
     return "Reconciled"
 
@@ -315,10 +344,21 @@ def _special_classification(entry) -> str | None:
         return "Reversal Entries"
 
     # "Other entry" (SA) rows — per the mapping doc these are internal to
-    # each side and only net against other SA entries on the same side, so
-    # an unmatched one is not a genuine "not booked by X" difference.
+    # each side and only net against ANOTHER SA entry on the same side
+    # (_other_entry_match / OTHER_ENTRY_PASS). An UNPAIRED SA entry (no
+    # same-side counterpart of equal & opposite amount — never actually
+    # matched via that same-side-netting pass) is NOT an internal reversal;
+    # it is a genuine open item. Client-confirmed bug: an unmatched SA entry
+    # (e.g. "MSME Interest", amount -664.73, no counterpart) kept showing
+    # under "Reversal Entries" purely because of its raw doc type/category,
+    # even though it never netted against anything. Per the mapping doc's
+    # own "Open Item Status" section ("Remaining entries open from Emcure/
+    # vendor, then other entry not booked by vendor/company"), an unpaired
+    # SA entry must fall through to normal open-item classification (Other
+    # Differences / "Other entry not booked by Company/Party") so it shows
+    # up as a genuine unmatched entry, not a hidden reversal.
     cat = (getattr(entry, "document_category", "") or "").strip()
-    if dtype == "sa" or cat == "Adjusted":
+    if (dtype == "sa" or cat == "Adjusted") and getattr(entry, "pass_number", None) == OTHER_ENTRY_PASS:
         return "Reversal Entries"
 
     # TDS entries (tagged by the transformation pass, or doc type/remark = TDS).
@@ -1013,21 +1053,6 @@ class ReconciliationExportService:
                 agg[1] += 1
             return out
 
-        def matched_bucket(entries, side):
-            """Aggregate MATCHED entries (have a match_id) into a total per side.
-            Excludes balance rows. Returns [amount_sum, count]."""
-            amt = Decimal("0")
-            cnt = 0
-            for e in entries:
-                if not getattr(e, "match_id", None):
-                    continue
-                cat = (getattr(e, "document_category", "") or "").strip()
-                if cat in ("Opening Balance", "Closing Balance"):
-                    continue
-                amt += Decimal(str(_num(getattr(e, "amount", 0))))
-                cnt += 1
-            return [amt, cnt]
-
         comp_buckets = bucket(company_entries, "company")
         party_buckets = bucket(vendor_entries, "party")
 
@@ -1115,46 +1140,27 @@ class ReconciliationExportService:
             )
 
         # ── Reconciled (matched) section ──
-        # Every matched entry is accounted for here so the No. of Entries totals
-        # cover the full ledgers (matched + unmatched + balances).
-        comp_matched = matched_bucket(company_entries, "company")
-        party_matched = matched_bucket(vendor_entries, "party")
-        if comp_matched[1] or party_matched[1]:
-            matched_amt = comp_matched[0] + party_matched[0]
-            matched_cnt = comp_matched[1] + party_matched[1]
-            row = self._summary_group(
-                ws, row, "Reconciled Entries",
-                total_amount=matched_amt, total_count=matched_cnt,
-                detail_lines=[
-                    ("Reconciled - Company", None, comp_matched[0], comp_matched[1], "", "company"),
-                    ("Reconciled - Party", None, party_matched[0], party_matched[1], "", "party"),
-                ],
-            )
+        # Client-reported bug: this section re-summed the SAME matched-pair
+        # amounts that a residual (TDS deducted / rounding write-off /
+        # Amount Mismatch) is already itemised under via
+        # matched_residual_bucket above — a fully-cancelling pair nets to
+        # 0 and contributes nothing, but a pair WITH a residual shows that
+        # exact residual amount a second time under "Reconciled - Company/
+        # Party", creating a double effect on the Summary sheet. Removed
+        # per explicit correction: matched entries with a residual are
+        # already covered by their own difference group; matched entries
+        # with NO residual net to zero and add no information here.
 
-        # ── Amount Unsettled (balancing) section ──
-        # The itemised differences should fully explain the closing-balance
-        # difference. Any leftover is the unexplained/"unsettled" amount. Show
-        # it as an explicit line so the final Difference nets to zero.
-        residual = closing_diff - total_diff_amount
-        if residual != 0:
-            # Sign convention: a positive residual means the company side is
-            # higher (vendor still owes / vendor unsettled); negative the reverse.
-            if residual > 0:
-                unsettled_label = "Amount Unsettled by Vendor"
-                unsettled_side = "party"
-            else:
-                unsettled_label = "Amount Unsettled by Company"
-                unsettled_side = "company"
-            row = self._summary_group(
-                ws, row, unsettled_label,
-                total_amount=residual, total_count=None,
-                detail_lines=[
-                    (unsettled_label, None, residual, None,
-                     "To be settled / adjusted between Company and Vendor", unsettled_side),
-                ],
-            )
-            # Roll the residual into the itemised total so the balance closes.
-            total_diff_amount += residual
+        # ── Amount Unsettled section removed ──
+        # This was a forced balancing plug (`closing_diff - total_diff_amount`)
+        # with no linked annexure and no real entry count, inserted purely to
+        # make the final "Difference" row show zero. Per explicit correction,
+        # the Summary sheet must only reflect genuine open items/differences
+        # that were actually classified — not a fabricated residual used to
+        # force a balance. The "Difference" row below can now be non-zero
+        # when the itemised differences don't fully explain the closing-
+        # balance gap (e.g. data not yet mapped/classified); that gap is
+        # exactly what should be surfaced, not hidden by a plug line.
 
         # ── Total Entries check row ──
         total_all_entries = len(company_entries) + len(vendor_entries)
@@ -1175,8 +1181,11 @@ class ReconciliationExportService:
         ws.cell(row=row, column=3).font = BOLD
         row += 1
 
-        # After adding the unsettled line, the calculated balance equals the
-        # closing-balance difference, so the final Difference is zero.
+        # No forced balancing plug — "Difference" is the HONEST gap between
+        # the closing-balance difference and what the itemised categories
+        # actually explain. A non-zero value here is a real signal (data not
+        # yet classified/mapped) that should be visible, not hidden by
+        # inserting a fabricated "Amount Unsettled" line to zero it out.
         final_difference = closing_diff - total_diff_amount
         ws.cell(row=row, column=1, value="Difference")
         for c in range(1, 6):
@@ -1278,19 +1287,28 @@ _MATCHED_RESIDUAL_INFO: dict[str, tuple[str, str]] = {
         "Unexplained Amount Gap Difference",
         "Finance to review - matched pair's gap does not match the configured TDS/GST rate",
     ),
+    # Status "Amount Mismatch" is now reported by TWO passes, per explicit
+    # correction that a genuine unexplained gap must never be reported as
+    # "Reconciled" (settled):
+    #   - Pass 15 (AMOUNT_MISMATCH): same invoice number + same document
+    #     date on both sides, gap NOT explained by TDS/GST.
+    #   - Pass 12 (TOLERANCE_DATE, "Date Range and Amount Matched"): the
+    #     weakest matching tier — no exact amount, no invoice-number
+    #     correlation at all — previously always reported "Reconciled"
+    #     even for a large, unexplained gap.
+    "Amount Mismatch": (
+        "Amount Mismatch Difference",
+        "Finance to review - invoice number and date match but amount differs",
+    ),
 }
 
-# Classification -> (Summary group, Action Required text) for MATCHED pairs
-# whose Status is the plain "Reconciled" (the pair IS settled/matched) but
-# whose Classification carries a caveat worth surfacing on the Summary sheet.
-# Pass 15 (AMOUNT_MISMATCH): same invoice number + same document date on both
-# sides, gap not explained by TDS/GST (see _amount_mismatch_match in
-# reconciliation_engine_service.py) — Status = "Reconciled" (it IS matched),
-# Classification = "Amount Mismatch" (why it's worth a second look). Looked
-# up separately from _MATCHED_RESIDUAL_INFO above because this one keys off
-# Classification, not Status — every other entry in that dict has ITS OWN
-# distinct Status value, but Amount Mismatch deliberately shares "Reconciled"
-# with every clean match, so it can't be distinguished by Status alone.
+# Classification -> (Summary group, Action Required text) fallback for
+# matched pairs whose Status doesn't already have an entry in
+# _MATCHED_RESIDUAL_INFO above. Per explicit correction, pass 15
+# (AMOUNT_MISMATCH) now reports Status = "Amount Mismatch" directly (it used
+# to always report "Reconciled" with the caveat living only in
+# Classification) — so it's found via the primary Status-keyed lookup above
+# in the normal case. This dict is kept as a defensive fallback only.
 _MATCHED_RESIDUAL_INFO_BY_CLASSIFICATION: dict[str, tuple[str, str]] = {
     "Amount Mismatch": (
         "Amount Mismatch Difference",

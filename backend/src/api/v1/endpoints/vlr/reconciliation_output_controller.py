@@ -100,14 +100,26 @@ async def _verify_case_exists(
 
 
 # Document categories that are NOT genuine cross-ledger differences: balance
-# markers, knock-off / reversal (SAP "AB") entries, and "Other entry"
-# (SA / Adjusted) rows. Knock-off and SA entries each net ONLY within their
-# own side (per the Vendor Ledger Mapping Rules doc) — they are excluded from
-# the "unmatched" definition everywhere so the unmatched list, the analytics
-# count, and the reconciliation statement all agree. Kept in sync with
+# markers and knock-off / reversal (SAP "AB") entries. Knock-off entries net
+# ONLY within their own side (per the Vendor Ledger Mapping Rules doc) —
+# matched knock-off pairs already get a match_id via _reversal_match, so
+# match_id IS NULL alone already excludes them; this list additionally
+# excludes them by category/doc-type as defense in depth.
+#
+# "Other entry" (SA / Adjusted) rows are DELIBERATELY NOT in this list.
+# Client-confirmed bug: an unpaired SA entry (e.g. "MSME Interest", no
+# same-side netting counterpart) was blanket-excluded from ever appearing
+# as unmatched purely by category/doc-type, regardless of whether it
+# actually netted against anything — hiding a genuine open item. A SA entry
+# that DID net via _other_entry_match already carries a match_id (set by
+# bulk_update_match), so match_id IS NULL alone correctly identifies only
+# the genuinely UNPAIRED SA entries here, which per the mapping doc's Open
+# Item Status section ("Remaining entries open from Emcure/vendor, then
+# other entry not booked by vendor/company") are real differences and must
+# surface in the unmatched list. Kept in sync with
 # reconciliation_export_service._special_classification.
-_NON_DIFFERENCE_CATEGORIES = ["Opening Balance", "Closing Balance", "Knocking Off", "Adjusted"]
-_NON_DIFFERENCE_DOC_TYPES = ["AB", "SA"]
+_NON_DIFFERENCE_CATEGORIES = ["Opening Balance", "Closing Balance", "Knocking Off"]
+_NON_DIFFERENCE_DOC_TYPES = ["AB"]
 
 # Pass-number groups for "auto-accepted" vs "needs finance confirmation",
 # mirroring the engine's is_auto_accepted logic in
@@ -116,9 +128,14 @@ _NON_DIFFERENCE_DOC_TYPES = ["AB", "SA"]
 # EXACT/TOLERANCE; TOLERANCE_DATE (6.5) is the weakest tier and always needs
 # review alongside FUZZY_REFERENCE/ONE_TO_MANY/MANY_TO_ONE/DATE_PROXIMITY.
 # Same-side netting passes (9=Knocking Off, 13=Other entry/SA) are their own
-# entry-intrinsic category — excluded from BOTH lists via
-# _NON_DIFFERENCE_CATEGORIES/_NON_DIFFERENCE_DOC_TYPES above rather than
-# counted as "Matched", so they don't inflate the Matched-rate KPI.
+# entry-intrinsic category — excluded from both these lists (they aren't
+# counted as "Matched" so they don't inflate the Matched-rate KPI). Knock-off
+# (pass 9) is additionally excluded from the unmatched list by category/doc-
+# type via _NON_DIFFERENCE_CATEGORIES/_NON_DIFFERENCE_DOC_TYPES above; "Other
+# entry"/SA (pass 13) is excluded from unmatched ONLY via match_id IS NOT
+# NULL (an unpaired SA entry with no match_id is a genuine open item and
+# must appear in the unmatched list — see _NON_DIFFERENCE_CATEGORIES comment
+# above).
 # Defined once here so every "Matched" / "Recommended" count across the
 # dashboard, analytics, and tab endpoints stays in sync — previously these
 # were hardcoded as raw [1, 2] / [3, 4, 5, 6] lists that silently excluded
