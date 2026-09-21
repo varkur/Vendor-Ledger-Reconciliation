@@ -180,7 +180,7 @@ def _genuine_unmatched_conditions(case_id: UUID, side: str) -> list:
     return conds
 
 
-def _particulars_group_for_entry(entry) -> str | None:
+def _particulars_group_for_entry(entry, side: str | None = None) -> str | None:
     """
     Classify one unmatched ledger entry into its Particulars-statement
     difference group label (e.g. "Invoice Difference", "Other Differences"),
@@ -193,6 +193,13 @@ def _particulars_group_for_entry(entry) -> str | None:
     the full unmatched list — bug fix: previously every group's View button
     routed to the same unfiltered unmatched-company view, so every group
     "tab" displayed identical invoices.
+
+    `side` ("company" or "party") is passed through to _special_classification
+    so a company-ledger TDS entry is still recognized as TDS regardless of
+    which side it's on (see that function's side-attribution fix) — this
+    function only needs the GROUP label, which is the same "TDS / TCS
+    Difference" either way, but the underlying is-this-TDS check must still
+    match on side to avoid missing company-side TDS entries.
     """
     from src.domain.services.vlr.reconciliation_export_service import (
         CATEGORY_TO_SUMMARY,
@@ -203,7 +210,7 @@ def _particulars_group_for_entry(entry) -> str | None:
     cat = (getattr(entry, "document_category", "") or "").strip()
     if cat in ("Opening Balance", "Closing Balance"):
         return None
-    special = _special_classification(entry)
+    special = _special_classification(entry, side)
     if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
         return None
     # Bug fix: this was missing the same TDS special-case override that
@@ -216,7 +223,7 @@ def _particulars_group_for_entry(entry) -> str | None:
     # group_filter match and never showed up when a user clicked "View" on
     # TDS / TCS Difference — the statement's count included it, but the
     # drill-in returned zero results for that entry.
-    if special == "TDS Booked by Party":
+    if special in ("TDS Booked by Party", "TDS Booked by Company"):
         info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
     else:
         info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
@@ -763,7 +770,7 @@ async def get_unmatched_company(
         all_entries = list(all_result.scalars().all())
         entries_filtered = [
             e for e in all_entries
-            if _particulars_group_for_entry(e) == group_filter.strip()
+            if _particulars_group_for_entry(e, "company") == group_filter.strip()
         ]
         total = len(entries_filtered)
         offset = (page - 1) * page_size
@@ -882,7 +889,7 @@ async def get_unmatched_vendor(
         all_entries = list(all_result.scalars().all())
         entries_filtered = [
             e for e in all_entries
-            if _particulars_group_for_entry(e) == group_filter.strip()
+            if _particulars_group_for_entry(e, "party") == group_filter.strip()
         ]
         total = len(entries_filtered)
         offset = (page - 1) * page_size
@@ -1431,7 +1438,7 @@ async def get_reconciliation_particulars(
             cat = (getattr(e, "document_category", "") or "").strip()
             if cat in ("Opening Balance", "Closing Balance"):
                 continue
-            special = _special_classification(e)
+            special = _special_classification(e, side)
             if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                 continue
             # Bug fix: an unmatched TDS entry must roll up under "TDS / TCS
@@ -1441,7 +1448,11 @@ async def get_reconciliation_particulars(
             # missing the same special-case, so unmatched TDS entries fell
             # through to "Other Differences" on-screen while the exported
             # workbook correctly grouped them under TDS / TCS Difference).
-            if special == "TDS Booked by Party":
+            # Checks both TDS labels since `special` is now side-aware (see
+            # _special_classification's side-attribution fix — a company-
+            # ledger TDS entry is "TDS Booked by Company", not always
+            # "...by Party").
+            if special in ("TDS Booked by Party", "TDS Booked by Company"):
                 info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
             else:
                 info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
@@ -1761,8 +1772,18 @@ async def export_reconciliation(
     )
     match_results = list(mr_res.scalars().all())
 
-    # Tolerances (as display strings)
-    tol_amt = f"{float(parent.tolerance_amount or 0)} Rs" if parent else "0 Rs"
+    # Tolerances (as display strings). The Request Statement screen's
+    # "Amount Tolerance" field is always configured as a PERCENTAGE (the
+    # UI shows a literal "%" suffix badge, and the reconciliation engine
+    # divides tolerance_amount by 100 before use — see
+    # case_controller.start_reconciliation's tolerance_fraction). This
+    # display string used to hardcode the "Rs" unit regardless, so a
+    # reviewer configuring "1%" saw the Summary sheet report "1.0 Rs" —
+    # implying a flat Rs 1 absolute tolerance instead of the real 1% of
+    # each entry's amount. Client-confirmed: caused confusion about why
+    # entries with a several-thousand-rupee gap were being tolerance-
+    # matched when the sheet appeared to say only Rs 1 was allowed.
+    tol_amt = f"{float(parent.tolerance_amount or 0)}%" if parent else "0%"
     tds_min_display = float(getattr(parent, "tds_percentage_min", 0) or 0) if parent else 0.0
     tds_max_display = float(getattr(parent, "tds_percentage", 0) or 0) if parent else 0.0
     tds_pct = f"{tds_min_display} - {tds_max_display}"

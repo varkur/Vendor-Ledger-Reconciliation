@@ -224,19 +224,28 @@ export interface DifferencesSummary {
   total_unmatched_vendor?: number;
 }
 
-/** Request body for POST /confirm action. */
+/**
+ * Request body for POST /confirm action.
+ *
+ * Bug fix: this previously sent `item_id`/`tab` — fields the backend's
+ * ConfirmMatchRequest schema (match_id + action + optional notes) has
+ * never declared, so every accept/reject/clarify click on the Recommended
+ * Matches tab failed with a 422 Unprocessable Entity (client-confirmed:
+ * "I'm not able to match or unmatched this entries"). Renamed to match
+ * the actual backend contract.
+ */
 export interface ConfirmMatchRequest {
-  item_id: string;
+  match_id: string;
   action: ConfirmAction | UnmatchedCompanyAction | UnmatchedVendorAction;
   notes?: string;
-  tab: 'confirmation' | 'unmatched_company' | 'unmatched_vendor';
 }
 
 /** Response from POST /confirm. */
 export interface ConfirmMatchResponse {
   success: boolean;
   message: string;
-  item_id: string;
+  match_id: string;
+  action: string;
 }
 
 /** Request body for POST /approvals/submit. */

@@ -79,11 +79,10 @@ export const ConfirmationTab = ({ caseId, computedStatusFilter }: ConfirmationTa
     }));
   };
 
-  const handleAction = (itemId: string, action: ConfirmAction) => {
+  const handleAction = (matchId: string, action: ConfirmAction) => {
     confirmMutation.mutate({
-      item_id: itemId,
+      match_id: matchId,
       action,
-      tab: 'confirmation',
     });
   };
 
@@ -113,7 +112,7 @@ export const ConfirmationTab = ({ caseId, computedStatusFilter }: ConfirmationTa
         tooltip="Accept match"
         tooltipOptions={{ position: 'top' }}
         onClick={() => handleAction(rowData.id, 'accept')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'accept'}
+        loading={confirmMutation.isPending && confirmMutation.variables?.match_id === rowData.id && confirmMutation.variables?.action === 'accept'}
         disabled={confirmMutation.isPending}
         aria-label={`Accept match for ${rowData.company_reference}`}
       />
@@ -124,7 +123,7 @@ export const ConfirmationTab = ({ caseId, computedStatusFilter }: ConfirmationTa
         tooltip="Reject match"
         tooltipOptions={{ position: 'top' }}
         onClick={() => handleAction(rowData.id, 'reject')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'reject'}
+        loading={confirmMutation.isPending && confirmMutation.variables?.match_id === rowData.id && confirmMutation.variables?.action === 'reject'}
         disabled={confirmMutation.isPending}
         aria-label={`Reject match for ${rowData.company_reference}`}
       />
@@ -135,7 +134,7 @@ export const ConfirmationTab = ({ caseId, computedStatusFilter }: ConfirmationTa
         tooltip="Request clarification"
         tooltipOptions={{ position: 'top' }}
         onClick={() => handleAction(rowData.id, 'clarify')}
-        loading={confirmMutation.isPending && confirmMutation.variables?.item_id === rowData.id && confirmMutation.variables?.action === 'clarify'}
+        loading={confirmMutation.isPending && confirmMutation.variables?.match_id === rowData.id && confirmMutation.variables?.action === 'clarify'}
         disabled={confirmMutation.isPending}
         aria-label={`Clarify match for ${rowData.company_reference}`}
       />

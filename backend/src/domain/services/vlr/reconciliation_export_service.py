@@ -320,12 +320,23 @@ def _entry_signals(entry) -> str:
     return " ".join(parts).lower()
 
 
-def _special_classification(entry) -> str | None:
+def _special_classification(entry, side: str | None = None) -> str | None:
     """
     Detect entry-intrinsic classifications that don't depend on the match pass:
     Opening Balance, Closing Balance, Reversal Entries (knock-off), and
-    TDS Booked by Party. Returns None when no special class applies (so the
-    caller falls back to the pass-based classification).
+    TDS Booked by Company/Party. Returns None when no special class applies
+    (so the caller falls back to the pass-based classification).
+
+    `side` ("company" or "party"/"vendor") tells us which ledger the entry
+    physically sits on, so a standalone TDS entry is attributed to the side
+    that actually booked it. Client-confirmed bug: this used to hardcode
+    "TDS Booked by Party" for EVERY unmatched TDS entry regardless of side
+    — a genuine company-side TDS rectification entry (doc type SA,
+    narration "TDS RECT.") was mislabeled "TDS Booked by Party" when it was
+    actually booked by the Company. `side` is optional (defaults to the
+    Party label) so existing call sites that don't have side info handy
+    keep their prior behavior; every call site that DOES know the side now
+    passes it through.
     """
     if entry is None:
         return None
@@ -362,8 +373,13 @@ def _special_classification(entry) -> str | None:
         return "Reversal Entries"
 
     # TDS entries (tagged by the transformation pass, or doc type/remark = TDS).
+    # The side the entry actually sits on is the side that "booked" the TDS
+    # — a company-ledger TDS entry is "TDS Booked by Company", a vendor-
+    # ledger one is "TDS Booked by Party". Same side-attribution rule used
+    # everywhere else in this module (party_missing when side=="company",
+    # company_missing when side=="party").
     if getattr(entry, "is_tds", False) or "tds" in sig or dtype in ("tds", "wt"):
-        return "TDS Booked by Party"
+        return "TDS Booked by Company" if side == "company" else "TDS Booked by Party"
 
     return None
 
@@ -542,13 +558,21 @@ class ReconciliationExportService:
     _gst_percentage_value: float = 0.0
 
     # Full 46-column header for the Reconciliation sheet (matches reference).
+    # Bug fix: "Remark" was a WORKING column only (used internally to carry
+    # the reviewer's manual-link reason / auto-generated explanatory note
+    # into the row before it's rendered) and was never meant to ship in the
+    # final client-facing output file — per explicit correction, it's
+    # removed from the exported headers entirely. The underlying `remark`
+    # value on each row dict is still computed and still drives
+    # Status/Classification (e.g. the manual-link-reason override in
+    # _row()) — only the exported COLUMN is removed, not the computation.
     RECON_HEADERS = [
         "Company Id", "Party Id", "Matched Id", "Status", "Classification",
         "Company Statement Type", "Company Invoice Date", "Company Invoice Number",
         "Company DocType", "Company Original DocType", "Company Narration", "Company Amount",
         "Party Statement Type", "Party Invoice Date", "Party Invoice Number",
         "Party DocType", "Party Original DocType", "Party Narration", "Party Amount",
-        "Difference", "Matched Rule", "Reco Data & Time", "Remark", "Party Code",
+        "Difference", "Matched Rule", "Reco Data & Time", "Party Code",
         "Daybook Name", "Company Clearing Document Number", "Company Clearing Date",
         "Company TDS Amount", "Company Posting Date", "Company Code", "Supplier",
         "Document Number", "Business Area", "Assignment", "Document Header Text",
@@ -561,7 +585,7 @@ class ReconciliationExportService:
     COMPANY_COLS = list(range(6, 13))     # Company Statement Type .. Company Amount
     PARTY_COLS = list(range(13, 20))      # Party Statement Type .. Party Amount
     DIFF_COLS = [20]                       # Difference
-    META_COLS = list(range(1, 6)) + list(range(21, 47))  # ids/status/class + tail meta
+    META_COLS = list(range(1, 6)) + list(range(21, 46))  # ids/status/class + tail meta
 
     PARTY_HEADERS = [
         "Party Id", "Matched Id", "Status", "Classification", "Party Statement Type",
@@ -583,7 +607,7 @@ class ReconciliationExportService:
         period_start,
         period_end,
         party_code: str = "",
-        tolerance_amount: str = "1.0 Rs",
+        tolerance_amount: str = "1.0%",
         tds_percentage: str = "0.0 - 10.0",
         date_tolerance: str = "0 - 15",
         tds_percentage_value: float = 0.0,
@@ -717,8 +741,12 @@ class ReconciliationExportService:
         # Party" (via _special_classification in _row/_classification), but
         # Status fell through to the generic "Other entry not booked by..."
         # because this function didn't check for the TDS special case too.
-        special = _special_classification(entry)
-        if special in ("Opening Balance", "Closing Balance", "Reversal Entries", "TDS Booked by Party"):
+        # `side` is passed through so a company-ledger TDS entry correctly
+        # reads "TDS Booked by Company", not always "...by Party" (see
+        # _special_classification's side-attribution fix).
+        special = _special_classification(entry, side)
+        if special in ("Opening Balance", "Closing Balance", "Reversal Entries",
+                        "TDS Booked by Company", "TDS Booked by Party"):
             return special
         cat = (getattr(entry, "document_category", "") or "").strip()
         info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
@@ -750,8 +778,11 @@ class ReconciliationExportService:
         manual_reason = (getattr(match, "status_reason", "") or "") if match else ""
         # Entry-intrinsic classification (Opening/Closing Balance, Reversal,
         # TDS) takes priority over the pass-based label, and applies whether or
-        # not the row was matched. Check company side first, then party.
-        special = _special_classification(c) or _special_classification(p)
+        # not the row was matched. Check company side first, then party — and
+        # pass the correct side through so a company-ledger TDS entry reads
+        # "TDS Booked by Company", not always "...by Party" (see
+        # _special_classification's side-attribution fix).
+        special = _special_classification(c, "company") or _special_classification(p, "party")
         if special is not None:
             classification = special
         elif is_matched and pass_number is not None and int(pass_number) == 8 and manual_reason:
@@ -828,7 +859,7 @@ class ReconciliationExportService:
         }
 
     def _recon_record(self, r: dict) -> list:
-        """Map a row dict to the full 46-column Reconciliation record."""
+        """Map a row dict to the full 45-column Reconciliation record."""
         rec = [""] * len(self.RECON_HEADERS)
         rec[0] = r["company_id"]
         rec[1] = r["party_id"]
@@ -852,31 +883,34 @@ class ReconciliationExportService:
         rec[19] = r["difference"]
         rec[20] = r["rule"]
         rec[21] = self._reco_dt
-        rec[22] = r["remark"]              # Remark (reviewer's manual-link reason)
-        rec[23] = self._party_code
+        # index 22 was "Remark" (removed from the exported output — see
+        # RECON_HEADERS comment above; the underlying r["remark"] value
+        # still exists on the row dict and still drives Status/
+        # Classification, it's just no longer written to a column here).
+        rec[22] = self._party_code
         # Company-side SAP detail columns (0-indexed against RECON_HEADERS).
-        rec[24] = r["c_daybook"]           # Daybook Name
-        rec[25] = r["c_clearing_doc"]      # Company Clearing Document Number
-        rec[26] = r["c_clearing_date"]     # Company Clearing Date
-        rec[27] = r["c_tds_amount"]        # Company TDS Amount
-        rec[28] = r["c_posting_date"]      # Company Posting Date
-        rec[29] = r["c_company_code"]      # Company Code
-        rec[30] = r["c_supplier"]          # Supplier
-        rec[31] = r["c_docnum"]            # Document Number
-        rec[32] = r["c_business_area"]     # Business Area
-        rec[33] = r["c_assignment"]        # Assignment
-        rec[34] = r["c_doc_header_text"]   # Document Header Text
-        rec[35] = r["c_tax_code"]          # Tax Code
-        rec[36] = r["c_year_month"]        # Year/Month
-        rec[37] = r["c_reference"]         # Reference
-        rec[38] = r["c_profit_center"]     # Profit Center
-        rec[39] = r["c_posting_date"]      # Posting Date
-        rec[40] = r["c_doc_amount"]        # Amount in Doc. Curr.
-        rec[41] = r["c_doc_currency"]      # Document Currency
-        rec[42] = r["c_local_amount"]      # Local Currency
-        rec[43] = r["c_entry_date"]        # Entry Date
-        rec[44] = r["c_wht_base"]          # Withhldg Tax Base Amount
-        rec[45] = r["c_payment_date"]      # Payment Date
+        rec[23] = r["c_daybook"]           # Daybook Name
+        rec[24] = r["c_clearing_doc"]      # Company Clearing Document Number
+        rec[25] = r["c_clearing_date"]     # Company Clearing Date
+        rec[26] = r["c_tds_amount"]        # Company TDS Amount
+        rec[27] = r["c_posting_date"]      # Company Posting Date
+        rec[28] = r["c_company_code"]      # Company Code
+        rec[29] = r["c_supplier"]          # Supplier
+        rec[30] = r["c_docnum"]            # Document Number
+        rec[31] = r["c_business_area"]     # Business Area
+        rec[32] = r["c_assignment"]        # Assignment
+        rec[33] = r["c_doc_header_text"]   # Document Header Text
+        rec[34] = r["c_tax_code"]          # Tax Code
+        rec[35] = r["c_year_month"]        # Year/Month
+        rec[36] = r["c_reference"]         # Reference
+        rec[37] = r["c_profit_center"]     # Profit Center
+        rec[38] = r["c_posting_date"]      # Posting Date
+        rec[39] = r["c_doc_amount"]        # Amount in Doc. Curr.
+        rec[40] = r["c_doc_currency"]      # Document Currency
+        rec[41] = r["c_local_amount"]      # Local Currency
+        rec[42] = r["c_entry_date"]        # Entry Date
+        rec[43] = r["c_wht_base"]          # Withhldg Tax Base Amount
+        rec[44] = r["c_payment_date"]      # Payment Date
         return rec
 
     # ------------------------------------------------------------- recon sheet
@@ -1029,15 +1063,17 @@ class ReconciliationExportService:
                 # classifications, not a cross-ledger "not booked" gap. A
                 # knock-off nets within one side, so it must not surface as a
                 # difference "not booked by" the other side.
-                special = _special_classification(e)
+                special = _special_classification(e, side)
                 if special in ("Opening Balance", "Closing Balance", "Reversal Entries"):
                     continue
                 # An unmatched TDS entry must roll up under "TDS / TCS
                 # Difference" regardless of its raw document_category (TDS
                 # detection in _special_classification checks is_tds/doc
                 # type/narration, not document_category) — otherwise it fell
-                # through to DEFAULT_SUMMARY ("Other Differences").
-                if special == "TDS Booked by Party":
+                # through to DEFAULT_SUMMARY ("Other Differences"). Checks
+                # both possible TDS labels since `special` is now side-aware
+                # (see _special_classification's side-attribution fix).
+                if special in ("TDS Booked by Party", "TDS Booked by Company"):
                     info = CATEGORY_TO_SUMMARY["TDS Adjusted"]
                 else:
                     info = CATEGORY_TO_SUMMARY.get(cat, DEFAULT_SUMMARY)
@@ -1186,7 +1222,30 @@ class ReconciliationExportService:
         # actually explain. A non-zero value here is a real signal (data not
         # yet classified/mapped) that should be visible, not hidden by
         # inserting a fabricated "Amount Unsettled" line to zero it out.
-        final_difference = closing_diff - total_diff_amount
+        #
+        # Client-confirmed bug (real data, EMCURE/ZUVENTUS ledgers): this was
+        # `closing_diff - total_diff_amount`, which ALWAYS doubles the real
+        # gap instead of explaining it — verified against the real matching
+        # engine output, not just a hand-picked example. Proof: a closing
+        # balance is by definition the running total of every OTHER entry on
+        # that same side, so for each side individually:
+        #   sum(that side's non-balance entries) + that side's closing = 0
+        #   => sum(that side's non-balance entries) = -that side's closing
+        # `total_diff_amount` is exactly the sum of both sides' non-balance
+        # (unmatched + matched-residual) entries, so:
+        #   total_diff_amount = -(company_closing) + -(party_closing)
+        #                      = -(company_closing + party_closing)
+        #                      = -closing_diff
+        # This identity holds for ANY ledger pair regardless of match
+        # quality or classification — it's pure bookkeeping, not data-
+        # dependent. So `closing_diff - total_diff_amount` always equals
+        # `closing_diff - (-closing_diff) = 2 * closing_diff` — exactly the
+        # doubling seen in production (closing_diff=-41424 produced
+        # Difference=-82848). The itemised categories DO fully explain the
+        # closing-balance gap when `total_diff_amount == -closing_diff`;
+        # adding them (which correctly nets to zero) is what actually
+        # reflects that, not subtracting.
+        final_difference = closing_diff + total_diff_amount
         ws.cell(row=row, column=1, value="Difference")
         for c in range(1, 6):
             ws.cell(row=row, column=c).fill = FILL_GREEN

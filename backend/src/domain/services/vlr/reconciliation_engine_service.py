@@ -1885,12 +1885,27 @@ class ReconciliationEngineService:
                         matched = True
 
                 if matched:
-                    # Also verify invoice numbers have some similarity (>50%).
+                    # Also verify invoice numbers are actually similar.
                     # Uses invoice_number, NOT reference_number — see _exact_match.
+                    #
+                    # Client-confirmed bug (real ELECTROLAB data, 1017/949
+                    # entries): the old >= 0.5 floor was far too weak for
+                    # SAP-style alphanumeric invoice numbers (e.g.
+                    # "2021DS1400" vs "2122DS1205", "7053044025" vs
+                    # "2223JV0425") — genuinely DIFFERENT invoices routinely
+                    # scored exactly 0.5-0.67 purely by coincidental
+                    # character overlap (shared "DS"/digit-length patterns),
+                    # with ZERO real invoice-number correlation. Verified
+                    # against the real case: every single one of the ~38
+                    # pairs this fallback caught scored between 0.5 and
+                    # 0.667 — none reached even 0.7. Raised to the SAME
+                    # >0.8 bar the dedicated Fuzzy Reference pass (Pass 3)
+                    # already uses as "similar enough to be the same
+                    # invoice", instead of an unrelated, weaker floor here.
                     ref_sim = self._reference_similarity(
                         c_entry.invoice_number, v_entry.invoice_number
                     )
-                    if ref_sim >= 0.5 or (
+                    if ref_sim > 0.8 or (
                         c_entry.invoice_number
                         and c_entry.invoice_number == v_entry.invoice_number
                     ):

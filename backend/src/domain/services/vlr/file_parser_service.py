@@ -73,6 +73,19 @@ DEFAULT_FIELD_MAPPING: dict[str, list[str]] = {
         "document_type", "doc_type", "blart", "type",
         "document type", "vch type",
     ],
+    # Secondary/fallback source for document_type. Some Tally exports (seen
+    # in a real client ledger) mix two report sections into one sheet: the
+    # main "Voucher Register" block has "Vch Type" populated on every row,
+    # but a second "Outstanding/Bills" block pasted below it leaves "Vch
+    # Type" blank and only carries the doc-type info in a "Remark" column
+    # instead. Left unhandled, every row in that second block parses with
+    # document_type=None, gets classified "Unknown" (a wildcard category),
+    # never appears in the Map Document Type screen for the user to map,
+    # and any that fail to match get silently dumped into the summary's
+    # catch-all "Other Differences" bucket instead of their real category.
+    # This is used ONLY when the primary "document_type" column is blank
+    # for a given row — a populated "Vch Type" always wins.
+    "document_type_fallback": ["remark", "remarks"],
     "clearing_date": ["clearing_date", "clear_date", "augdt", "payment date"],
     "clearing_document": [
         "clearing_document", "clear_doc", "augbl",
@@ -608,6 +621,12 @@ class FileParserService:
 
         # Parse optional fields
         document_type = get_value("document_type") or None
+        if not document_type:
+            # Fall back to the "Remark" column (see document_type_fallback
+            # comment above) so rows from a secondary report block that
+            # never populated "Vch Type" still get a real doc-type code
+            # instead of silently classifying as "Unknown".
+            document_type = get_value("document_type_fallback") or None
         clearing_date_str = get_value("clearing_date")
         clearing_date = self._parse_date(clearing_date_str) if clearing_date_str else None
         clearing_document = get_value("clearing_document") or None

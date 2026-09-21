@@ -415,6 +415,49 @@ class TestCSVParsing:
         result = parser.validate_and_parse(content, "test.csv")
         assert result.file_type == FileType.CSV
 
+    def test_document_type_falls_back_to_remark_when_vch_type_blank(
+        self, parser: FileParserService
+    ):
+        """
+        Real-data bug: a Tally export mixed two report sections into one
+        sheet. The main voucher block has "Vch Type" populated on every
+        row; a second "Outstanding/Bills" block appended below leaves
+        "Vch Type" blank and only carries the doc-type info in a "Remark"
+        column. Without a fallback, those rows parse with
+        document_type=None, get classified "Unknown" (a wildcard
+        category), and never surface on the Map Document Type screen for
+        the user to map at all -- silently dumping ~half a real 949-row
+        vendor ledger into unclassified/"Other Differences".
+        """
+        headers = ["document_number", "amount", "posting_date", "vch type", "remark"]
+        rows = [
+            # Vch Type populated -- used as-is, Remark ignored.
+            ["DOC001", "100.00", "2024-01-15", "Receipt", "Sales"],
+            # Vch Type blank -- falls back to Remark.
+            ["DOC002", "200.00", "2024-01-16", "", "Sales"],
+            ["DOC003", "300.00", "2024-01-17", "", "Tds"],
+        ]
+        content = make_csv(headers, rows)
+        result = parser.validate_and_parse(content, "test.csv")
+
+        assert result.is_valid is True
+        assert result.entries[0].document_type == "Receipt"
+        assert result.entries[1].document_type == "Sales"
+        assert result.entries[2].document_type == "Tds"
+
+    def test_document_type_stays_none_without_remark_column(
+        self, parser: FileParserService
+    ):
+        """No "remark" column present at all -- blank doc type stays None,
+        no regression for files that never had this quirk."""
+        headers = ["document_number", "amount", "posting_date", "vch type"]
+        rows = [["DOC001", "100.00", "2024-01-15", ""]]
+        content = make_csv(headers, rows)
+        result = parser.validate_and_parse(content, "test.csv")
+
+        assert result.is_valid is True
+        assert result.entries[0].document_type is None
+
 
 # ─── Full Validate And Parse Integration Tests ────────────────────────────────
 

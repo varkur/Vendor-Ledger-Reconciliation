@@ -2316,6 +2316,35 @@ class TestCategoryGating:
         assert pairs[0].company_entry_id == company[0].id
         assert pairs[0].vendor_entry_id == vendor[0].id
 
+    def test_tds_gst_match_similarity_floor_rejects_genuinely_different_sap_invoice_numbers(
+        self, service: ReconciliationEngineService
+    ):
+        """
+        Client-confirmed bug (real ELECTROLAB data, 1017/949 entries): the
+        old >= 0.5 similarity floor was far too weak for SAP-style
+        alphanumeric invoice numbers — genuinely DIFFERENT invoices
+        routinely scored exactly 0.5-0.667 purely from coincidental
+        character overlap, with a matching TDS-sized amount gap doing the
+        rest. Every one of ~38 real false-positive pairs in that case
+        scored between 0.5 and 0.667 — none reached even 0.7. The floor
+        must be strict enough to reject these (real numbers below).
+        """
+        cases = [
+            ("1920DS0644", "1920SS0356"),
+            ("1920DS4085", "1819DS4474"),
+            ("7053044025", "2223JV0425"),
+            ("2021DS1400", "2122DS1205"),
+            ("2122DS0250", "2122DS2787"),
+        ]
+        for c_inv, v_inv in cases:
+            company = [_cat_entry("-45844", "Invoice", date(2018, 7, 31), c_inv)]
+            vendor = [_cat_entry("50994", "Invoice", date(2019, 7, 17), v_inv)]
+            pairs = service._tds_gst_match(company, vendor, Decimal("10"), Decimal("0"))
+            assert len(pairs) == 0, (
+                f"{c_inv!r} vs {v_inv!r} must NOT match — these are "
+                "genuinely different invoices, not a fuzzy-matchable pair."
+            )
+
     def test_exact_match_gates_on_category(
         self, service: ReconciliationEngineService
     ):
