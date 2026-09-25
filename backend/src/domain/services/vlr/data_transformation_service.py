@@ -51,7 +51,18 @@ class DocumentCategory(StrEnum):
 # Document types that are invoice-like (use ZUONR > XBLNR > BELNR derivation)
 INVOICE_DOC_TYPES = {"RE", "KR", "DR", "KG", "RV"}
 
-# Document types that are payment (invoice_number = NULL, use AUGBL)
+# Document types that are payment. Per explicit client correction: Payment
+# entries' invoice_number is now derived the SAME WAY as every other doc
+# type (ZUONR > XBLNR > BELNR, via _derive_with_priority_fallback) instead
+# of being nulled out — the Map Columns screen already tells the user
+# "Assignment maps to Invoice Number" as a general rule with no Payment-
+# specific carve-out, and the matching engine's own UTR/reference-grouped
+# passes already read assignment_number directly for Payment identity, so
+# leaving invoice_number blank only made every OTHER invoice-number-aware
+# pass (Exact/Tolerance/Fuzzy/TDS_GST) blind to Payments for no benefit.
+# `payment_reference` (AUGBL/Clearing Document) is still populated
+# alongside invoice_number for backward compatibility/display purposes,
+# but is no longer the ONLY identity signal a Payment entry carries.
 PAYMENT_DOC_TYPES = {"ZP", "KZ", "ZV"}
 
 # Document types that are journal entries (invoice_number = NULL, manual review)
@@ -190,10 +201,13 @@ class DataTransformationService:
         Derive invoice number using ZUONR > XBLNR > BELNR priority.
 
         Logic by document type:
-        - Invoice types (RE, KR, DR) and Credit/Debit Notes (KG, RV):
+        - Invoice types (RE, KR, DR), Credit/Debit Notes (KG, RV), and
+          Payment types (ZP, KZ, ZV):
           Use ZUONR > XBLNR > BELNR fallback with CLEAN function applied.
-        - Payment types (ZP, KZ, ZV):
-          invoice_number = None, payment_reference = AUGBL (Clearing Document).
+          Payment types ADDITIONALLY populate payment_reference from AUGBL
+          (Clearing Document) for backward-compatible display purposes,
+          but invoice_number is no longer nulled out for them — see the
+          PAYMENT_DOC_TYPES comment above for why.
         - Journal entries (AB, SA):
           invoice_number = None, flagged for manual review.
         - All other document types:
@@ -208,16 +222,13 @@ class DataTransformationService:
         start = time.perf_counter()
         doc_type = entry.blart.strip().upper()
 
-        # Payment documents: invoice_number = NULL, use AUGBL
+        # Payment documents: derive invoice_number the same way as every
+        # other doc type (ZUONR > XBLNR > BELNR), then additionally attach
+        # payment_reference from AUGBL for backward compatibility.
         if doc_type in PAYMENT_DOC_TYPES:
-            result = DerivedInvoice(
-                invoice_number=None,
-                raw_value=entry.augbl if entry.augbl.strip() else None,
-                source_field=None,
-                payment_reference=self.clean_reference(entry.augbl)
-                if entry.augbl.strip()
-                else None,
-                flags=[],
+            result = self._derive_with_priority_fallback(entry)
+            result.payment_reference = (
+                self.clean_reference(entry.augbl) if entry.augbl.strip() else None
             )
         elif doc_type in JOURNAL_DOC_TYPES:
             # Journal entries: invoice_number = NULL, flag for manual review

@@ -277,11 +277,24 @@ class TestDeriveInvoiceNumber:
 
 
 class TestDeriveInvoiceNumberPayments:
-    """Tests for payment document types (ZP, KZ, ZV)."""
+    """
+    Tests for payment document types (ZP, KZ, ZV).
+
+    Client-confirmed rule change: Payment doc types now derive
+    invoice_number the same way as every other doc type (ZUONR > XBLNR >
+    BELNR), instead of being nulled out. The Map Columns screen already
+    tells the user "Assignment maps to Invoice Number" with no Payment-
+    specific carve-out, and payment_reference (AUGBL) was never actually
+    read by the matching engine anywhere — leaving invoice_number blank
+    only made Payments invisible to every invoice-number-aware pass for
+    no benefit.
+    """
 
     @pytest.mark.parametrize("doc_type", ["ZP", "KZ", "ZV"])
-    def test_payment_docs_have_null_invoice_number(self, service, doc_type):
-        """BRD: Payment docs (ZP, KZ, ZV) → invoice_number = NULL."""
+    def test_payment_docs_derive_invoice_number_from_zuonr(self, service, doc_type):
+        """Payment docs (ZP, KZ, ZV) now use the same ZUONR>XBLNR>BELNR
+        fallback as every other doc type — invoice_number is no longer
+        nulled out."""
         entry = RawSAPEntry(
             zuonr="INV001",
             xblnr="REF002",
@@ -292,11 +305,16 @@ class TestDeriveInvoiceNumberPayments:
         )
         result = service.derive_invoice_number(entry)
 
-        assert result.invoice_number is None
+        assert result.invoice_number == "INV001"
+        assert result.source_field == InvoiceSourceField.ZUONR
 
     @pytest.mark.parametrize("doc_type", ["ZP", "KZ", "ZV"])
-    def test_payment_docs_use_augbl_as_payment_reference(self, service, doc_type):
-        """BRD: Payment docs use ClearingDocument (AUGBL) as payment_reference."""
+    def test_payment_docs_still_populate_payment_reference_from_augbl(
+        self, service, doc_type
+    ):
+        """payment_reference (AUGBL/Clearing Document) is still populated
+        alongside invoice_number, for backward-compatible display
+        purposes — it's just no longer the ONLY identity signal."""
         entry = RawSAPEntry(
             zuonr="INV001",
             xblnr="REF002",
@@ -308,9 +326,11 @@ class TestDeriveInvoiceNumberPayments:
         result = service.derive_invoice_number(entry)
 
         assert result.payment_reference == "7000001"
+        assert result.invoice_number == "INV001"
 
-    def test_payment_doc_with_empty_augbl(self, service):
-        """Payment doc with no AUGBL returns None for payment_reference."""
+    def test_payment_doc_with_empty_augbl_still_derives_invoice_number(self, service):
+        """A Payment doc with no AUGBL still derives invoice_number
+        normally from ZUONR; payment_reference alone is None."""
         entry = RawSAPEntry(
             zuonr="INV001",
             xblnr="REF002",
@@ -322,7 +342,24 @@ class TestDeriveInvoiceNumberPayments:
         result = service.derive_invoice_number(entry)
 
         assert result.payment_reference is None
-        assert result.raw_value is None
+        assert result.invoice_number == "INV001"
+
+    def test_payment_doc_with_no_zuonr_falls_back_to_xblnr(self, service):
+        """Payment docs go through the full priority fallback, same as
+        Invoice types — ZUONR empty falls back to XBLNR."""
+        entry = RawSAPEntry(
+            zuonr="",
+            xblnr="REF002",
+            belnr="5000001",
+            gjahr="2024",
+            blart="KZ",
+            augbl="7000001",
+        )
+        result = service.derive_invoice_number(entry)
+
+        assert result.invoice_number == "REF002"
+        assert result.source_field == InvoiceSourceField.XBLNR
+        assert result.payment_reference == "7000001"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -421,7 +458,9 @@ class TestDeriveInvoiceNumberCaseInsensitive:
         assert result.invoice_number == "INV001"
 
     def test_mixed_case_payment_doc_type(self, service):
-        """Mixed case payment doc types work correctly."""
+        """Mixed case payment doc types work correctly — invoice_number is
+        now derived from ZUONR (same as every other doc type), and
+        payment_reference is still populated from AUGBL alongside it."""
         entry = RawSAPEntry(
             zuonr="INV001",
             blart="Zp",
@@ -429,7 +468,7 @@ class TestDeriveInvoiceNumberCaseInsensitive:
         )
         result = service.derive_invoice_number(entry)
 
-        assert result.invoice_number is None
+        assert result.invoice_number == "INV001"
         assert result.payment_reference == "7000001"
 
 

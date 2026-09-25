@@ -61,6 +61,7 @@ def make_entry(
     amount: str = "1000.00",
     posting_date: date | None = None,
     reference_number: str = "REF-001",
+    document_type: str = "invoice",
 ) -> FakeLedgerEntry:
     """Helper to create a fake ledger entry with given attributes.
 
@@ -69,6 +70,11 @@ def make_entry(
     different invoice-matching keys once converted via _to_entry_data_list —
     matching this test file's existing convention of using reference_number
     as the per-test matchable identifier.
+
+    document_type defaults to "invoice" (existing behavior); pass e.g.
+    document_type="KZ" to get category="Payment" instead, needed for tests
+    exercising passes that Invoice-category entries are no longer eligible
+    for (Amount+Date, Date-proximity, Tolerance+Date, subset-sum grouping).
     """
     return FakeLedgerEntry(
         side=side,
@@ -76,6 +82,7 @@ def make_entry(
         posting_date=posting_date or date(2024, 3, 15),
         reference_number=reference_number,
         document_number=f"DOC-{reference_number}",
+        document_type=document_type,
     )
 
 
@@ -549,20 +556,23 @@ class TestOneToManyMatch:
         self, service: ReconciliationEngineService
     ):
         """Should match one company entry to multiple vendor entries summing
-        to same amount. Category must be a KNOWN one (e.g. "Invoice") — see
+        to same amount. Category must be a KNOWN, non-Invoice one (e.g.
+        "Payment") — client-confirmed rule: subset-sum grouping is
+        Payment-only, Invoice entries never participate (see
+        TestCategoryGating). See also
         test_one_to_many_excludes_wildcard_category_entries for why a
         wildcard/uncategorized entry must never participate in subset-sum
         grouping."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            id=uuid4(), amount=Decimal("1000"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            id=uuid4(), amount=Decimal("600"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         v2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            id=uuid4(), amount=Decimal("400"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
 
@@ -672,18 +682,19 @@ class TestManyToOneMatch:
         self, service: ReconciliationEngineService
     ):
         """Should match multiple company entries summing to one vendor entry.
-        Category must be a KNOWN one — see
+        Category must be a KNOWN, non-Invoice one (e.g. "Payment") —
+        client-confirmed rule: subset-sum grouping is Payment-only. See
         test_many_to_one_excludes_wildcard_category_entries."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            id=uuid4(), amount=Decimal("400"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         c2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            id=uuid4(), amount=Decimal("600"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            id=uuid4(), amount=Decimal("1000"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
 
@@ -1488,10 +1499,15 @@ class TestDateProximityMatchInFullExecution:
         date within N days" criteria, so it wins for any entry pair this
         simple. Pass 6 only fires for pairs Pass 1.5 could not claim (e.g.
         already consumed by an earlier reference-aware pass on one side).
+
+        Uses document_type="KZ" (Payment) — client-confirmed rule:
+        Pass 1.5/Amount+Date never inspects invoice number, so an
+        Invoice-category entry is no longer eligible for it at all; only
+        Payment (and other non-invoice categories) may match this way.
         """
         case_id = uuid4()
-        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001")
-        v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT")
+        c1 = make_entry("company", "1000.00", date(2024, 3, 15), "REF-001", document_type="KZ")
+        v1 = make_entry("vendor", "1000.00", date(2024, 3, 17), "COMPLETELY-DIFFERENT", document_type="KZ")
 
         def side_effect(cid, side):
             if side == "company":
@@ -1640,17 +1656,20 @@ class TestConfidenceScoring:
     def test_one_to_many_confidence_is_0_80(
         self, service: ReconciliationEngineService
     ):
-        """Pass 4 (One-to-Many): BRD MatchScore = 80 → confidence = 0.80."""
+        """Pass 4 (One-to-Many): BRD MatchScore = 80 → confidence = 0.80.
+
+        Uses category="Payment" — subset-sum grouping is Payment-only per
+        the client-confirmed rule (Invoice entries never participate)."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            id=uuid4(), amount=Decimal("1000"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            id=uuid4(), amount=Decimal("600"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         v2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            id=uuid4(), amount=Decimal("400"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
 
@@ -1663,17 +1682,20 @@ class TestConfidenceScoring:
     def test_many_to_one_confidence_is_0_75(
         self, service: ReconciliationEngineService
     ):
-        """Pass 5 (Many-to-One): BRD MatchScore = 75 → confidence = 0.75."""
+        """Pass 5 (Many-to-One): BRD MatchScore = 75 → confidence = 0.75.
+
+        Uses category="Payment" — subset-sum grouping is Payment-only per
+        the client-confirmed rule (Invoice entries never participate)."""
         c1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("400"), category="Invoice",
+            id=uuid4(), amount=Decimal("400"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-A"
         )
         c2 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("600"), category="Invoice",
+            id=uuid4(), amount=Decimal("600"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-B"
         )
         v1 = LedgerEntryData(
-            id=uuid4(), amount=Decimal("1000"), category="Invoice",
+            id=uuid4(), amount=Decimal("1000"), category="Payment",
             posting_date=date(2024, 3, 15), reference_number="REF-001"
         )
 
@@ -2200,13 +2222,23 @@ class TestCategoryGating:
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
         assert len(pairs) == 0
 
-    def test_invoice_matches_invoice_on_amount_date(
+    def test_invoice_does_not_match_invoice_on_amount_date_alone(
         self, service: ReconciliationEngineService
     ):
+        """
+        Client-confirmed rule reversal: Invoice-to-Invoice matching MUST go
+        through an invoice-number-aware pass (Exact/Tolerance/Fuzzy/
+        TDS_GST) — it must NEVER be allowed to match purely on amount+date
+        coincidence with no invoice-number correlation at all. Previously
+        this pass allowed it (see test history); the client explicitly
+        corrected this — an invoice with no traceable invoice-number
+        correspondence must stay Unmatched, not silently pair with an
+        unrelated invoice that merely shares an amount and a nearby date.
+        """
         company = [_cat_entry("1000", "Invoice", date(2024, 3, 15))]
         vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 16))]
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
-        assert len(pairs) == 1
+        assert len(pairs) == 0
 
     def test_payment_does_not_match_receipt(self, service: ReconciliationEngineService):
         """Cross-category matching should not occur except where the mapping
@@ -2388,11 +2420,28 @@ class TestCategoryGating:
         self, service: ReconciliationEngineService
     ):
         """Unrecognized/uncategorized entries (wildcard) must remain matchable
-        so users aren't blocked before mapping a doc type."""
+        so users aren't blocked before mapping a doc type. Uses a Payment
+        vendor side — client-confirmed rule: an Invoice-category entry on
+        EITHER side now requires an invoice-number-aware pass regardless of
+        the other side's category, so a wildcard-vs-Invoice pair is no
+        longer eligible here (see
+        test_wildcard_category_does_not_bypass_invoice_number_requirement)."""
+        company = [_cat_entry("1000", "", date(2024, 3, 15))]
+        vendor = [_cat_entry("-1000", "Payment", date(2024, 3, 15))]
+        pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
+        assert len(pairs) == 1
+
+    def test_wildcard_category_does_not_bypass_invoice_number_requirement(
+        self, service: ReconciliationEngineService
+    ):
+        """A wildcard/unmapped company entry must NOT be able to blind-match
+        an Invoice-category vendor entry via amount+date — the Invoice side
+        still requires an invoice-number-aware pass regardless of what the
+        OTHER side's category is."""
         company = [_cat_entry("1000", "", date(2024, 3, 15))]
         vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 15))]
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=5)
-        assert len(pairs) == 1
+        assert len(pairs) == 0
 
 
 class TestInvoiceNumberNormalizedExactMatch:
@@ -2813,9 +2862,15 @@ class TestPaymentDateDirectionality:
     def test_non_payment_category_stays_symmetric(
         self, service: ReconciliationEngineService
     ):
-        """Invoice matching is unaffected — still a symmetric ± window."""
-        company = [_cat_entry("1000", "Invoice", date(2024, 3, 10))]
-        vendor = [_cat_entry("-1000", "Invoice", date(2024, 3, 1))]  # -9 days
+        """Non-Payment, non-Invoice category matching is unaffected — still
+        a symmetric ± window. Uses "Journal" (self-matching only, per
+        CATEGORY_COMPATIBILITY) rather than "Invoice" — client-confirmed
+        rule: Invoice entries are no longer eligible for this pass at all
+        (see TestCategoryGating), so this directionality test needs a
+        different non-Payment category to isolate what it's actually
+        testing (date-window symmetry, not invoice-number correlation)."""
+        company = [_cat_entry("1000", "Journal", date(2024, 3, 10))]
+        vendor = [_cat_entry("-1000", "Journal", date(2024, 3, 1))]  # -9 days
         pairs = service._amount_date_match(company, vendor, date_tolerance_days=15)
         assert len(pairs) == 1
 
@@ -3098,3 +3153,213 @@ class TestAmountMismatchMatch:
             _NEEDS_CONFIRMATION_PASSES,
         )
         assert MatchPassType.AMOUNT_MISMATCH in _NEEDS_CONFIRMATION_PASSES
+
+
+# ─── Reference-Grouped Match ("Multiple Based on Invoice Number") ──────────
+# Client mapping-doc numeric example (Payment sheet): 4 company Payment
+# legs sharing reference 7053002234 (10633 + 56410 + 29087 + 9138 =
+# 105268) matched as a group against a single vendor Payment of -105268.
+
+
+class TestReferenceGroupedMatch:
+    def test_company_legs_grouped_by_shared_reference_match_single_vendor_total(
+        self, service: ReconciliationEngineService
+    ):
+        """Real numeric example from the client's Mapping Process.xlsx
+        Payment sheet, 'Multiple Based on Invoice Number' scenario."""
+        c1 = _cat_entry("10633", "Payment", date(2024, 4, 15), reference_number="7053002234")
+        c2 = _cat_entry("56410", "Payment", date(2024, 4, 15), reference_number="7053002234")
+        c3 = _cat_entry("29087", "Payment", date(2024, 4, 15), reference_number="7053002234")
+        c4 = _cat_entry("9138", "Payment", date(2024, 4, 15), reference_number="7053002234")
+        v1 = _cat_entry("-105268", "Payment", date(2024, 4, 16), reference_number="")
+
+        groups = service._reference_grouped_match(
+            [c1, c2, c3, c4], [v1], date_tolerance_days=15
+        )
+
+        assert len(groups) == 1
+        assert set(groups[0].company_entry_ids) == {c1.id, c2.id, c3.id, c4.id}
+        assert groups[0].vendor_entry_ids == [v1.id]
+        assert groups[0].pass_number == MatchPassType.REFERENCE_GROUPED
+        assert groups[0].matched_amount == Decimal("105268")
+
+    def test_mirror_direction_vendor_legs_grouped_by_reference(
+        self, service: ReconciliationEngineService
+    ):
+        """Mirror image: multiple vendor legs sharing a reference, matched
+        against a single company total. Company date must be ON/BEFORE the
+        vendor group's date — Payment matching is forward-only directional
+        per the mapping doc (vendor receipt date is on/after the company
+        payment date), so the company anchor here is dated one day EARLIER
+        than the vendor legs."""
+        v1 = _cat_entry("10633", "Payment", date(2024, 4, 16), reference_number="UTR-X")
+        v2 = _cat_entry("56410", "Payment", date(2024, 4, 16), reference_number="UTR-X")
+        c1 = _cat_entry("-67043", "Payment", date(2024, 4, 15), reference_number="")
+
+        groups = service._reference_grouped_match(
+            [c1], [v1, v2], date_tolerance_days=15
+        )
+
+        assert len(groups) == 1
+        assert groups[0].company_entry_ids == [c1.id]
+        assert set(groups[0].vendor_entry_ids) == {v1.id, v2.id}
+
+    def test_invoice_category_entries_excluded_from_reference_grouping(
+        self, service: ReconciliationEngineService
+    ):
+        """Client-confirmed rule: Invoice/DN/CN entries never participate in
+        subset-sum-style grouping, even when they share a reference."""
+        c1 = _cat_entry("500", "Invoice", date(2024, 4, 15), reference_number="SHARED-REF")
+        c2 = _cat_entry("500", "Invoice", date(2024, 4, 15), reference_number="SHARED-REF")
+        v1 = _cat_entry("-1000", "Payment", date(2024, 4, 15), reference_number="")
+
+        groups = service._reference_grouped_match([c1, c2], [v1], date_tolerance_days=15)
+        assert len(groups) == 0
+
+    def test_single_entry_reference_group_does_not_fire(
+        self, service: ReconciliationEngineService
+    ):
+        """A reference shared by only ONE entry isn't a genuine multi-entry
+        group — leave it to the normal 1:1 passes."""
+        c1 = _cat_entry("1000", "Payment", date(2024, 4, 15), reference_number="LONE-REF")
+        v1 = _cat_entry("-1000", "Payment", date(2024, 4, 15), reference_number="")
+        groups = service._reference_grouped_match([c1], [v1], date_tolerance_days=15)
+        assert len(groups) == 0
+
+
+# ─── Date-Grouped Match ("Multiple Based on Date") ─────────────────────────
+# Client mapping-doc numeric example (Payment sheet): company payments of
+# 30,000 and 20,000 individually pair with vendor receipts of 30,000 and
+# 20,000 on the same date, purely because of the date cluster — no
+# reference correlation, no summing.
+
+
+class TestDateGroupedMatch:
+    def test_multi_entry_date_cluster_pairs_individually(
+        self, service: ReconciliationEngineService
+    ):
+        """Real numeric example (paraphrased) from the client's Mapping
+        Process.xlsx Payment sheet, 'Multiple Based on Date' scenario.
+        Uses same-sign amounts on both sides — this pass mirrors
+        _date_proximity_match's signed-amount convention exactly (see
+        _date_grouped_match docstring)."""
+        c1 = _cat_entry("30000", "Payment", date(2024, 5, 1), reference_number="C-A")
+        c2 = _cat_entry("20000", "Payment", date(2024, 5, 1), reference_number="C-B")
+        v1 = _cat_entry("30000", "Payment", date(2024, 5, 1), reference_number="V-A")
+        v2 = _cat_entry("20000", "Payment", date(2024, 5, 1), reference_number="V-B")
+
+        pairs = service._date_grouped_match([c1, c2], [v1, v2], date_tolerance_days=3)
+
+        assert len(pairs) == 2
+        matched = {(p.company_entry_id, p.vendor_entry_id) for p in pairs}
+        assert (c1.id, v1.id) in matched
+        assert (c2.id, v2.id) in matched
+        assert all(p.pass_number == MatchPassType.DATE_GROUPED for p in pairs)
+
+    def test_lone_pair_with_no_date_siblings_does_not_fire(
+        self, service: ReconciliationEngineService
+    ):
+        """A single company/vendor pair on a date with no other entries
+        sharing that date is NOT a cluster — falls through to Pass 6
+        (Date-proximity) instead."""
+        c1 = _cat_entry("1000", "Payment", date(2024, 5, 5), reference_number="LONE")
+        v1 = _cat_entry("-1000", "Payment", date(2024, 5, 5), reference_number="LONE-V")
+        pairs = service._date_grouped_match([c1], [v1], date_tolerance_days=3)
+        assert len(pairs) == 0
+
+    def test_invoice_category_excluded_from_date_grouping(
+        self, service: ReconciliationEngineService
+    ):
+        c1 = _cat_entry("1000", "Invoice", date(2024, 5, 1), reference_number="A")
+        c2 = _cat_entry("2000", "Invoice", date(2024, 5, 1), reference_number="B")
+        v1 = _cat_entry("-1000", "Invoice", date(2024, 5, 1), reference_number="C")
+        v2 = _cat_entry("-2000", "Invoice", date(2024, 5, 1), reference_number="D")
+        pairs = service._date_grouped_match([c1, c2], [v1, v2], date_tolerance_days=3)
+        assert len(pairs) == 0
+
+
+# ─── Cross-Doctype Reversal Candidates ("Reversal Entries", recommended) ────
+# Client mapping-doc numeric example (Reversal sheet): a company debitNote
+# of +32,677.60 and a company invoice of -32,677.60, same date
+# (31-10-2023) — Status "Reversal Entries", Classification "Manually
+# Matched". Per explicit client instruction: this must be auto-DETECTED as
+# a recommended candidate (not silently auto-matched); once approved it is
+# re-stamped as a genuine manual match.
+
+
+class TestCrossDoctypeReversalCandidates:
+    def test_debit_note_and_invoice_same_side_same_date_detected(
+        self, service: ReconciliationEngineService
+    ):
+        """Real numeric example from the client's Mapping Process.xlsx
+        Reversal sheet."""
+        d = _cat_entry(
+            "32677.60", "Debit Note", date(2023, 10, 31),
+            document_type="KG",
+        )
+        cr = _cat_entry(
+            "-32677.60", "Invoice", date(2023, 10, 31),
+            document_type="KR", reference_number="IXJ/23-24/47038R",
+        )
+
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+
+        assert len(pairs) == 1
+        assert pairs[0].pass_number == MatchPassType.CROSS_DOCTYPE_REVERSAL
+        assert pairs[0].matched_amount == Decimal("32677.60")
+        assert pairs[0].reversal_side == "company"
+        assert {pairs[0].company_entry_id, pairs[0].vendor_entry_id} == {d.id, cr.id}
+
+    def test_same_doctype_cancellation_not_claimed_by_this_pass(
+        self, service: ReconciliationEngineService
+    ):
+        """Two entries of the SAME doc type that cancel out are the
+        genuine automatic case (handled by _reversal_match/
+        _other_entry_match) — this pass must not also claim them."""
+        d = _cat_entry("5000", "Invoice", date(2024, 1, 1), document_type="KR")
+        cr = _cat_entry("-5000", "Invoice", date(2024, 1, 1), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_different_dates_not_matched(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("1000", "Debit Note", date(2024, 1, 1), document_type="KG")
+        cr = _cat_entry("-1000", "Invoice", date(2024, 1, 5), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_non_zero_sum_not_matched(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("1000", "Debit Note", date(2024, 1, 1), document_type="KG")
+        cr = _cat_entry("-900", "Invoice", date(2024, 1, 1), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_already_flagged_reversal_entries_excluded(
+        self, service: ReconciliationEngineService
+    ):
+        """AB-marked entries are claimed by the genuine automatic
+        _reversal_match pass first — this pass must not double-claim
+        them even if their doc types happen to differ superficially."""
+        d = _cat_entry("1000", "Knocking Off", date(2024, 1, 1), document_type="AB")
+        cr = _cat_entry("-1000", "Invoice", date(2024, 1, 1), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_opening_closing_balance_excluded(
+        self, service: ReconciliationEngineService
+    ):
+        d = _cat_entry("1000", "Opening Balance", date(2024, 1, 1), document_type="Op")
+        cr = _cat_entry("-1000", "Invoice", date(2024, 1, 1), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_confidence_score_is_0_75(self, service: ReconciliationEngineService):
+        d = _cat_entry("500", "Debit Note", date(2024, 2, 1), document_type="KG")
+        cr = _cat_entry("-500", "Invoice", date(2024, 2, 1), document_type="KR")
+        pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 1
+        assert pairs[0].confidence_score == 0.75
+        assert pairs[0].confidence_score == CONFIDENCE_SCORES[MatchPassType.CROSS_DOCTYPE_REVERSAL]

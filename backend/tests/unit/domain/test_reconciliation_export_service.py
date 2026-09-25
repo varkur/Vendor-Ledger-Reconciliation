@@ -1190,3 +1190,179 @@ class TestAmountMismatchPassClassification:
         assert len(rows) == 1
         assert rows[0]["status"] == "Amount Mismatch"
         assert rows[0]["classification"] == "Amount Mismatch"
+
+
+class TestPaymentAndDnCnClassificationLabels:
+    """
+    Client mapping-doc "Payment Matched - Recommended" and "Amount Matched
+    - Recommended (DN/CN)" scenarios — a Payment or DN/CN pair matched via
+    a tolerance-style pass must get its own distinct Classification label
+    instead of the generic pass-based one.
+    """
+
+    def test_payment_pair_via_tolerance_pass_gets_recommended_label(self):
+        """Real numeric example from the client's Mapping Process.xlsx
+        Payment sheet: company 34,358 vs vendor -34,357.82 (a small
+        rounding gap), Status "Write off / Rounding off"."""
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        c_entry = FakeEntry(document_category="Payment")
+        p_entry = FakeEntry(document_category="Payment")
+        assert _classification(2, c_entry, p_entry) == "Payment Matched - Recommended"
+
+    def test_payment_pair_via_tolerance_date_pass_gets_recommended_label(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Payment")
+        p_entry = FakeEntry(document_category="Payment")
+        assert (
+            _classification(MatchPassType.TOLERANCE_DATE, c_entry, p_entry)
+            == "Payment Matched - Recommended"
+        )
+
+    def test_non_payment_pair_via_tolerance_pass_keeps_generic_label(self):
+        """A non-Payment pair (e.g. Invoice) matched via the same pass
+        must NOT get the Payment-specific label."""
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        c_entry = FakeEntry(document_category="Invoice")
+        p_entry = FakeEntry(document_category="Invoice")
+        assert _classification(2, c_entry, p_entry) == "Invoice Number Matched"
+
+    def test_dn_cn_pair_via_tolerance_pass_gets_recommended_label(self):
+        """Real numeric example from the client's Mapping Process.xlsx
+        DN CN sheet: company debitNote 5716.99 vs party invoice -5717
+        (Status "Reconciled") and vs party invoice -5700 (Status "TDS
+        Booked by Company") — both rows carry Classification "Amount
+        Matched - Recommended"."""
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        c_entry = FakeEntry(document_category="Debit Note")
+        p_entry = FakeEntry(document_category="Invoice")
+        assert _classification(2, c_entry, p_entry) == "Amount Matched - Recommended"
+
+    def test_dn_cn_pair_via_tds_gst_pass_gets_recommended_label(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Credit Note")
+        p_entry = FakeEntry(document_category="Invoice")
+        assert (
+            _classification(MatchPassType.TDS_GST, c_entry, p_entry)
+            == "Amount Matched - Recommended"
+        )
+
+    def test_reference_grouped_pass_label(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        assert (
+            _classification(MatchPassType.REFERENCE_GROUPED)
+            == "Multiple Based on Invoice Number"
+        )
+
+    def test_date_grouped_pass_label(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        assert _classification(MatchPassType.DATE_GROUPED) == "Multiple Based on Date"
+
+
+class TestCrossDoctypeReversalCandidateLabels:
+    """
+    Client mapping-doc "Reversal Entries" scenario (Reversal sheet): a
+    same-side cancellation between two DIFFERENT doc types (Debit Note +
+    Invoice) — before approval, Status "Reversal Entries" / Classification
+    "Reversal Entries (Recommended)"; after approval (re-stamped to pass 8
+    by confirm_match's ACCEPT branch), Status/Classification both read as
+    a normal manual link ("Manually Mapped" / the status_reason).
+    """
+
+    def test_pending_candidate_status_and_classification(self):
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Debit Note", amount=32677.60)
+        p_entry = FakeEntry(document_category="Invoice", amount=-32677.60)
+        assert (
+            _status(MatchPassType.CROSS_DOCTYPE_REVERSAL, c_entry, p_entry, difference=0.0)
+            == "Reversal Entries"
+        )
+        assert (
+            _classification(MatchPassType.CROSS_DOCTYPE_REVERSAL, c_entry, p_entry)
+            == "Reversal Entries (Recommended)"
+        )
+
+    def test_approved_candidate_reads_as_manually_mapped(self):
+        """After confirm_match's ACCEPT branch re-stamps pass_number=8,
+        the row must read exactly like any other manual link."""
+        from src.domain.services.vlr.reconciliation_export_service import _classification
+        c_entry = FakeEntry(document_category="Debit Note", amount=32677.60)
+        p_entry = FakeEntry(document_category="Invoice", amount=-32677.60)
+        assert _status(8, c_entry, p_entry, difference=0.0) == "Manually Mapped"
+        assert _classification(8, c_entry, p_entry) == "Manually Mapped"
+
+
+class TestTdsBookedByPartyInvoiceRestriction:
+    """
+    Client-confirmed rule: on an Invoice-to-Invoice pair, only "TDS Booked
+    by Company" is ever valid — a vendor doesn't withhold tax from its own
+    invoice. Both directions remain valid for Payment (and other non-
+    invoice) pairs. Confirmed against the client's own Invoice sheet
+    examples, which both show Status "TDS Booked by Company" (never "...by
+    Party") even though the gap math alone would otherwise flip the side
+    attribution.
+    """
+
+    def test_invoice_pair_never_reports_tds_booked_by_party_via_tolerance(self):
+        """Real numeric example from the client's Mapping Process.xlsx
+        Invoice sheet: company invoice -10643.16 vs party invoice 10752
+        (diff 108.84) — Status must be "TDS Booked by Company" even though
+        the company side has the SMALLER absolute amount here would
+        otherwise flip it to "...by Party" under the old side-only rule."""
+        c_entry = FakeEntry(document_category="Invoice", amount=-10643.16)
+        p_entry = FakeEntry(document_category="Invoice", amount=10752.0)
+        result = _status(
+            2, c_entry, p_entry, difference=108.84,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Company"
+
+    def test_invoice_pair_with_company_side_larger_still_reports_by_company(self):
+        """Sanity check the other direction too: company side LARGER in
+        absolute terms (the case that would naturally resolve to "by
+        Company" under the old rule) must still say "by Company", not flip
+        to "by Party" — Invoice pairs never report "by Party" regardless of
+        which side is smaller."""
+        c_entry = FakeEntry(document_category="Invoice", amount=-100000.0)
+        p_entry = FakeEntry(document_category="Invoice", amount=95000.0)
+        result = _status(
+            2, c_entry, p_entry, difference=5000.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Company"
+
+    def test_payment_pair_can_still_report_tds_booked_by_party(self):
+        """Non-invoice (Payment) pairs are unaffected — both directions
+        remain valid."""
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Payment", amount=-100000.0)
+        p_entry = FakeEntry(document_category="Payment", amount=95000.0)
+        result = _status(
+            MatchPassType.TDS_GST, c_entry, p_entry, difference=5000.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Party"
+
+    def test_payment_pair_flips_to_by_company_when_company_side_smaller(self):
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Payment", amount=-90000.0)
+        p_entry = FakeEntry(document_category="Payment", amount=100000.0)
+        result = _status(
+            MatchPassType.TDS_GST, c_entry, p_entry, difference=10000.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Company"
+
+    def test_invoice_pair_via_tolerance_date_pass_never_reports_by_party(self):
+        from src.domain.services.vlr.reconciliation_engine_service import MatchPassType
+        c_entry = FakeEntry(document_category="Invoice", amount=-50780.0)
+        p_entry = FakeEntry(document_category="Invoice", amount=51656.0)
+        result = _status(
+            MatchPassType.TOLERANCE_DATE, c_entry, p_entry, difference=876.0,
+            tds_percentage=10.0, gst_percentage=0.0, tds_percentage_min=0.0,
+        )
+        assert result == "TDS Booked by Company"

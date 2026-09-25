@@ -30,6 +30,12 @@ from src.domain.services.vlr.reconciliation_engine_service import (
     _is_tax_band_gap,
 )
 
+# Categories treated as "Invoice-like" for classification-label purposes —
+# an Invoice, Debit Note, or Credit Note pair gets its own distinct label
+# instead of the generic pass-based one (see _classification).
+_INVOICE_LIKE_CATEGORIES = frozenset({"Invoice", "Debit Note", "Credit Note"})
+_DN_CN_CATEGORIES = frozenset({"Debit Note", "Credit Note"})
+
 
 # ── Colour palette (matches the reference export) ──
 FILL_COMPANY = PatternFill("solid", fgColor="1E88E5")   # blue
@@ -83,26 +89,80 @@ PASS_RULE_CODE: dict[int, str] = {
     MatchPassType.TDS_GST: "VLR-TDSGST-2.5",
     MatchPassType.TOLERANCE_DATE: "VLR-TOLDATE-6.5",
     MatchPassType.AMOUNT_MISMATCH: "VLR-AMTMISMATCH-15.0",
+    MatchPassType.REFERENCE_GROUPED: "VLR-REFGROUPED-16.0",
+    MatchPassType.DATE_GROUPED: "VLR-DATEGROUPED-17.0",
 }
 
 
-def _classification(pass_number: int | None) -> str:
+def _classification(pass_number: int | None, c_entry=None, p_entry=None) -> str:
+    """
+    Map a match pass to its human-readable Classification label.
+
+    `c_entry`/`p_entry` are optional — when supplied, a Payment-category or
+    Debit Note/Credit Note-category pair gets a distinct, client-mandated
+    label instead of the generic pass-based one for passes whose match
+    condition is category-agnostic (blind amount+date/tolerance-date/
+    subset-sum passes never inspect category on their own, so the label
+    must branch here instead). Passes that are ALREADY category-specific by
+    construction (invoice-number-aware passes, which per the engine's
+    _requires_invoice_number_match rule never fire for Payment entries at
+    all) are left exactly as before.
+    """
     if pass_number is None:
         return "Unmatched"
-    # Pass 8 = manual link (see manual_link endpoint). Treat as a valid match
-    # classification rather than the "Unmatched" fallback.
-    if int(pass_number) == 8:
+    pn = int(pass_number)
+    if pn == 8:
         return "Manually Mapped"
-    if int(pass_number) in (9, 13):
+    if pn in (9, 13):
         # 9 = knock-off (AB) same-side netting, 13 = "Other entry" (SA)
         # same-side netting — both are entry-intrinsic reversals per the
         # mapping doc, shown identically as "Reversal Entries".
         return "Reversal Entries"
-    if int(pass_number) == 14:
+    if pn == MatchPassType.CROSS_DOCTYPE_REVERSAL:
+        # Recommended candidate, not yet approved — a same-side
+        # cancellation between two DIFFERENT doc types (see
+        # _cross_doctype_reversal_candidates). Once a reviewer approves
+        # it via /confirm, the match record is re-stamped to pass 8 and
+        # this branch no longer applies (see confirm_match's ACCEPT
+        # branch) — the row then reads "Manually Mapped" like any other
+        # manual link, matching the client's own worked example
+        # (Classification "Manually Matched").
+        return "Reversal Entries (Recommended)"
+    if pn == 14:
         # TDS Sequential Link: an invoice pair matched cleanly first, then a
         # separate standalone TDS ledger line linked to it as a third leg.
         return "Invoice Number Matched"
-    return PASS_CLASSIFICATION.get(int(pass_number), "Date and Amount Matched")
+
+    c_cat = (getattr(c_entry, "document_category", "") or "").strip()
+    p_cat = (getattr(p_entry, "document_category", "") or "").strip()
+    is_dn_cn_pair = c_cat in _DN_CN_CATEGORIES or p_cat in _DN_CN_CATEGORIES
+    is_payment_pair = c_cat == "Payment" or p_cat == "Payment"
+
+    # Client mapping-doc scenario "Amount Matched - Recommended" (DN/CN):
+    # a Debit Note/Credit Note pair matched via a tolerance-style pass
+    # (small write-off or TDS-band gap) — distinct from the generic
+    # invoice-number label these passes otherwise produce.
+    if is_dn_cn_pair and pn in (2, MatchPassType.TDS_GST, MatchPassType.TOLERANCE_DATE):
+        return "Amount Matched - Recommended"
+
+    # Client mapping-doc scenario "Payment Matched - Recommended": a
+    # Payment pair matched via a tolerance-style pass (small write-off/
+    # rounding gap or date-range tolerance) — distinct from the generic
+    # "Date and Amount Matched"/"Date Range and Amount Matched" labels
+    # those passes otherwise produce for non-Payment entries.
+    if is_payment_pair and pn in (2, MatchPassType.TOLERANCE_DATE):
+        return "Payment Matched - Recommended"
+
+    # New passes (see reconciliation_engine_service.py): a shared invoice/
+    # assignment-number reference tying a multi-entry group together
+    # ("Multiple Based on Invoice Number"), or a multi-entry date cluster
+    # with no reference correlation ("Multiple Based on Date").
+    if pn == MatchPassType.REFERENCE_GROUPED:
+        return "Multiple Based on Invoice Number"
+    if pn == MatchPassType.DATE_GROUPED:
+        return "Multiple Based on Date"
+
+    return PASS_CLASSIFICATION.get(pn, "Date and Amount Matched")
 
 
 def _status(
@@ -157,7 +217,11 @@ def _status(
     pn = int(pass_number)
     if pn == 8:
         return "Manually Mapped"
-    if pn in (9, 13):
+    if pn in (9, 13, MatchPassType.CROSS_DOCTYPE_REVERSAL):
+        # Matches the client's own worked example (Mapping Process.xlsx,
+        # "Reversal" sheet): Status "Reversal Entries" even while the
+        # Classification still reads "Manually Matched" pending review
+        # (see _classification's CROSS_DOCTYPE_REVERSAL branch above).
         return "Reversal Entries"
     if pn == 14:
         # TDS Sequential Link group: exported as 2 rows — the parent
@@ -171,6 +235,28 @@ def _status(
 
     c_amt = abs(_num(getattr(c_entry, "amount", 0))) if c_entry else 0.0
     p_amt = abs(_num(getattr(p_entry, "amount", 0))) if p_entry else 0.0
+
+    # Client-confirmed rule: on an Invoice-to-Invoice pair, only "TDS
+    # Booked by Company" is ever valid — a vendor doesn't withhold tax
+    # from its own invoice, so "TDS Booked by Party" never makes sense
+    # for a pure invoice comparison. Both directions stay valid for
+    # Payment (and other non-invoice) pairs, where either side may have
+    # booked a TDS deduction independently. Confirmed against the client's
+    # own worked examples: the Invoice sheet's two TDS-gap rows both show
+    # "TDS Booked by Company" (never "...by Party"); the standalone TDS
+    # sheet's "TDS Booked by Party" example is a standalone vendor-side
+    # entry with no company counterpart at all (handled separately by
+    # _special_classification, untouched by this rule).
+    c_cat = (getattr(c_entry, "document_category", "") or "").strip()
+    p_cat = (getattr(p_entry, "document_category", "") or "").strip()
+    is_invoice_pair = (
+        c_cat in _INVOICE_LIKE_CATEGORIES and p_cat in _INVOICE_LIKE_CATEGORIES
+    )
+
+    def _tds_side(smaller_side_is_company: bool) -> str:
+        if is_invoice_pair:
+            return "TDS Booked by Company"
+        return "TDS Booked by Company" if smaller_side_is_company else "TDS Booked by Party"
 
     def _matches_tax_amount(gap: float) -> bool:
         """Range-aware TDS/GST check — same logic (and same base-amount
@@ -204,7 +290,7 @@ def _status(
         # here so Status/Classification never disagree if that ever
         # changes).
         if c_amt > 0 and p_amt > 0 and _matches_tax_amount(abs(difference)):
-            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            return _tds_side(c_amt < p_amt)
         return "Amount Mismatch"
     if pn == 2 and abs(difference) > 0.005:
         # Pass 2 (_tolerance_match) now covers both small rounding
@@ -217,7 +303,7 @@ def _status(
         # exactly — otherwise it's a real amount mismatch.
         if abs(difference) > 5 and c_amt > 0 and p_amt > 0:
             if _matches_tax_amount(abs(difference)):
-                return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+                return _tds_side(c_amt < p_amt)
             # Defensive fallback only — a same-invoice-number, same-date
             # pair with an unexplained gap should already have been
             # claimed by pass 15 (AMOUNT_MISMATCH) before reaching here;
@@ -231,7 +317,7 @@ def _status(
         # from it, so that side is the one that "booked" the TDS.
         if c_amt > 0 and p_amt > 0:
             if _matches_tax_amount(abs(difference)):
-                return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+                return _tds_side(c_amt < p_amt)
             return "Unexplained Amount Gap"
         return "Reconciled"
     if pn == MatchPassType.TOLERANCE_DATE:
@@ -243,7 +329,7 @@ def _status(
         # with the SMALLER absolute amount had tax withheld/deducted from
         # it, so that side "booked" the TDS.
         if c_amt > 0 and p_amt > 0 and _matches_tax_amount(abs(difference)):
-            return "TDS Booked by Company" if c_amt < p_amt else "TDS Booked by Party"
+            return _tds_side(c_amt < p_amt)
         # Per explicit correction (same treatment as pass 15/AMOUNT_MISMATCH
         # above): this pass is the weakest matching tier — no exact amount,
         # no invoice-number correlation at all, matched purely on amount-
@@ -795,7 +881,7 @@ class ReconciliationExportService:
             # "Manually Mapped" regardless of what was actually picked.
             classification = manual_reason
         elif is_matched:
-            classification = _classification(pass_number)
+            classification = _classification(pass_number, c, p)
         else:
             classification = "Unmatched"
         return {
@@ -973,7 +1059,7 @@ class ReconciliationExportService:
                     self._tds_percentage_value, self._gst_percentage_value,
                     self._tds_percentage_min_value,
                 ) if m else self._unmatched_status(e, "party"),
-                _classification(pass_number) if m else "Unmatched",
+                _classification(pass_number, None, e) if m else "Unmatched",
                 "ledger",
                 _fmt_date(getattr(e, "posting_date", None)),
                 # Bug fix: this read derived_invoice_number/document_number

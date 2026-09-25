@@ -153,6 +153,13 @@ _NEEDS_CONFIRMATION_PASSES = [
     # _amount_mismatch_match) — always needs Finance review, never
     # auto-accepted.
     MatchPassType.AMOUNT_MISMATCH,
+    MatchPassType.REFERENCE_GROUPED,
+    MatchPassType.DATE_GROUPED,
+    # Same-side cancellation between two DIFFERENT doc types (e.g. Debit
+    # Note + Invoice) — no automatic marker confirming intent, so it's
+    # surfaced here for review; approving it re-stamps the match as
+    # manual (pass 8) — see confirm_match's ACCEPT branch below.
+    MatchPassType.CROSS_DOCTYPE_REVERSAL,
 ]
 
 
@@ -1869,6 +1876,38 @@ async def confirm_match(
     if request.action == ConfirmAction.ACCEPT:
         # Mark match as confirmed
         match_record.is_confirmed = True
+
+        # Client-confirmed rule: a CROSS_DOCTYPE_REVERSAL candidate (two
+        # different doc types on the same side that cancel by exact
+        # amount + date, e.g. a Debit Note and an Invoice — see
+        # _cross_doctype_reversal_candidates) has no automatic marker
+        # confirming intent, so once a reviewer approves it here it must
+        # be re-stamped as a genuine MANUAL match (pass 8), identical to
+        # what /link produces, rather than staying tagged with its
+        # candidate-detection pass number. This also stamps the mandatory
+        # status_reason ("Reversal Entries", already a valid reason per
+        # docs/Update Status.xlsx) so it surfaces correctly everywhere a
+        # manual link does (Particulars "Manually Mapped" drill-in, etc).
+        if match_record.pass_number == MatchPassType.CROSS_DOCTYPE_REVERSAL:
+            match_record.pass_number = 8
+            match_record.match_type = "manual_pair"
+            match_record.confidence_score = 1.0
+            match_record.status_reason = "Reversal Entries"
+
+            all_entry_ids = list(match_record.company_entry_ids or []) + list(
+                match_record.vendor_entry_ids or []
+            )
+            for entry_id in all_entry_ids:
+                entry_stmt = select(LedgerEntryModel).where(
+                    LedgerEntryModel.id == str(entry_id)
+                )
+                entry_result = await session.execute(entry_stmt)
+                entry = entry_result.scalar_one_or_none()
+                if entry:
+                    entry.pass_number = 8
+                    entry.confidence_score = 1.0
+                    session.add(entry)
+
         session.add(match_record)
         await session.flush()
         message = "Match accepted and confirmed."
