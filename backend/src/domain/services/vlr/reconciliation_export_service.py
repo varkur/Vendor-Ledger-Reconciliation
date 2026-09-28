@@ -28,6 +28,7 @@ from src.domain.services.vlr.reconciliation_engine_service import (
     OTHER_ENTRY_PASS,
     MatchPassType,
     _is_tax_band_gap,
+    _REVERSAL_SUFFIX_RE,
 )
 
 # Categories treated as "Invoice-like" for classification-label purposes —
@@ -437,7 +438,34 @@ def _special_classification(entry, side: str | None = None) -> str | None:
 
     # Reversal / knock-off entries. SAP doc type "AB" is the reversal doc type;
     # the category is mapped to "knocking off" in the reference.
-    if dtype == "ab" or "knock" in sig or "reversal" in sig or "reverse" in sig:
+    #
+    # Client-confirmed bug (real data, AUTOPACK INDUSTRIES/EPL): a genuine,
+    # correctly-matched Invoice for a physical product literally named
+    # "UNIVERSAL REVERSE BENDING TOOL(ELMACH)" got silently reclassified
+    # as "Reversal Entries" purely because its narration text contains the
+    # substring "reverse" — nothing to do with the entry actually being a
+    # reversal. Since _special_classification's callers (bucket() in
+    # _compute_summary) treat "Reversal Entries" as entry-intrinsic and
+    # EXCLUDE it entirely from the Summary sheet's difference accounting
+    # (it's assumed to net to zero within one side, per the mapping doc),
+    # this one false-positive silently dropped a real matched entry's
+    # amount out of the Summary's closing-balance identity — corrupting
+    # the final "Difference" row by exactly that entry's amount, with no
+    # visible trace of what happened.
+    #
+    # "reversal"/"reverse" as bare keyword substrings are too broad for a
+    # free-text narration field (any product/description containing that
+    # English word false-positives). Narrowed to the same doc-number
+    # reclass-suffix pattern _is_reversal() already uses in
+    # reconciliation_engine_service.py ("-R"/"-RE"/"-Rev" suffix on the
+    # invoice number itself) plus "knock"/explicit "reversal entr(y/ies)"
+    # phrasing — not a bare "reverse" substring match on narration text.
+    derived_inv = getattr(entry, "derived_invoice_number", "") or ""
+    doc_no = getattr(entry, "document_number", "") or ""
+    reversal_suffix_hit = (
+        _REVERSAL_SUFFIX_RE.search(str(derived_inv)) or _REVERSAL_SUFFIX_RE.search(str(doc_no))
+    )
+    if dtype == "ab" or "knock" in sig or "reversal entr" in sig or reversal_suffix_hit:
         return "Reversal Entries"
 
     # "Other entry" (SA) rows — per the mapping doc these are internal to
@@ -1211,9 +1239,22 @@ class ReconciliationExportService:
             annexure_map[annex_no] = (label, "both")
             lines_by_group[grp].append((label, annex_no, amt, cnt, action, "both"))
 
-        # ── Closing balance section ──
-        company_closing = _company_closing(company_entries)
-        party_closing = _closing(vendor_entries)
+        # ── Opening balance (computed FIRST — closing's fallback below
+        # needs it). Client-confirmed rule: opening balance is 0 ONLY when
+        # there's genuinely no Opening Balance row on that side at all; if
+        # one or more rows exist (even multiple, even sharing a date — see
+        # _balance_sum), they are summed as the real opening figure. ──
+        company_opening = _balance_sum(company_entries, "opening")
+        party_opening = _balance_sum(vendor_entries, "opening")
+        n_company_opening = _balance_count(company_entries, "opening")
+        n_party_opening = _balance_count(vendor_entries, "opening")
+
+        # ── Closing balance section. Client-confirmed rule: closing
+        # balance is NEVER assumed to be 0 — when no literal Closing
+        # Balance row exists, it's derived as opening + sum(everything
+        # else) instead (see _closing/_effective_closing). ──
+        company_closing = _company_closing(company_entries, company_opening)
+        party_closing = _closing(vendor_entries, party_opening)
         n_company_closing = _closing_count(company_entries)
         n_party_closing = _closing_count(vendor_entries)
         closing_diff = company_closing + party_closing
@@ -1230,10 +1271,6 @@ class ReconciliationExportService:
         )
 
         # ── Opening balance section (counted so all balance rows appear) ──
-        company_opening = _balance_sum(company_entries, "opening")
-        party_opening = _balance_sum(vendor_entries, "opening")
-        n_company_opening = _balance_count(company_entries, "opening")
-        n_party_opening = _balance_count(vendor_entries, "opening")
         if n_company_opening or n_party_opening:
             row = self._summary_group(
                 ws, row, "Opening Balance Difference",
@@ -1248,7 +1285,25 @@ class ReconciliationExportService:
 
         # ── Difference groups ──
         # Track the running sum of all difference sections for the final check.
-        total_diff_amount = Decimal("0")
+        #
+        # Client-confirmed rule: the Opening Balance gap must be folded
+        # into this running total too, not just displayed informationally.
+        # Proof this is the correct (and ONLY correct) treatment: for each
+        # side individually, opening + sum(all non-balance entries) =
+        # -closing (pure bookkeeping identity, confirmed exact on real
+        # AUTOPACK INDUSTRIES/EPL data down to the rupee). Summed across
+        # both sides: opening_diff + total_diff_amount_itemised =
+        # -closing_diff, which rearranges to
+        # closing_diff + opening_diff + total_diff_amount_itemised = 0.
+        # Without opening_diff in this sum, "Difference" collapses to
+        # exactly `-opening_diff` whenever every OTHER entry is correctly
+        # itemised — i.e. a real, non-zero opening-balance mismatch was
+        # silently passed through to "Difference" unexplained, even though
+        # the actual itemised categories fully reconciled. Folding it in
+        # here means "Difference" is zero exactly when the itemised
+        # categories fully explain BOTH the opening AND closing gaps —
+        # the genuine, complete monetary difference.
+        total_diff_amount = company_opening + party_opening
         for grp in group_order:
             lines = lines_by_group.get(grp, [])
             if not lines:
@@ -1315,22 +1370,30 @@ class ReconciliationExportService:
         # engine output, not just a hand-picked example. Proof: a closing
         # balance is by definition the running total of every OTHER entry on
         # that same side, so for each side individually:
-        #   sum(that side's non-balance entries) + that side's closing = 0
-        #   => sum(that side's non-balance entries) = -that side's closing
-        # `total_diff_amount` is exactly the sum of both sides' non-balance
-        # (unmatched + matched-residual) entries, so:
-        #   total_diff_amount = -(company_closing) + -(party_closing)
-        #                      = -(company_closing + party_closing)
-        #                      = -closing_diff
+        #   opening + sum(that side's non-balance entries) = -that side's closing
+        #   => sum(that side's non-balance entries) = -that side's closing - opening
+        # `total_diff_amount` now includes BOTH the opening-balance gap AND
+        # the sum of both sides' non-balance (unmatched + matched-residual)
+        # entries (client-confirmed correction — the opening gap must be
+        # folded in to get the true monetary difference, not just shown
+        # informationally), so:
+        #   total_diff_amount = (company_opening + party_opening)
+        #                       + [-(company_closing) - company_opening]
+        #                       + [-(party_closing) - party_opening]
+        #                     = -(company_closing + party_closing)
+        #                     = -closing_diff
         # This identity holds for ANY ledger pair regardless of match
-        # quality or classification — it's pure bookkeeping, not data-
-        # dependent. So `closing_diff - total_diff_amount` always equals
-        # `closing_diff - (-closing_diff) = 2 * closing_diff` — exactly the
-        # doubling seen in production (closing_diff=-41424 produced
-        # Difference=-82848). The itemised categories DO fully explain the
-        # closing-balance gap when `total_diff_amount == -closing_diff`;
-        # adding them (which correctly nets to zero) is what actually
-        # reflects that, not subtracting.
+        # quality, classification, or opening-balance shape (single row,
+        # multiple rows on the same date, or none at all — see
+        # _balance_sum/_effective_closing) — it's pure bookkeeping, not
+        # data-dependent. So `closing_diff - total_diff_amount` always
+        # equals `closing_diff - (-closing_diff) = 2 * closing_diff` —
+        # exactly the doubling seen in production (closing_diff=-41424
+        # produced Difference=-82848). The itemised categories (now
+        # including the opening-balance gap) DO fully explain the closing-
+        # balance gap when `total_diff_amount == -closing_diff`; adding
+        # them (which correctly nets to zero) is what actually reflects
+        # that, not subtracting.
         final_difference = closing_diff + total_diff_amount
         ws.cell(row=row, column=1, value="Difference")
         for c in range(1, 6):
@@ -1381,6 +1444,12 @@ class ReconciliationExportService:
 
 
 def _balance_sum(entries, keyword: str) -> Decimal:
+    """Sum every entry whose category contains `keyword` ("opening"/
+    "closing"). When multiple rows share that category (e.g. two literal
+    "Opening Balance" rows on the same date — confirmed on real client
+    data, AUTOPACK INDUSTRIES vendor ledger), they are ALL summed together
+    rather than only the first one being used — a real ledger's opening
+    position can legitimately be recorded as more than one line."""
     total = Decimal("0")
     for e in entries:
         cat = (getattr(e, "document_category", "") or "").lower()
@@ -1396,16 +1465,73 @@ def _balance_count(entries, keyword: str) -> int:
     )
 
 
-def _closing(entries) -> Decimal:
-    return _balance_sum(entries, "closing")
+def _sum_non_balance(entries) -> Decimal:
+    """Total of a side's transactional entries, excluding Opening/Closing
+    Balance rows — used as the closing-balance fallback below. Mirrors
+    reconciliation_engine_service.py's _compute_summary_fields helper of
+    the same name/purpose, kept as a separate local copy here since the
+    export service doesn't share that module's private scope."""
+    total = Decimal("0")
+    for e in entries:
+        cat = (getattr(e, "document_category", "") or "").lower()
+        if "opening" in cat or "closing" in cat:
+            continue
+        total += Decimal(str(_num(getattr(e, "amount", 0))))
+    return total
+
+
+def _effective_closing(entries, opening: Decimal) -> Decimal:
+    """
+    Closing balance for one side, with a fallback when there's no literal
+    Closing Balance row on that side.
+
+    Client-confirmed rule: a ledger's closing balance is NEVER genuinely
+    zero just because the file didn't carry an explicit "Closing Balance"
+    row — every ledger with any activity has a real ending position. When
+    no Closing Balance row exists, derive it the same way
+    reconciliation_engine_service.py's _compute_summary_fields already
+    does: opening + sum(every other entry on that side). This is exact
+    bookkeeping, not an approximation — a closing balance is BY DEFINITION
+    the running total of everything that came before it.
+
+    Confirmed real-data bug fix: a vendor file with zero Opening/Closing
+    rows at all (Prince Graphics) was previously read as
+    party_closing=0/party_opening=0, breaking the Summary sheet's core
+    identity (`Difference` should be 0 when every entry is itemised) and
+    producing a genuinely wrong non-zero Difference (144,450.17 on real
+    data) that had nothing to do with any actual reconciliation gap.
+
+    Only used as a FALLBACK — when a real Closing Balance row exists, it
+    always wins (see caller).
+    """
+    return opening + _sum_non_balance(entries)
+
+
+def _closing(entries, opening: Decimal | None = None) -> Decimal:
+    """
+    Closing balance for one side. Prefers a literal Closing Balance row
+    (summed, same multi-row handling as _balance_sum); falls back to
+    `_effective_closing` (opening + sum of everything else) ONLY when no
+    such row exists at all. `opening` must be pre-computed by the caller
+    (via _balance_sum(entries, "opening"), defaulting to 0 when absent —
+    see the Opening Balance rule below) and passed in for the fallback.
+    """
+    stated = _balance_sum(entries, "closing")
+    if _balance_count(entries, "closing") > 0:
+        return stated
+    return _effective_closing(entries, opening if opening is not None else Decimal("0"))
 
 
 def _closing_count(entries) -> int:
+    """Entry count for the Closing Balance row(s). When falling back to
+    the derived closing balance (no literal row present), there is no
+    real "closing balance entry" to count — 0, consistent with the
+    Opening Balance section's own "count 0 when absent" convention."""
     return _balance_count(entries, "closing")
 
 
-def _company_closing(entries) -> Decimal:
-    return _closing(entries)
+def _company_closing(entries, opening: Decimal | None = None) -> Decimal:
+    return _closing(entries, opening)
 
 
 # Row Status -> (Summary group, Action Required text) for MATCHED pairs that
