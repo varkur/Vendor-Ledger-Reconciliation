@@ -37,8 +37,12 @@ DEFAULT_DOC_TYPE_MAP: dict[str, str] = {
     # Receipt
     "RO": "Receipt",
     "REC": "Receipt",
-    # TDS
-    "KA": "TDS Adjusted",
+    # KA defaults to Payment per explicit client correction — real-data
+    # KA entries are company-side payment/journal postings (salary
+    # advances, TDS transfers, etc.), not a dedicated TDS category; the
+    # user can still remap a specific case's KA to "TDS Adjusted" via the
+    # Map Document Type screen if that case's data warrants it.
+    "KA": "Payment",
     # Opening / Closing Balance markers
     "OP": "Opening Balance",
     "CL": "Closing Balance",

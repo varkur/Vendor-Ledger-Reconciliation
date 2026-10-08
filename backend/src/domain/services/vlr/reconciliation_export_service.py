@@ -162,6 +162,12 @@ def _classification(pass_number: int | None, c_entry=None, p_entry=None) -> str:
         return "Multiple Based on Invoice Number"
     if pn == MatchPassType.DATE_GROUPED:
         return "Multiple Based on Date"
+    if pn == MatchPassType.INVOICE_GROUP_SUM:
+        # Payment / TDS Adjusted entries grouped independently by invoice
+        # number on EACH side, matched group-to-group on an exact sum —
+        # see _invoice_group_sum_match. Always an exact match by
+        # construction (no tolerance band), so this is never "Recommended".
+        return "Multiple Based on Invoice Number"
 
     return PASS_CLASSIFICATION.get(pn, "Date and Amount Matched")
 
@@ -492,7 +498,19 @@ def _special_classification(entry, side: str | None = None) -> str | None:
     # ledger one is "TDS Booked by Party". Same side-attribution rule used
     # everywhere else in this module (party_missing when side=="company",
     # company_missing when side=="party").
-    if getattr(entry, "is_tds", False) or "tds" in sig or dtype in ("tds", "wt"):
+    # Bug fix: this TDS-keyword/is_tds check used to fire unconditionally,
+    # even on an entry that is PART OF a genuine cross-side match (e.g. a
+    # Payment/TDS Adjusted entry whose narration happens to contain "TDS"
+    # but which _invoice_group_sum_match already matched, exactly, against
+    # a real vendor-side counterpart). That silently overrode a correct
+    # "Reconciled, zero difference" row with a misleading "TDS Booked by
+    # ..." label implying it's an unexplained one-sided TDS entry. Only
+    # apply this special-case label when the entry has NO real match at
+    # all (pass_number is None) — a genuinely matched entry's label comes
+    # from _classification instead.
+    if getattr(entry, "pass_number", None) is None and (
+        getattr(entry, "is_tds", False) or "tds" in sig or dtype in ("tds", "wt")
+    ):
         return "TDS Booked by Company" if side == "company" else "TDS Booked by Party"
 
     return None
@@ -658,6 +676,62 @@ DEFAULT_SUMMARY = {
     "company_action": "",
     "party_action": "",
 }
+
+# ── Status label -> Action Tracker "Action Taken Status" bucket ──
+#
+# Reverse-lookup built from CATEGORY_TO_SUMMARY: any status that is a
+# "company_missing" label means the COMPANY needs to act (book the missing
+# entry) -> bucket is "Pending with Company"; a "party_missing" label means
+# the VENDOR needs to act -> "Pending with Party". TDS gaps follow the same
+# convention as every other side-attribution in this module ("TDS Booked by
+# Company" means the ledger that's missing the TDS entry needing action is
+# the PARTY side, mirroring _unmatched_status's existing special-case
+# ordering) — kept explicit here rather than derived, since TDS entries
+# don't go through CATEGORY_TO_SUMMARY's normal company/party branch.
+_STATUS_TO_ACTION_BUCKET: dict[str, str] = {}
+for _info in CATEGORY_TO_SUMMARY.values():
+    _STATUS_TO_ACTION_BUCKET[_info["company_missing"]] = "Pending with Company"
+    _STATUS_TO_ACTION_BUCKET[_info["party_missing"]] = "Pending with Party"
+_STATUS_TO_ACTION_BUCKET[DEFAULT_SUMMARY["company_missing"]] = "Pending with Company"
+_STATUS_TO_ACTION_BUCKET[DEFAULT_SUMMARY["party_missing"]] = "Pending with Party"
+_STATUS_TO_ACTION_BUCKET["TDS Booked by Company"] = "Pending with Party"
+_STATUS_TO_ACTION_BUCKET["TDS Booked by Party"] = "Pending with Company"
+_STATUS_TO_ACTION_BUCKET["Amount Mismatch"] = "Pending with Party"
+
+
+def derive_action_taken_status(row: dict) -> str:
+    """
+    Map a row dict's `status` (and `difference` as a fallback signal) to the
+    3-value Action Tracker bucket: "Pending with Company", "Pending with
+    Party", or "No Action Required".
+
+    Opening/Closing Balance rows and any row with no outstanding residual
+    difference (fully reconciled, write-off/rounding within tolerance) need
+    no action. Everything else falls back to whichever side is missing the
+    entry per _STATUS_TO_ACTION_BUCKET; if the status isn't recognised at
+    all, the presence of a non-zero difference still routes it to the side
+    that's one-sided (`_side` == "company" -> party must act, and vice
+    versa), defaulting to "No Action Required" only when there is truly
+    nothing outstanding.
+    """
+    status = row.get("status") or ""
+    if status in ("Opening Balance", "Closing Balance", "Reversal Entries"):
+        return "No Action Required"
+    bucket = _STATUS_TO_ACTION_BUCKET.get(status)
+    if bucket is not None:
+        return bucket
+    try:
+        diff = abs(Decimal(str(row.get("difference", 0) or 0)))
+    except Exception:
+        diff = Decimal("0")
+    if diff < Decimal("0.005"):
+        return "No Action Required"
+    side = row.get("_side")
+    if side == "company":
+        return "Pending with Party"
+    if side == "party":
+        return "Pending with Company"
+    return "No Action Required"
 
 
 class ReconciliationExportService:

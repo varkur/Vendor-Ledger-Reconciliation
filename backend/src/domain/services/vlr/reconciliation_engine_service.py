@@ -149,6 +149,17 @@ class MatchPassType(IntEnum):
     # branch in reconciliation_output_controller.py. See
     # _cross_doctype_reversal_candidates.
     CROSS_DOCTYPE_REVERSAL = 18
+    # Client-confirmed rule for Payment / TDS Adjusted entries specifically:
+    # their invoice number does NOT correlate cross-side at all (company
+    # Assignment values and vendor receipt/TDS document numbers are
+    # unrelated reference schemes) — the only reliable cross-side
+    # commonality is amount. So: group same-side entries sharing one
+    # invoice number INDEPENDENTLY on each side, sum each group, and match
+    # a company group against a vendor group only when their sums are
+    # EXACTLY equal (no tolerance). Distinct from REFERENCE_GROUPED (16),
+    # which only groups ONE side and matches against a SINGLE entry on the
+    # other side — this pass groups BOTH sides and matches group-to-group.
+    INVOICE_GROUP_SUM = 20
 
 
 # BRD Section 5.6.10 - Matching Priority Rules confidence scores (normalized to 0.0-1.0)
@@ -192,7 +203,22 @@ CONFIDENCE_SCORES: dict[int, float] = {
     # but the gap is unexplained — always needs Finance review, never
     # auto-accepted (see _persist_results).
     MatchPassType.AMOUNT_MISMATCH: 0.60,
+    # INVOICE_GROUP_SUM: both sides' invoice-number groups sum to the exact
+    # same amount — as strong as any exact-amount pass (AMOUNT_DATE, 0.90).
+    MatchPassType.INVOICE_GROUP_SUM: 0.90,
 }
+
+# Wider date window used ONLY for Payment / TDS Adjusted invoice-number
+# group-sum matching (_invoice_group_sum_match) — per explicit client
+# correction, these categories' cross-side "commonality" is amount alone
+# (their invoice numbers never correlate across ledgers), so the matching
+# date window needs to be generous enough to find the genuine exact-sum
+# counterpart even when postings land weeks apart (e.g. a TDS transfer
+# posted at month-end against a vendor receipt dated earlier that month).
+# Kept as a separate constant (not the user-configured date_tolerance_days)
+# so a tight date-proximity setting elsewhere never suppresses this
+# specific, high-confidence exact-amount scenario.
+PAYMENT_TDS_GROUP_SUM_DATE_WINDOW_DAYS = 60
 
 
 @dataclass
@@ -973,6 +999,30 @@ class ReconciliationEngineService:
                 matched_vendor_ids.add(vid)
             result.match_groups.append(group)
 
+        # ─── Pass 20: Invoice-Number Group-Sum Match (Payment/TDS only) ──
+        # Per explicit client correction: Payment/TDS Adjusted entries'
+        # invoice numbers never correlate cross-side, so group BOTH sides
+        # independently by invoice number, sum each group, and match
+        # group-to-group only on an EXACT sum match (wide date window,
+        # no amount tolerance). Runs before the generic subset-sum passes
+        # so a genuine invoice-number grouping always wins over incidental
+        # amount coincidence.
+        available_company = [
+            e for e in company_entries if e.id not in matched_company_ids
+        ]
+        available_vendor = [
+            e for e in vendor_entries if e.id not in matched_vendor_ids
+        ]
+        invoice_group_sum_groups = self._invoice_group_sum_match(
+            available_company, available_vendor
+        )
+        for group in invoice_group_sum_groups:
+            for cid in group.company_entry_ids:
+                matched_company_ids.add(cid)
+            for vid in group.vendor_entry_ids:
+                matched_vendor_ids.add(vid)
+            result.match_groups.append(group)
+
         # ─── Pass 4: One-to-Many ──────────────────────────────────────────
         available_company = [
             e for e in company_entries if e.id not in matched_company_ids
@@ -1357,6 +1407,18 @@ class ReconciliationEngineService:
         claimed by the dedicated automatic passes first; this pass only
         looks at what's left. Also excludes Opening/Closing Balance rows
         (entry-intrinsic, never a reversal candidate).
+
+        Payment/Receipt entries are excluded from candidacy entirely: a
+        Payment knocking off against an Invoice is NOT a "Reversal Entries"
+        scenario per the mapping doc (that concept is limited to entries
+        that genuinely cancel each other out, e.g. Debit Note vs Invoice) —
+        the cross-category compatibility rules (CATEGORY_COMPATIBILITY)
+        already forbid a Payment from matching an Invoice on the opposite
+        ledger, and this same-side pass must not reintroduce that pairing
+        as a "recommended" candidate either. Confirmed bug: real case data
+        showed a `payment` (KZ) entry paired against an `invoice` (MI/AA)
+        entry here purely because the amounts canceled and dates matched —
+        these must instead fall through and remain unmatched.
         """
         pairs: list[MatchPair] = []
         used: set[UUID] = set()
@@ -1366,7 +1428,7 @@ class ReconciliationEngineService:
             if _is_matchable(e)
             and not _is_reversal(e)
             and not _is_other_entry(e)
-            and e.category not in ("Opening Balance", "Closing Balance")
+            and e.category not in ("Opening Balance", "Closing Balance", "Payment", "Receipt")
         ]
 
         by_amount: dict[Decimal, list[LedgerEntryData]] = {}
@@ -2470,6 +2532,117 @@ class ReconciliationEngineService:
                 )
                 used_company_ids.add(best_match.id)
                 used_vendor_ids.update(vendor_ids)
+
+        return groups
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Pass 20: Invoice-Number Group-Sum Match (Payment / TDS Adjusted only)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _invoice_group_sum_match(
+        self,
+        company: list[LedgerEntryData],
+        vendor: list[LedgerEntryData],
+        date_tolerance_days: int = PAYMENT_TDS_GROUP_SUM_DATE_WINDOW_DAYS,
+    ) -> list[MatchGroup]:
+        """
+        Payment / TDS Adjusted entries only. Per explicit client
+        correction: these categories' invoice numbers never correlate
+        cross-side (company Assignment values and vendor receipt/TDS
+        document numbers are unrelated reference schemes) — the only
+        reliable cross-side commonality is amount. So:
+
+          1. Group company entries by invoice number, independently.
+          2. Group vendor entries by invoice number, independently.
+          3. Sum each group.
+          4. Match a company group against a vendor group ONLY when the
+             two sums are EXACTLY equal (no tolerance, no amount gap).
+
+        This is distinct from _reference_grouped_match (pass 16), which
+        groups only ONE side and matches the sum against a SINGLE entry on
+        the other side — here, both sides are independently grouped and
+        compared group-to-group, so a company invoice number with 2 lines
+        can match a vendor invoice number with 3 lines, etc.
+
+        A "group" may also be a single entry (an invoice number with only
+        one line on that side) — this pass is the general case; the
+        single-entry-vs-single-entry scenario is just the trivial
+        1-element-group version of the same rule.
+        """
+        groups: list[MatchGroup] = []
+
+        def _invoice_key(e: LedgerEntryData) -> str:
+            return (e.derived_invoice_number or e.invoice_number or "").strip().upper()
+
+        def _eligible(e: LedgerEntryData) -> bool:
+            return (
+                _is_matchable(e)
+                and e.category in ("Payment", "TDS Adjusted")
+                and _invoice_key(e)
+            )
+
+        def _build_groups(entries: list[LedgerEntryData]) -> dict[str, list[LedgerEntryData]]:
+            by_key: dict[str, list[LedgerEntryData]] = {}
+            for e in entries:
+                if not _eligible(e):
+                    continue
+                by_key.setdefault(_invoice_key(e), []).append(e)
+            return by_key
+
+        company_groups = _build_groups(company)
+        vendor_groups = _build_groups(vendor)
+
+        used_vendor_keys: set[str] = set()
+
+        for c_key, c_group in company_groups.items():
+            c_total = sum(e.amount for e in c_group)
+            c_anchor_date = max(
+                (e.posting_date for e in c_group if e.posting_date is not None),
+                default=None,
+            )
+
+            best_v_key: str | None = None
+            best_date_diff: int | None = None
+
+            for v_key, v_group in vendor_groups.items():
+                if v_key in used_vendor_keys:
+                    continue
+                v_total = sum(e.amount for e in v_group)
+                if abs(abs(c_total) - abs(v_total)) > Decimal("0.01"):
+                    continue
+                v_anchor_date = max(
+                    (e.posting_date for e in v_group if e.posting_date is not None),
+                    default=None,
+                )
+                # Symmetric window (NOT the forward-only Payment window
+                # _date_diff_within_window applies elsewhere) — a TDS
+                # transfer is frequently posted AFTER the vendor's actual
+                # receipt date, so a company-after-vendor gap must be
+                # allowed just as much as vendor-after-company.
+                if c_anchor_date is None or v_anchor_date is None:
+                    date_diff = 0
+                else:
+                    date_diff = abs((c_anchor_date - v_anchor_date).days)
+                    if date_diff > date_tolerance_days:
+                        continue
+                if best_date_diff is None or date_diff < best_date_diff:
+                    best_date_diff = date_diff
+                    best_v_key = v_key
+
+            if best_v_key is not None:
+                v_group = vendor_groups[best_v_key]
+                v_total = sum(e.amount for e in v_group)
+                groups.append(
+                    MatchGroup(
+                        company_entry_ids=[e.id for e in c_group],
+                        vendor_entry_ids=[e.id for e in v_group],
+                        confidence_score=CONFIDENCE_SCORES[MatchPassType.INVOICE_GROUP_SUM],
+                        pass_number=MatchPassType.INVOICE_GROUP_SUM,
+                        matched_amount=abs(c_total),
+                        difference_amount=abs(c_total) - abs(v_total),
+                    )
+                )
+                used_vendor_keys.add(best_v_key)
 
         return groups
 

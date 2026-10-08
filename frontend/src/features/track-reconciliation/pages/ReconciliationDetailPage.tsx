@@ -31,6 +31,7 @@ import {
   useBulkReviewDone,
   useBulkSignoffRequest,
 } from '../hooks/useReconciliationDetail';
+import { useActionTrackerSummary } from '../hooks/useActionTracker';
 import type { BatchCaseRow } from '../api/reconciliationDetailApi';
 
 /**
@@ -98,8 +99,9 @@ export const ReconciliationDetailPage = () => {
   // Determine the stage filter for the current tab
   const currentStage = TAB_STAGE_MAP[activeTab];
 
-  // Fetch cases with stage filtering (skip fetch for statistics tab)
-  const shouldFetch = activeTab !== 'statistics' && !!requestId;
+  // Fetch cases with stage filtering (skip fetch for statistics/actionTracker
+  // tabs — Action Tracker has its own dedicated summary endpoint below).
+  const shouldFetch = activeTab !== 'statistics' && activeTab !== 'actionTracker' && !!requestId;
   const {
     data: casesData,
     isLoading,
@@ -114,6 +116,16 @@ export const ReconciliationDetailPage = () => {
 
   const cases = shouldFetch ? (casesData?.items ?? []) : [];
   const summary = casesData?.summary;
+
+  // Action Tracker summary (grouped by Action Taken Status) — separate data
+  // source from the case list, scoped to all cases under this request.
+  const {
+    data: actionTrackerSummary,
+    isLoading: isActionTrackerLoading,
+    isError: isActionTrackerError,
+    error: actionTrackerError,
+    refetch: refetchActionTracker,
+  } = useActionTrackerSummary(activeTab === 'actionTracker' ? (requestId ?? '') : '');
 
   // Fetch the parent request so the header shows its real period / type
   // instead of a hardcoded string.
@@ -421,7 +433,20 @@ export const ReconciliationDetailPage = () => {
   );
 
   const actionTrackerActionTemplate = () => (
-    <span className="link-view">View</span>
+    <span
+      className="link-view"
+      style={{ cursor: 'pointer' }}
+      onClick={() => navigate(`/track-reconciliation/${requestId}/action-tracker`)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          navigate(`/track-reconciliation/${requestId}/action-tracker`);
+        }
+      }}
+    >
+      View
+    </span>
   );
 
   /** Helper to render a count badge on action buttons. */
@@ -802,18 +827,74 @@ export const ReconciliationDetailPage = () => {
         </div>
       )}
 
-      {activeTab === 'actionTracker' && renderTabContent(
-        <div>
-          <div className="em-card" style={{ padding: 0 }}>
-            <DataTable value={cases} emptyMessage="No records found.">
-              <Column field="status" header="Action Taken Status" body={statusTemplate} sortable style={{ width: '25%' }} />
-              <Column field="no_of_lines" header="Number of Records" sortable style={{ width: '15%', textAlign: 'center' }} />
-              <Column field="company_amount" header="Company Amount" sortable style={{ width: '20%', textAlign: 'right' }} />
-              <Column field="difference_amount" header="Difference Amount" sortable style={{ width: '20%', textAlign: 'right' }} />
-              <Column header="Action" body={actionTrackerActionTemplate} style={{ width: '10%' }} />
-            </DataTable>
+      {activeTab === 'actionTracker' && (
+        isActionTrackerLoading ? renderLoadingSkeleton() :
+        isActionTrackerError ? (
+          <div className="em-card" style={{ padding: '2rem', textAlign: 'center' }}>
+            <Message
+              severity="error"
+              text={actionTrackerError instanceof Error ? actionTrackerError.message : 'Failed to load Action Tracker summary.'}
+            />
+            <div className="mt-3">
+              <Button label="Retry" icon="pi pi-refresh" className="p-button-outlined p-button-sm" onClick={() => refetchActionTracker()} />
+            </div>
           </div>
-        </div>
+        ) : (
+          <div>
+            <div className="em-card" style={{ padding: 0 }}>
+              <DataTable
+                value={actionTrackerSummary?.rows ?? []}
+                emptyMessage="No records found."
+                className="em-action-tracker-summary-table"
+              >
+                <Column
+                  field="action_taken_status"
+                  header="Action Taken Status"
+                  sortable
+                  style={{ width: '25%' }}
+                  footer="Total"
+                  footerStyle={{ fontWeight: 700 }}
+                />
+                <Column
+                  field="number_of_records"
+                  header="Number of Records"
+                  sortable
+                  style={{ width: '15%', textAlign: 'center' }}
+                  footer={actionTrackerSummary?.total_records ?? 0}
+                  footerStyle={{ textAlign: 'center', fontWeight: 700 }}
+                />
+                <Column
+                  field="percentage"
+                  header="Percentage"
+                  sortable
+                  style={{ width: '20%', textAlign: 'center' }}
+                  body={(row: { percentage: number }) => `${row.percentage}%`}
+                  footer="100%"
+                  footerStyle={{ textAlign: 'center', fontWeight: 700 }}
+                />
+                <Column
+                  field="amount"
+                  header="Amount (In Lakhs)"
+                  sortable
+                  style={{ width: '20%', textAlign: 'right' }}
+                  body={(row: { amount: number }) => (Number(row.amount) / 100000).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                  footer={
+                    actionTrackerSummary
+                      ? (Number(actionTrackerSummary.total_amount) / 100000).toLocaleString('en-IN', { maximumFractionDigits: 2 })
+                      : '0'
+                  }
+                  footerStyle={{ textAlign: 'right', fontWeight: 700 }}
+                />
+                <Column
+                  header="Action"
+                  body={actionTrackerActionTemplate}
+                  style={{ width: '10%' }}
+                  footer={actionTrackerActionTemplate}
+                />
+              </DataTable>
+            </div>
+          </div>
+        )
       )}
     </div>
   );

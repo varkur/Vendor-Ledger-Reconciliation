@@ -17,6 +17,7 @@ import { ColumnMappingPage } from '@features/track-reconciliation/pages/ColumnMa
 import { MappingFormPage } from '@features/track-reconciliation/pages/MappingFormPage';
 import { LinkUnmatchedPage } from '@features/track-reconciliation/pages/LinkUnmatchedPage';
 import { ReconciliationEntriesPage } from '@features/track-reconciliation/pages/ReconciliationEntriesPage';
+import { ActionTrackerDetailPage } from '@features/track-reconciliation/pages/ActionTrackerDetailPage';
 import { RolesPage } from '@features/rbac-admin/pages/RolesPage';
 import { AuditLogsPage } from '@features/rbac-admin/pages/AuditLogsPage';
 import { UserListPage } from '@features/user-management/pages/UserListPage';
@@ -82,6 +83,7 @@ export const AppRouter = () => {
           <Route path="track-reconciliation/:requestId/case/:caseId" element={<ReconciliationOutputPage />} />
           <Route path="track-reconciliation/:requestId/case/:caseId/view/:view" element={<ReconciliationEntriesPage />} />
           <Route path="track-reconciliation/:requestId/case/:caseId/link" element={<LinkUnmatchedPage />} />
+          <Route path="track-reconciliation/:requestId/action-tracker" element={<ActionTrackerDetailPage />} />
 
           {/* Exception Management */}
           <Route path="exceptions" element={<ExceptionListPage />} />

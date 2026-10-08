@@ -37,6 +37,7 @@ from src.infrastructure.database.models.vlr.column_mapping_template_model import
 from src.infrastructure.database.models.vlr.recovery_item_model import RecoveryItemModel
 from src.infrastructure.database.models.vlr.recovery_follow_up_model import RecoveryFollowUpModel
 from src.infrastructure.database.models.vlr.audit_event_model import AuditEventModel
+from src.infrastructure.database.models.vlr.action_tracker_model import ActionTrackerModel
 
 __all__ = [
     # Enums
@@ -72,4 +73,5 @@ __all__ = [
     "RecoveryItemModel",
     "RecoveryFollowUpModel",
     "AuditEventModel",
+    "ActionTrackerModel",
 ]

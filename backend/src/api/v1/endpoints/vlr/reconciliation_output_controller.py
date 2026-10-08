@@ -1372,6 +1372,8 @@ async def get_reconciliation_particulars(
         CATEGORY_TO_SUMMARY,
         DEFAULT_SUMMARY,
         ReconciliationExportService,
+        _balance_count,
+        _balance_sum,
         _closing,
         _closing_count,
         _company_closing,
@@ -1396,11 +1398,22 @@ async def get_reconciliation_particulars(
 
     groups: list[ParticularsGroup] = []
 
-    # ── Closing Balance Difference (from the actual closing-balance rows) ──
-    # Party amounts are stored with the opposite sign, so the difference is the
-    # SUM of the two sides (mirrors the export service).
-    company_closing = _company_closing(company_entries)
-    party_closing = _closing(vendor_entries)
+    # ── Opening balance (computed FIRST — closing's fallback below needs
+    # it). Mirrors the export service exactly: opening is 0 only when there
+    # is genuinely no Opening Balance row on that side; otherwise all such
+    # rows are summed. ──
+    company_opening = _balance_sum(company_entries, "opening")
+    party_opening = _balance_sum(vendor_entries, "opening")
+    n_company_opening = _balance_count(company_entries, "opening")
+    n_party_opening = _balance_count(vendor_entries, "opening")
+
+    # ── Closing Balance Difference (from the actual closing-balance rows,
+    # falling back to opening + sum(everything else) when no literal
+    # Closing Balance row exists — same as the export service). Party
+    # amounts are stored with the opposite sign, so the difference is the
+    # SUM of the two sides. ──
+    company_closing = _company_closing(company_entries, company_opening)
+    party_closing = _closing(vendor_entries, party_opening)
     n_company_closing = _closing_count(company_entries)
     n_party_closing = _closing_count(vendor_entries)
     closing_diff = company_closing + party_closing
@@ -1428,6 +1441,37 @@ async def get_reconciliation_particulars(
                         side="vendor",
                         document_category="Closing Balance",
                         view_key="closing_party",
+                    ),
+                ],
+            )
+        )
+
+    # ── Opening Balance Difference (mirrors the export service's own
+    # section, previously missing here entirely — this caused the on-screen
+    # Calculated Balance to disagree with the downloaded workbook). ──
+    if n_company_opening or n_party_opening:
+        groups.append(
+            ParticularsGroup(
+                label="Opening Balance Difference",
+                amount=company_opening + party_opening,
+                no_of_entries=n_company_opening + n_party_opening,
+                view_key="opening_balance",
+                children=[
+                    ParticularsChild(
+                        label="Opening Balance as per Company",
+                        amount=company_opening,
+                        no_of_entries=n_company_opening,
+                        side="company",
+                        document_category="Opening Balance",
+                        view_key="opening_company",
+                    ),
+                    ParticularsChild(
+                        label="Opening Balance as per Party",
+                        amount=party_opening,
+                        no_of_entries=n_party_opening,
+                        side="vendor",
+                        document_category="Opening Balance",
+                        view_key="opening_party",
                     ),
                 ],
             )
@@ -1556,7 +1600,11 @@ async def get_reconciliation_particulars(
             )
         )
 
-    calculated_balance = Decimal("0")
+    # Seed with the opening-balance gap, mirroring the export service's
+    # `total_diff_amount` initialization — without this the on-screen
+    # Calculated Balance always understated the true gap by exactly the
+    # Opening Balance Difference amount.
+    calculated_balance = company_opening + party_opening
     ordered = group_order + [g for g in lines_by_group if g not in group_order]
     for grp in ordered:
         children = lines_by_group.get(grp)

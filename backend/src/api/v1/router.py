@@ -38,6 +38,7 @@ from src.api.v1.endpoints.vlr.email_config_controller import router as vlr_email
 from src.api.v1.endpoints.vlr.reminder_config_controller import router as vlr_reminder_config_router
 from src.api.v1.endpoints.vlr.email_template_controller import router as vlr_email_template_router
 from src.api.v1.endpoints.vlr.document_type_controller import router as vlr_document_type_router
+from src.api.v1.endpoints.vlr.action_tracker_controller import router as vlr_action_tracker_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -75,3 +76,4 @@ api_v1_router.include_router(vlr_email_config_router)
 api_v1_router.include_router(vlr_reminder_config_router)
 api_v1_router.include_router(vlr_email_template_router)
 api_v1_router.include_router(vlr_document_type_router)
+api_v1_router.include_router(vlr_action_tracker_router)

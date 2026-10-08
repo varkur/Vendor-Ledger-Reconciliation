@@ -2778,6 +2778,139 @@ class TestOtherEntrySameSideNetting:
         assert len(pairs) == 1
 
 
+class TestInvoiceGroupSumMatch:
+    """
+    Pass 20: Payment / TDS Adjusted entries only. Per explicit client
+    correction, these categories' invoice numbers never correlate
+    cross-side — group each side independently by invoice number, sum each
+    group, and match group-to-group ONLY on an exact sum match.
+    """
+
+    def test_single_entry_groups_match_on_exact_sum(
+        self, service: ReconciliationEngineService
+    ):
+        """The trivial case: one company line, one vendor line, different
+        invoice numbers (they never correlate for Payment/TDS), but the
+        amounts are exactly equal — must match."""
+        c = _cat_entry(
+            "637000", category="TDS Adjusted", document_type="KA",
+            derived_invoice_number="OSG001252", posting_date=date(2025, 5, 30),
+        )
+        v = _cat_entry(
+            "-637000", category="Payment", document_type="Receipt",
+            derived_invoice_number="54", posting_date=date(2025, 5, 2),
+        )
+        groups = service._invoice_group_sum_match([c], [v])
+        assert len(groups) == 1
+        assert groups[0].pass_number == MatchPassType.INVOICE_GROUP_SUM
+        assert groups[0].difference_amount == Decimal("0")
+        assert groups[0].company_entry_ids == [c.id]
+        assert groups[0].vendor_entry_ids == [v.id]
+
+    def test_many_company_lines_same_invoice_number_combine(
+        self, service: ReconciliationEngineService
+    ):
+        """Two company lines sharing invoice number "1234" are combined
+        and matched against a single vendor line whose amount equals their
+        sum exactly."""
+        c1 = _cat_entry(
+            "4000", category="Payment", document_type="KZ",
+            derived_invoice_number="1234", posting_date=date(2025, 5, 2),
+        )
+        c2 = _cat_entry(
+            "1000", category="TDS Adjusted", document_type="KA",
+            derived_invoice_number="1234", posting_date=date(2025, 5, 30),
+        )
+        v = _cat_entry(
+            "-5000", category="Payment", document_type="Receipt",
+            derived_invoice_number="999", posting_date=date(2025, 5, 10),
+        )
+        groups = service._invoice_group_sum_match([c1, c2], [v])
+        assert len(groups) == 1
+        assert set(groups[0].company_entry_ids) == {c1.id, c2.id}
+        assert groups[0].vendor_entry_ids == [v.id]
+        assert groups[0].difference_amount == Decimal("0")
+
+    def test_many_vendor_lines_same_invoice_number_combine(
+        self, service: ReconciliationEngineService
+    ):
+        """Three vendor lines sharing invoice number "125" are combined and
+        matched against a single company line whose amount equals their
+        sum exactly."""
+        c = _cat_entry(
+            "9000", category="Payment", document_type="KZ",
+            derived_invoice_number="1234", posting_date=date(2025, 5, 2),
+        )
+        v1 = _cat_entry(
+            "-3000", category="Payment", document_type="Receipt",
+            derived_invoice_number="125", posting_date=date(2025, 5, 10),
+        )
+        v2 = _cat_entry(
+            "-5000", category="Payment", document_type="Receipt",
+            derived_invoice_number="125", posting_date=date(2025, 5, 10),
+        )
+        v3 = _cat_entry(
+            "-1000", category="TDS Adjusted", document_type="Tds",
+            derived_invoice_number="125", posting_date=date(2025, 5, 10),
+        )
+        groups = service._invoice_group_sum_match([c], [v1, v2, v3])
+        assert len(groups) == 1
+        assert groups[0].company_entry_ids == [c.id]
+        assert set(groups[0].vendor_entry_ids) == {v1.id, v2.id, v3.id}
+        assert groups[0].difference_amount == Decimal("0")
+
+    def test_no_tolerance_unequal_sums_never_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Confirmed real-data bug this replaces: a 637,000 company entry
+        must NOT match a 676,200 vendor entry (39,200 gap) — exact sum
+        only, no tolerance band at all."""
+        c = _cat_entry(
+            "637000", category="TDS Adjusted", document_type="KA",
+            derived_invoice_number="OSG001252", posting_date=date(2025, 5, 30),
+        )
+        v = _cat_entry(
+            "-676200", category="Payment", document_type="Receipt",
+            derived_invoice_number="114", posting_date=date(2025, 6, 4),
+        )
+        groups = service._invoice_group_sum_match([c], [v])
+        assert len(groups) == 0
+
+    def test_invoice_category_entries_excluded(
+        self, service: ReconciliationEngineService
+    ):
+        """Invoice/Debit Note/Credit Note entries are not eligible for this
+        pass at all — only Payment and TDS Adjusted."""
+        c = _cat_entry(
+            "5000", category="Invoice", document_type="RE",
+            derived_invoice_number="INV-1", posting_date=date(2025, 5, 2),
+        )
+        v = _cat_entry(
+            "-5000", category="Invoice", document_type="Sales",
+            derived_invoice_number="INV-1", posting_date=date(2025, 5, 2),
+        )
+        groups = service._invoice_group_sum_match([c], [v])
+        assert len(groups) == 0
+
+    def test_wide_date_window_still_finds_exact_match(
+        self, service: ReconciliationEngineService
+    ):
+        """Confirmed real-data scenario: company TDS entry posted 28 days
+        after the vendor's exact-amount receipt — must still match within
+        this pass's wider (60-day) window, unlike the narrower
+        date_tolerance_days used by other passes."""
+        c = _cat_entry(
+            "637000", category="TDS Adjusted", document_type="KA",
+            derived_invoice_number="OSG001252", posting_date=date(2025, 5, 30),
+        )
+        v = _cat_entry(
+            "-637000", category="Payment", document_type="Receipt",
+            derived_invoice_number="54", posting_date=date(2025, 5, 2),
+        )
+        groups = service._invoice_group_sum_match([c], [v])
+        assert len(groups) == 1
+
+
 class TestUTRPaymentGrouping:
     """
     Per doc: "If Emcure has made the payment in multiple split entries under
@@ -3346,6 +3479,43 @@ class TestCrossDoctypeReversalCandidates:
         d = _cat_entry("1000", "Knocking Off", date(2024, 1, 1), document_type="AB")
         cr = _cat_entry("-1000", "Invoice", date(2024, 1, 1), document_type="KR")
         pairs = service._cross_doctype_reversal_candidates([d, cr], side="company")
+        assert len(pairs) == 0
+
+    def test_payment_vs_invoice_not_flagged_as_reversal_candidate(
+        self, service: ReconciliationEngineService
+    ):
+        """Bug fix: a Payment (KZ) entry and an Invoice (MI/AA) entry that
+        happen to cancel out in amount on the same date were being
+        surfaced as "Reversal Entries (Recommended)" even though a
+        Payment knocking off an Invoice is not a genuine reversal
+        scenario per the mapping doc — CATEGORY_COMPATIBILITY already
+        forbids Payment<->Invoice cross-side matching, and this same-side
+        pass must not reintroduce that pairing as a recommended
+        candidate. These must instead remain unmatched."""
+        payment = _cat_entry(
+            "22480.4", "Payment", date(2025, 6, 10), document_type="KZ",
+        )
+        invoice = _cat_entry(
+            "-22480.4", "Invoice", date(2025, 6, 10), document_type="MI",
+        )
+        pairs = service._cross_doctype_reversal_candidates(
+            [payment, invoice], side="company"
+        )
+        assert len(pairs) == 0
+
+    def test_receipt_vs_invoice_not_flagged_as_reversal_candidate(
+        self, service: ReconciliationEngineService
+    ):
+        """Same guard applies to Receipt entries, symmetric with Payment."""
+        receipt = _cat_entry(
+            "252036", "Receipt", date(2025, 4, 29), document_type="KZ",
+        )
+        invoice = _cat_entry(
+            "-252036", "Invoice", date(2025, 4, 29), document_type="AA",
+        )
+        pairs = service._cross_doctype_reversal_candidates(
+            [receipt, invoice], side="company"
+        )
         assert len(pairs) == 0
 
     def test_opening_closing_balance_excluded(
